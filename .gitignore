@@ -1,0 +1,83 @@
+# Python environments and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+ENV/
+.paddlex-cache/
+
+# Tests, coverage, and type-checking caches
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Build and packaging output
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+wheels/
+
+# Local tools and generated project data
+/iopaint/
+/paddleocr_example_demo/
+/paddleocrclient
+/.agents/
+/.codex/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.secrets/
+secrets.*
+!secrets.example.*
+*.key
+*.pem
+*.p12
+*.pfx
+/vlm_config*.json
+/web_config*.json
+/data/config/*.json
+!/data/config/*.example.json
+/data/fonts/*
+!/data/fonts/README.md
+!/data/fonts/font_use.example.txt
+/data/models/*
+!/data/models/README.md
+/data/cache/*
+!/data/cache/.gitkeep
+/data/jobs/*
+!/data/jobs/.gitkeep
+**/.tetolate-web-state.json
+**/.tetolate-web.lock
+/web_jobs/
+
+# Application output
+*.cbz
+/debug_folder/
+/test-image.*
+*_translated/
+*.log
+*.tmp
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,32 @@
+[project]
+name = "tetolate"
+version = "0.1.0"
+description = "Experimental comic translation pipeline"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.136.1",
+    "openai>=2.36.0",
+    "pillow>=12.2.0",
+    "python-multipart>=0.0.28",
+    "uvicorn>=0.47.0",
+]
+
+[project.optional-dependencies]
+inpaint = [
+    "filelock>=3.29.0",
+    "numpy>=2.3.5",
+    "torch==2.5.1",
+]
+ocr = [
+    "paddleocr[doc-parser]>=3.7.0",
+    "paddlepaddle==3.3.1",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }

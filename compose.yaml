@@ -1,0 +1,47 @@
+name: tetolate
+
+services:
+  tetolate:
+    container_name: tetolate
+    build:
+      context: .
+      target: runtime
+    image: tetolate-core:local
+    ports:
+      - "127.0.0.1:8088:8088"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TETOLATE_DATA_DIR: /data
+      TETOLATE_PADDLEOCR_VL_SERVER_URL: http://llama-paddleocr-vl16:8081/v1
+    volumes:
+      - ./data:/data:z
+    init: true
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  llama-paddleocr-vl16:
+    profiles: ["paddleocr-vl"]
+    image: ghcr.io/ggml-org/llama.cpp:server-b9445@sha256:8dd148c53936b6e8b0e75309841e66eab13adc50b004a5e86ab1fec477c17d8e
+    container_name: tetolate-llama-paddleocr-vl16
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./data/models:/models:ro,z
+    command:
+      [
+        "--host", "0.0.0.0",
+        "--port", "8081",
+
+        "--model", "/models/PaddleOCR-VL-1.6-GGUF.gguf",
+        "--mmproj", "/models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+        "--chat-template-file", "/models/chat_template.jinja",
+        "--alias", "PaddlePaddle/PaddleOCR-VL-1.6",
+
+        "--ctx-size", "65536",
+        "-n", "8192",
+
+        "--temp", "0",
+        "--jinja"
+      ]

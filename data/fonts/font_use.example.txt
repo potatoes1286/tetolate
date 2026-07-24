@@ -1,0 +1,5 @@
+font_a.ttf: talking, narrator, general text, fallback
+font_b.ttf: thinking, monologue
+font_c.ttf: computer text
+font_d.ttf: hand written text
+font_e.ttf: sfx, loud shout

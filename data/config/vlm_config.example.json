@@ -1,0 +1,32 @@
+{
+  "base_url": "http://host.docker.internal:8080/v1",
+  "api_key": "not-needed",
+  "model": "",
+  "temperature": 0.7,
+  "max_tokens": 32768,
+  "thinking_budget_tokens": 2048,
+  "timeout": 1000,
+  "backup_font": {
+    "font": "DejaVu-Sans",
+    "fill": "black",
+    "gravity": "center"
+  },
+  "default_language": {
+    "source": "jp",
+    "target": "en"
+  },
+  "output": {
+    "webp_quality": 70,
+    "jxl_quality": 65
+  },
+  "postprocess": {
+    "proofread_translations": true,
+    "write_translation_notes": true
+  },
+  "alt_placement": {
+    "enabled": true
+  },
+  "ocr": {
+    "min_score": 0.75
+  }
+}

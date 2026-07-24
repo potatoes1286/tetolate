@@ -1,0 +1,5 @@
+{
+  "listen": "0.0.0.0:8088",
+  "jobs_dir": "../jobs",
+  "max_upload_bytes": 1073741824
+}
