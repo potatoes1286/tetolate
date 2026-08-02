@@ -1,7 +1,6 @@
 # Building tetolate
 
-This document covers native development environments, tests, and individual
-container targets. For the pipeline and normal Docker setup, see [README.md](README.md).
+This document covers native development environments, tests, and individual container targets. For the pipeline and normal Docker setup, see [README.md](README.md).
 
 ## Native Environment
 

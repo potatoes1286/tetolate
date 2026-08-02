@@ -1,12 +1,10 @@
 # tetolate
 
-I vibed this with mr. codex for my own personal use. Uploaded to share. This software is experimental. Do not expose it to WAN, etc.
+This is a program for locally and automatically translating comic archives (`.cbz`) and sets of images from Japanese/Korean/Chinese to English using an AI pipeline consisting of OCR, Vision-Large Language Model (VLM), and cleaning.
 
-This is a dockerized program which translates comic archives (`.cbz`) and sets of images from Japanese/Korean/Chinese to English using an AI pipeline consisting of OCR, Vision-Large Language Model (VLM), and cleaning.
+It is intended to run on local machines. The software itself is relatively light and should run on any semi-decent computer, the VLM is the bulk of the compute requirements.
 
-It is primarily intended to run on local machines. The software itself is relatively light and should run on any semi-decent computer, the VLM is the bulk of the compute requirements.
-
-For VLM, I would recommend at minimum Gemma 4 12B, and I personally run with Gemma 4 31B for high-quality translations and Gemma 4 26B-A4B for faster medium-quality translations.
+For a VLM, I would recommend at minimum Gemma 4 12B, and I personally run with Gemma 4 31B for high-quality translations and Gemma 4 26B-A4B for faster medium-quality translations. I would not recommend running any of the Qwen 3.x models as they produce sub-par translations compared to Gemma 4.
 
 THIS IS NOT REAL TIME TRANSLATION SOFTWARE. With a 3090, Gemma 4 31B, I see about 5-10 min PER PAGE. This is a send, come back later, and pick up.
 
@@ -35,39 +33,37 @@ VERY experimental editing of jobs.
 ## Requirements
 
 - Docker or Podman
-- 8 GB free disk space, plus space for models and jobs
-- 8 GB system RAM; 16 GB is more comfortable
-- An OpenAI-compatible vision-language model endpoint
-- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
-- font files for text
+- An OpenAI-compatible vision-language model endpoint -- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
+- If using PaddleOCR-VL 1.6 (recommended) 1+ gb of free RAM
+- font files for text -- recommended ones are listed in [the font config's readme](data/fonts/README.md), but it is up to you to obtain them or get alternatives from google fonts or wherever
 
-Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not
-currently tested.
+Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
 
-## Install with Docker
+## Install
 
-For detailed building see [BUILDING.md](BUILDING.md).
+Installing with self-built docker is recommended.
 
-Go start up a llama.cpp instance running the vision-language model.
+For detailed building / native install see [BUILDING.md](BUILDING.md).
 
-The main image includes standard PaddleOCR and the PaddleOCR-VL client. For OCR,
-you may choose to either:
+1. Go start up a llama.cpp instance running the vision-language model.
+
+2. The main image includes standard PaddleOCR and the PaddleOCR-VL client. For OCR, you may choose to either:
 
 - Run standard PaddleOCR directly in the main container (not recommended, faster, frequently misses text in my tests)
 - Run PaddleOCR-VL 1.6 in the bundled CPU llama.cpp container (recommended, slower, FAR higher quality)
 
-Clone the repository, then prepare the configuration before first startup:
+3. Clone the repository, then prepare the configuration before first startup:
 
 ```bash
 cp data/config/vlm_config.example.json data/config/vlm_config.json
 cp data/config/web_config.example.json data/config/web_config.json
 ```
 
-Set the translation endpoint in `data/config/vlm_config.json` -- please note for docker, 127.0.0.1 does not usually work and to access ports on the host machine you will have to use `host.docker.internal`.
+4. Set the translation endpoint in `data/config/vlm_config.json` -- please note for docker, 127.0.0.1 does not usually work and to access ports on the host machine you will have to use `host.docker.internal`.
 
-Put your font files into `data/fonts` and make a `font_use.txt` file from the example and readme. A suggested list of fonts are provided in `data/fonts/README.md`, though it is up to you to get them.
+5. Put your font files into `data/fonts` and make a `font_use.txt` file from the example and readme. A suggested list of fonts are provided in `data/fonts/README.md`, though it is up to you to get them.
 
-For PaddleOCR-VL 1.6, download the two GGUF files and chat template listed in `data/models/README.md` into `data/models/`, then run. The main container performs layout detection and the profile adds only the CPU llama.cpp endpoint:
+6. For PaddleOCR-VL 1.6, download the two GGUF files and chat template listed in `data/models/README.md` into `data/models/`, then run. The main container performs layout detection and the profile adds only the CPU llama.cpp endpoint:
 ```bash
 docker compose --profile paddleocr-vl up -d
 ```
@@ -77,13 +73,11 @@ For standard PaddleOCR:
 docker compose up -d
 ```
 
-When you submit a job to translate, select the matching OCR engine in a job's advanced options.
+7. When you submit a job to translate, select the matching OCR engine in a job's advanced options.
 
-On first startup there will be an auto-generated password in the docker logs. If you already detached, use `docker compose logs tetolate | grep password`. You can change it after logging in.
+8. On first startup there will be an auto-generated password in the docker logs. If you already detached, use `docker compose logs tetolate | grep password`. You can change it after logging in the webui.
 
-The password hash is stored in `data/jobs/.tetolate-web-state.json`.
-
-The container only listens to localhost on `127.0.0.1`. To listen to the network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. Exposing to WAN is very much not advised.
+The container only listens to localhost on `127.0.0.1`. To listen to the network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. Exposing to WAN is VERY MUCH not advised.
 
 Persistent data is stored in:
 
@@ -106,14 +100,10 @@ Stopping the containers does not delete jobs or caches.
 - Wait. (models will be downloaded on your first run, be warned!)
 - Download your cbz archive or view in browser.
 
-## Release
+## Extra
 
-Current version: `0.1.0`.
+Third-party software and models keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-The pipeline and intermediate job format may change between releases.
+For legal reasons, be aware that copyright exists
 
-Third-party software and models keep their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-Only translate material you have the right to process. You are responsible for
-the source files, fonts, models, and translated output you use or distribute.
+I vibed this with mr. codex for my own personal use. Uploaded to share. This software is experimental. Do not expose it to WAN, etc.
