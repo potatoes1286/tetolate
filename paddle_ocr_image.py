@@ -1441,10 +1441,10 @@ def draw_label(
     font: ImageFont.ImageFont,
 ) -> None:
     text = str(boxno)
-    padding = 4
     text_left, text_top, text_right, text_bottom = draw.textbbox((0, 0), text, font=font)
     text_width = text_right - text_left
     text_height = text_bottom - text_top
+    padding = max(4, round(text_height * 0.2))
     label_width = text_width + padding * 2
     label_height = text_height + padding * 2
     label_top = top - label_height if top >= label_height else top

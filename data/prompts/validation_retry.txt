@@ -1,0 +1,5 @@
+${prompt}
+
+VALIDATION RETRY:
+The previous response was rejected: ${error}
+Return the complete response again, correcting that error and following the requested schema exactly. Do not explain the correction.

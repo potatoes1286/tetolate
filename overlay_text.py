@@ -4,15 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from PIL import ImageFont
 
 
 DEFAULT_FONT = "Helvetica"
@@ -35,12 +39,14 @@ TARGET_WIDTH_FILL_RATIO = 0.78
 MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.82
 MAX_COMFORTABLE_WIDTH_FILL_RATIO = 0.92
 TALL_CAPTION_ASPECT_RATIO = 1.75
-TALL_CAPTION_TARGET_HEIGHT_FILL_RATIO = 0.78
-TALL_CAPTION_TARGET_WIDTH_FILL_RATIO = 0.52
-TALL_CAPTION_MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.92
-TALL_CAPTION_MAX_COMFORTABLE_WIDTH_FILL_RATIO = 0.72
-TALL_CAPTION_LINE_COUNT_BONUS = 0.08
-TALL_CAPTION_WRAP_RATIOS = (0.52, 0.58, 0.62, 0.68, 0.78, 0.90, 1.0)
+TALL_CAPTION_TARGET_HEIGHT_FILL_RATIO = 0.62
+TALL_CAPTION_TARGET_WIDTH_FILL_RATIO = 0.80
+TALL_CAPTION_MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.86
+TALL_CAPTION_MAX_COMFORTABLE_WIDTH_FILL_RATIO = 0.94
+TALL_CAPTION_WRAP_RATIOS = (0.75, 0.85, 0.95, 1.0)
+LINE_COUNT_PENALTY = 0.08
+POINT_SIZE_REDUCTION_PENALTY = 3.0
+TRAILING_PUNCTUATION = frozenset(",.;:!?%~)]}\u00bb\u201d\u2019\u2026")
 VOWELS = set("aeiouyAEIOUY")
 
 
@@ -163,6 +169,19 @@ def validate_entry(index: int, item: dict[str, Any]) -> None:
             or max_point_size <= 0
         ):
             raise InputError(f"Entry {index} maxPointSize must be a positive number.")
+
+    if "fontSizeWidthPercent" in item:
+        font_size_percent = item["fontSizeWidthPercent"]
+        if (
+            not isinstance(font_size_percent, (int, float))
+            or isinstance(font_size_percent, bool)
+            or not math.isfinite(font_size_percent)
+            or font_size_percent <= 0
+            or font_size_percent > 100
+        ):
+            raise InputError(
+                f"Entry {index} fontSizeWidthPercent must be between 0 and 100."
+            )
 
     if "renderBleed" in item:
         render_bleed = item["renderBleed"]
@@ -289,20 +308,52 @@ def best_hyphen_break(word: str, segment_limit: int) -> int:
 
 
 def normalize_caption_text(text: str) -> str:
-    lines = [" ".join(line.split()) for line in text.strip().splitlines()]
+    lines = [
+        re.sub(
+            r"\s+([,.;:!?%~)\]}\u00bb\u201d\u2019\u2026]+)",
+            r"\1",
+            " ".join(line.split()),
+        )
+        for line in text.strip().splitlines()
+    ]
     return "\n".join(line for line in lines if line)
+
+
+def punctuation_only(value: str) -> bool:
+    return bool(value) and all(character in TRAILING_PUNCTUATION for character in value)
+
+
+def split_trailing_punctuation(word: str) -> tuple[str, str]:
+    split_at = len(word)
+    while split_at > 0 and word[split_at - 1] in TRAILING_PUNCTUATION:
+        split_at -= 1
+    return word[:split_at], word[split_at:]
 
 
 def split_word_for_capacity(word: str, capacity: int) -> list[str]:
     if len(word) <= capacity:
         return [word]
+    core, punctuation = split_trailing_punctuation(word)
+    if not core:
+        return [word]
     if capacity <= 1:
-        return list(word)
+        segments = list(core)
+        segments[-1] += punctuation
+        return segments
 
     segments: list[str] = []
-    remaining = word
+    remaining = core
     while len(remaining) > capacity:
-        if len(remaining) >= MIN_HYPHENATED_WORD_LENGTH and capacity > MIN_HYPHEN_SEGMENT_LENGTH:
+        existing_hyphen = remaining.rfind("-", 1, capacity + 1)
+        if existing_hyphen > 0:
+            segments.append(remaining[: existing_hyphen + 1])
+            remaining = remaining[existing_hyphen + 1 :]
+            continue
+
+        if (
+            len(remaining) >= MIN_HYPHENATED_WORD_LENGTH
+            and capacity > MIN_HYPHEN_SEGMENT_LENGTH
+        ):
             break_at = best_hyphen_break(remaining, capacity)
             if break_at >= MIN_HYPHEN_SEGMENT_LENGTH:
                 segments.append(f"{remaining[:break_at]}-")
@@ -314,6 +365,7 @@ def split_word_for_capacity(word: str, capacity: int) -> list[str]:
 
     if remaining:
         segments.append(remaining)
+    segments[-1] += punctuation
     return segments
 
 
@@ -324,6 +376,15 @@ def wrap_line_for_capacity(line: str, capacity: int) -> list[str]:
     wrapped: list[str] = []
     current = ""
     for raw_word in line.split():
+        if punctuation_only(raw_word):
+            if current:
+                current += raw_word
+            elif wrapped:
+                wrapped[-1] += raw_word
+            else:
+                current = raw_word
+            continue
+
         word_parts = split_word_for_capacity(raw_word, capacity)
         for word in word_parts:
             if not current:
@@ -334,23 +395,44 @@ def wrap_line_for_capacity(line: str, capacity: int) -> list[str]:
                 wrapped.append(current)
                 current = word
 
-            while len(current) > capacity:
-                wrapped.append(current[:capacity])
-                current = current[capacity:]
-
     if current:
         wrapped.append(current)
     return wrapped or [line]
 
 
-def lines_fit(lines: list[str], point_size: float, width: int, height: int) -> bool:
-    estimated_width, estimated_height = estimated_text_extent(lines, point_size)
+@functools.lru_cache(maxsize=512)
+def loaded_layout_font(font: str, point_size: int) -> ImageFont.FreeTypeFont | None:
+    try:
+        return ImageFont.truetype(font, max(1, point_size))
+    except (OSError, ValueError):
+        return None
+
+
+def lines_fit(
+    lines: list[str],
+    point_size: float,
+    width: int,
+    height: int,
+    font: str | None = None,
+) -> bool:
+    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font)
     return estimated_width <= width and estimated_height <= height
 
 
-def estimated_text_extent(lines: list[str], point_size: float) -> tuple[float, float]:
-    longest_line = max((len(line) for line in lines), default=0)
-    estimated_width = longest_line * point_size * APPROX_FONT_WIDTH_RATIO
+def estimated_text_extent(
+    lines: list[str],
+    point_size: float,
+    font: str | None = None,
+) -> tuple[float, float]:
+    layout_font = loaded_layout_font(font, round(point_size)) if font else None
+    if layout_font is not None:
+        estimated_width = max(
+            (float(layout_font.getlength(line)) for line in lines),
+            default=0.0,
+        )
+    else:
+        longest_line = max((len(line) for line in lines), default=0)
+        estimated_width = longest_line * point_size * APPROX_FONT_WIDTH_RATIO
     estimated_height = len(lines) * point_size * APPROX_LINE_HEIGHT_RATIO
     return estimated_width, estimated_height
 
@@ -381,8 +463,9 @@ def layout_quality_score(
     point_size_cap: float,
     tall_caption: bool,
     wrap_width_ratio: float,
+    font: str | None = None,
 ) -> float:
-    estimated_width, estimated_height = estimated_text_extent(lines, point_size)
+    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font)
     width_ratio = estimated_width / max(1, width)
     height_ratio = estimated_height / max(1, height)
 
@@ -403,24 +486,30 @@ def layout_quality_score(
         if width_ratio > MAX_COMFORTABLE_WIDTH_FILL_RATIO:
             score += (width_ratio - MAX_COMFORTABLE_WIDTH_FILL_RATIO) * 6.0
 
-    visible_lengths = [line_visible_length(line) for line in lines if line.strip()]
+    nonblank_lines = [line for line in lines if line.strip()]
+    visible_lengths = [line_visible_length(line) for line in nonblank_lines]
+    punctuation_only_lines = sum(
+        1 for line in nonblank_lines if punctuation_only(line.strip())
+    )
     one_character_lines = sum(1 for length in visible_lengths if length == 1)
     two_character_lines = sum(1 for length in visible_lengths if length == 2)
     hyphenated_lines = sum(1 for line in lines if line.rstrip().endswith("-"))
-    score += one_character_lines * 2.0
-    score += two_character_lines * 0.6
-    score += hyphenated_lines * 0.45
+    score += punctuation_only_lines * 8.0
+    score += one_character_lines * 3.0
+    score += two_character_lines * 0.35
+    score += hyphenated_lines * 1.35
+    score += max(0, len(nonblank_lines) - 2) * LINE_COUNT_PENALTY
 
     if visible_lengths:
         longest = max(visible_lengths)
         shortest = min(visible_lengths)
         if longest > 0:
             score += ((longest - shortest) / longest) * 0.35
-        if tall_caption:
-            score -= min(len(visible_lengths), 12) * TALL_CAPTION_LINE_COUNT_BONUS
 
+    size_ratio = min(1.0, point_size / max(1.0, point_size_cap))
+    score += (1.0 - size_ratio) * POINT_SIZE_REDUCTION_PENALTY
     # Prefer larger text only as a mild tie-breaker; the fill targets carry the layout.
-    score -= min(point_size, point_size_cap) * 0.015
+    score -= min(point_size, point_size_cap) * 0.008
     return score
 
 
@@ -429,13 +518,20 @@ def technical_fitting_point_size(
     width: int,
     height: int,
     image_height: int | None = None,
+    font: str | None = None,
+    maximum_point_size: float | None = None,
 ) -> float:
     wrap_ratios = wrap_ratios_for_region(width, height)
-    start_size = max(1, math.ceil(page_relative_max_point_size(image_height, width, height)))
+    search_maximum = (
+        maximum_point_size
+        if maximum_point_size is not None
+        else page_relative_max_point_size(image_height, width, height)
+    )
+    start_size = max(1, math.ceil(search_maximum))
     for point_size in range(start_size, 0, -1):
         for wrap_width_ratio in wrap_ratios:
             lines = layout_lines_for_point_size(text, float(point_size), width, wrap_width_ratio)
-            if lines_fit(lines, float(point_size), width, height):
+            if lines_fit(lines, float(point_size), width, height, font):
                 return float(point_size)
     return 1.0
 
@@ -445,11 +541,42 @@ def explicit_caption_layout(
     text: str,
     width: int,
     height: int,
+    image_width: int | None = None,
     image_height: int | None = None,
 ) -> tuple[str, float, float]:
+    font = entry.get("font") if isinstance(entry.get("font"), str) else None
+    fixed_percent = entry.get("fontSizeWidthPercent")
+    if (
+        isinstance(fixed_percent, (int, float))
+        and not isinstance(fixed_percent, bool)
+        and image_width is not None
+        and image_width > 0
+    ):
+        requested_size = max(1.0, image_width * float(fixed_percent) / 100.0)
+        technical_size = technical_fitting_point_size(
+            text,
+            width,
+            height,
+            image_height,
+            font,
+            requested_size,
+        )
+        point_size = min(requested_size, technical_size)
+        candidates = [
+            layout_lines_for_point_size(text, point_size, width, ratio)
+            for ratio in wrap_ratios_for_region(width, height)
+        ]
+        fitting = [
+            lines for lines in candidates if lines_fit(lines, point_size, width, height, font)
+        ]
+        selected = min(fitting or candidates, key=lambda lines: len(lines))
+        return "\n".join(selected), point_size, technical_size
+
     minimum = min_point_size(entry, image_height)
     point_size_cap = aesthetic_max_point_size(entry, width, height, image_height)
-    technical_best_size = technical_fitting_point_size(text, width, height, image_height)
+    technical_best_size = technical_fitting_point_size(
+        text, width, height, image_height, font
+    )
     tall_caption = is_tall_caption_region(width, height)
     wrap_ratios = wrap_ratios_for_region(width, height)
     best_candidate: tuple[float, list[str], float] | None = None
@@ -462,7 +589,7 @@ def explicit_caption_layout(
     for point_size in candidate_sizes:
         for wrap_width_ratio in wrap_ratios:
             lines = layout_lines_for_point_size(text, float(point_size), width, wrap_width_ratio)
-            if not lines_fit(lines, float(point_size), width, height):
+            if not lines_fit(lines, float(point_size), width, height, font):
                 continue
             score = layout_quality_score(
                 lines,
@@ -472,6 +599,7 @@ def explicit_caption_layout(
                 point_size_cap,
                 tall_caption,
                 wrap_width_ratio,
+                font,
             )
             if best_candidate is None or score < best_candidate[0]:
                 best_candidate = (score, lines, float(point_size))
@@ -510,6 +638,7 @@ def render_text_layer(
     entry: dict[str, Any],
     layer_path: Path,
     text_path: Path,
+    image_width: int,
     image_height: int,
 ) -> None:
     left, top, width, height = rounded_region(entry["region"])
@@ -533,6 +662,7 @@ def render_text_layer(
         layout_text,
         inner_width,
         inner_height,
+        image_width,
         image_height,
     )
     point_size_args = explicit_pointsize_args(entry, point_size, estimated_fit_size, image_height)
@@ -709,7 +839,14 @@ def overlay_text(entries: list[dict[str, Any]], input_image: Path, output_image:
             layer_path = temp_dir / f"layer-{index}.png"
             next_path = temp_dir / f"composited-{index}.png"
 
-            render_text_layer(magick, entry, layer_path, text_path, image_height)
+            render_text_layer(
+                magick,
+                entry,
+                layer_path,
+                text_path,
+                image_width,
+                image_height,
+            )
             composite_layer(magick, current_path, layer_path, next_path, entry)
             current_path = next_path
 

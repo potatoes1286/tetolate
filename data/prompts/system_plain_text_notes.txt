@@ -1,0 +1,1 @@
+Write concise plain text. Do not use JSON, markdown code fences, or explanations outside the requested notes.

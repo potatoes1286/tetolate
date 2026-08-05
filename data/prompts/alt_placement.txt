@@ -1,0 +1,37 @@
+You are deciding erase safety for one comic page.
+${structure_context}
+
+For each structured ${source_name} text box, decide whether the original source text can be safely erased
+and redrawn in the same region, or whether the ${target_name} translation needs alternate placement.
+
+Return only a compact JSON array of rows. Row format:
+[boxno,safeToEraseOriginal,reasonCode]
+- boxno: one current-page structured box number.
+- safeToEraseOriginal: use 1 when the original text can be cleaned/erased safely, 0 when it needs alternate placement.
+- reasonCode: use 0=bubble, 1=caption_box, 2=bordered_box, 3=blank_text_area, 4=sign_label,
+  5=over_art, 6=over_face_body, 7=integrated_sfx, or 8=unclear.
+- All three values are integers. Do not emit reason names in the JSON.
+- The outer array is mandatory, including for one record. A one-record response looks like [[0,1,0]].
+
+Policy:
+- Default to safeToEraseOriginal=1.
+- Use 1 for text inside speech balloons, thought balloons, caption boxes, narration boxes, rectangular/torn-edge boxes,
+  signs, labels, panels reserved for text, or white/blank text areas.
+- Use 1 for normal dialogue or narration that has a clear container or intentionally blank text area, even if the
+  container is large, irregular, partially cropped, or sits over artwork.
+- Use 0 only when erasing the original text would likely damage important page art: faces, bodies, clothing,
+  props, action lines, speed lines, detailed backgrounds, or hand-drawn SFX integrated into the artwork.
+- Use 0 for text clearly free-floating directly on artwork/background with no enclosing visual container and no
+  dedicated blank/white text area.
+- SFX can be unsafe only when the lettering itself is integrated into the art with no safe blank/container area.
+  SFX inside a bubble, caption box, panel space, or white sound-effect area is safe.
+- If uncertain, choose safeToEraseOriginal=1. The purpose is to avoid unnecessary alternate placement.
+
+The page image is annotated with the current box numbers. Return one row for every input record and no others.
+Do not include source text, page number, markdown, or explanations.
+
+Current page index:
+${page_index}
+
+Structured records compact table:
+${records_table}

@@ -1,0 +1,36 @@
+Proofread one batch as part of a sequential full-comic proofreading stage.
+
+You are given translated records with ${source_name} source text and current ${target_name} text,
+user translation notes, and a short tail of already corrected records from the preceding batch.
+Input rows are tab-separated and already sorted in correct page/boxno order. Improve consistency
+and natural ${target_name} flow while preserving meaning.
+
+Goals:
+- Keep names, terms, pronouns, titles, attacks, magic, locations, and recurring phrases consistent.
+- Improve awkward phrasing, grammar, and dialogue flow.
+- Preserve character voice, tone, and scene context.
+- Keep translations concise enough for comic lettering.
+- Do not rewrite good translations merely to be different.
+- Do not invent new records or translate text that is not present.
+- Keep SFX concise and natural. A kept SFX must have visible, non-empty ${target_name} lettering.
+- Repair any empty englishText with a concise translation. Do not make any englishText empty.
+
+Output format:
+- Return only records whose englishText must change.
+- Use one tab-separated line per correction: row<TAB>final englishText
+- Use the row number from the current input table. Do not use page:box as the row number.
+- Do not return unchanged records.
+- If no records need changes, return exactly <NO_CHANGES>.
+- Do not include headers, labels, bullets, quotes, markdown, JSON, or explanations.
+
+User translation notes:
+${translation_notes}
+
+Earlier corrected context:
+- Use these rows only to preserve names, terms, voice, and flow across batch boundaries.
+- Do not output lines for these rows.
+${prior_context}
+
+Current batch: ${batch_scope}
+Current input rows to proofread:
+${records_table}

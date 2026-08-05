@@ -1,0 +1,59 @@
+You are classifying and ordering OCR groups for one comic page.
+${structure_context}
+Reading order guidance: use ${reading_order}.
+
+You are given the page image and script-merged OCR groups for the current page.
+The groups are already merged geometrically. Do not merge groups. Do not split groups. Return one row for every group.
+Your job is to put translatable ${source_name} text groups in reading order, reject groups that do not need
+translation or replacement, reject clear OCR false positives, and classify each kept group.
+Return only a compact JSON array of rows for the current page.
+Row format:
+[mergedBoxno,classification]
+or, only when correcting OCR:
+[mergedBoxno,classification,textCorrection]
+- mergedBoxno: one script-merged OCR group boxno from this page.
+- classification: exactly one of "text", "sfx", or "reject".
+- textCorrection: optional corrected OCR text string. Omit it when no correction is needed.
+
+The array order itself is the reading order. There is no output-order field.
+The first value in every row is always a numbered image label, never an output position.
+For example, if labels 2, 0, and 1 are normal text in that reading order, return:
+[[2,"text"],[0,"text"],[1,"text"]]
+Never return rows such as [0,0,2,...] with a separate order number.
+
+Rejection policy:
+- Reject intentional lettering when it does not need translation into ${target_name}.
+- Reject text already written in ${target_name}. Leave it unchanged in the original image.
+- Reject text made only from numbers, percentages, punctuation, mathematical marks, currency marks, or symbols.
+  Examples include `22%`, `100`, `...`, `!?`, `$$`, `#`, `@`, `+`, `=`, and isolated UI indicators.
+- Reject a symbol or number even when it appears inside a speech bubble, caption box, sign, label, or UI box.
+- Do not reject a mixed group when it also contains readable ${source_name} text that needs translation.
+- Also reject obvious false positives such as screen tone texture, hatching, panel borders, character art,
+  background art, dust/noise, random isolated punctuation, cropped fragments with no readable character,
+  or OCR boxes that contain only furigana/reading marks separated from their base text.
+- Do not reject readable ${source_name} text, even if the OCR string is wrong, garbled, incomplete, badly ordered,
+  split oddly, mixes furigana with base text, or contains extra punctuation.
+- Do not reject text inside speech bubbles, thought bubbles, caption boxes, narration boxes, rectangular
+  boxes, signs, labels, UI-like boxes, bordered areas, white/blank text areas, or decorative containers.
+- Do not reject short readable ${source_name} text merely because it is short.
+- Source-language SFX should be kept when it needs translation. Target-language or symbol-only SFX should be rejected.
+- If unsure whether readable text needs translation into ${target_name}, keep it.
+
+The OCR text is already provided. Do not retype it unless correction is needed. If the OCR text is clearly
+wrong and you can confidently correct it, put the corrected text in textCorrection. Otherwise omit it.
+
+Return exactly ${record_count} rows. Every mergedBoxno from this page must appear exactly once, including
+rejected boxes. No mergedBoxno may appear twice.
+
+Return kept rows in the requested reading order. Rejected rows may appear where they occur visually.
+Do not include page, sourceBoxnos, region, text, markdown, or explanations.
+
+Region coordinates are [left,top,right,bottom] pixels with the origin at the image's top-left.
+The numbered labels drawn on the image match mergedBoxno. Use those labels and the image directly;
+do not re-derive or debate the coordinate convention. Make one concise classification/order pass and return.
+
+Current page index:
+${page_index}
+
+Current page script-merged OCR groups compact table:
+${records_table}

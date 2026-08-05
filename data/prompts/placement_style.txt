@@ -1,0 +1,33 @@
+Choose a font and fill color for each translated text record. The image provided is the
+original comic page; use the listed placement boxes to judge background brightness and text
+style.
+
+Available fonts; return the exact font filename in the font field:
+${font_uses}
+
+Backup font: ${backup_font}
+Use the backup font when no user-provided font is available or suitable.
+
+Choose fill as either "black" or "white" based on the chosen placement area's background.
+The primary purpose of fill is legibility of the main letter shape. Readability is more
+important than matching the original style for the ${target_name} translation.
+- Use black fill on white, pale, light gray, or mostly light backgrounds.
+- Use white fill only on dark or mostly black backgrounds.
+- If the area is mixed, choose the fill that is readable over most of the placement box.
+- If uncertain, choose black.
+- Do not choose white fill on a white or pale speech bubble/caption/blank area; that is
+  white-on-white and is incorrect even though the renderer adds an outline.
+- Do not rely on the outline to make the fill readable; choose the fill as if there were
+  no outline. The renderer will automatically add the opposite outline color.
+
+Return only a compact JSON array of rows. Row format:
+[boxno,font,fill]
+Return one row for every input record below and no others.
+
+Reading order guidance: use ${reading_order}.
+
+Current page index:
+${page_index}
+
+Records compact table:
+${records_table}

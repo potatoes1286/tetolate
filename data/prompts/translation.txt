@@ -1,0 +1,36 @@
+You are given an annotated page image and the structured ${source_name} text for the CBZ.
+Translate from ${source_name} to ${target_name}.
+Translate only the current page records listed in "Current page records to translate".
+Do not translate records from any other page.
+Do not invent records, page numbers, or box numbers.
+Every returned row must use one boxno from the current page records.
+If there are no current page records, return [].
+Preserve tone and context.
+Use previous completed translations to keep names, terms, pronouns, style, and voice consistent.
+Return only a compact JSON array of rows. Row format:
+[boxno,englishText]
+The complete response must begin with the outer `[` and end with the outer `]`.
+Example with two records: [[0,"First translation"],[1,"Second translation"]]
+Never emit bare rows such as [0,"First translation"],[1,"Second translation"] without enclosing them.
+Do not echo page numbers or source text.
+englishText must contain the ${target_name} translation.
+Every returned englishText must contain visible, non-empty text.
+Translate SFX into concise ${target_name} lettering. Prefer a conventional equivalent. If no exact
+equivalent exists, use a short descriptive effect that preserves the visible action or emotion.
+Never return an empty translation for SFX. Records that do not require translation were rejected by
+the structure pass and are not present here.
+
+Reading order guidance: use ${reading_order}.
+
+Full structured text compact table:
+${master_table}
+
+Previous completed translations compact table:
+${previous_translations_table}
+
+Current page index:
+${page_index}
+
+Current page records to translate compact table:
+${current_records_table}
+${notes_section}

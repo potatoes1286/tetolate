@@ -16,19 +16,21 @@ Web UI to upload, view jobs, and download from.
 
 png, webp, jxl cbz output options, or view in browser.
 
-VERY experimental editing of jobs.
+Versioned job editor for OCR grouping, structure, erase safety, translation,
+placement, and rendered previews. Protected edits survive later model passes.
 
 ## Pipeline
 
-1. ocr_raw -- initial OCR detection via PaddleOCR or PaddleOCR-VL
-2. ocr_structured -- merge detected OCR into text boxes, reject false-positives, order the reading order via VLM
-3. alt_placement -- optional, detect open lettering text and classify alternative placements for translation via VLM
-4. translations -- translate page by page via VLM
-5. proofread -- optional, VLM does one final pass, proofreads
-6. translation_notes -- optional, VLM assembles translation notes to carry to future related translations
-7. placement -- determine text box sizes
-8. render -- clean up text via LaMa, draw over text with ImageMagick
-9. package -- generate PNG, WebP, and JXL CBZ downloads.
+1. ocr_raw -- detect text with PaddleOCR or PaddleOCR-VL
+2. ocr_merged -- merge nearby OCR detections with deterministic geometry
+3. ocr_structured -- reject false positives, classify text, and set reading order with the VLM
+4. alt_placement -- optionally classify text that must not be erased in place
+5. translations -- translate each page with the VLM
+6. proofreading -- optionally proofread translations in bounded batches
+7. translation_notes -- optionally create reusable notes for related translations
+8. placements -- determine text regions and styles
+9. render -- clean text with LaMa and draw translated text with ImageMagick
+10. package -- generate PNG, WebP, and JXL CBZ downloads
 
 ## Requirements
 
@@ -84,6 +86,7 @@ Persistent data is stored in:
 - `data/config/`: private runtime configuration
 - `data/fonts/`: user-provided font files and font-use guidance
 - `data/models/`: local PaddleOCR-VL model files
+- `data/prompts/`: editable VLM prompt templates
 - `data/jobs/`: source files, intermediate stages, logs, and results
 - `data/cache/`: PaddleOCR, Hugging Face, Torch, and LaMa model caches
 
@@ -96,9 +99,21 @@ Stopping the containers does not delete jobs or caches.
 - Change the password from the auto-generated one once inside.
 - Create a new category (no relation between jobs in the same category, they are just there to organize).
 - Choose a cbz or list of images.
-- Under advanced options, put in your translation notes, enable optional runs, source language, ocr engine, paddleocr server & model (should be auto filled), max thinking tokens, then submit job.
+- Under advanced options, set translation notes, optional passes, source language, OCR engine, endpoints, thinking tokens, and page worker counts, then submit the job.
 - Wait. (models will be downloaded on your first run, be warned!)
 - Download your cbz archive or view in browser.
+
+VLM prompts are plain text files in `data/prompts/`. They are read for each request, so edits apply to the next pass without restarting. See `data/prompts/README.md` for placeholder and custom-directory details.
+
+NOTE: For Gemma 4, the default tokens dedicated per image is relatively low which can cause poor performance. To max tokens per image, if running via llama.cpp add `--image-min-tokens 1120`, or with ExLlamaV3 go to your model's `processor_config.json` and set
+
+```json
+"image_processor": {
+    ...
+    "max_soft_tokens": 1120,
+    ...
+}
+```
 
 ## Extra
 

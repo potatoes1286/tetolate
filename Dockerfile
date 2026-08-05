@@ -133,8 +133,10 @@ COPY --from=imagemagick-builder /opt/imagemagick /opt/imagemagick
 COPY --from=app-dependency-builder /app/.venv /app/.venv
 
 WORKDIR /app
-COPY *.py web_editor.js ./
+COPY *.py ./
+COPY web_editor/ ./web_editor/
 COPY data/config /app/data/config
+COPY data/prompts /app/data/prompts
 COPY docker ./docker
 
 RUN magick -version \

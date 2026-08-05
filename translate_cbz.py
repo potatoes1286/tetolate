@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import math
@@ -15,9 +14,12 @@ import signal
 import sys
 import subprocess
 import tempfile
+import threading
 import time
+import unicodedata
 import zipfile
-from dataclasses import dataclass, replace
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -25,8 +27,39 @@ from urllib.parse import urlsplit
 from PIL import Image
 
 import clean_text_regions
+import editor_runtime
+import lama_inpaint
+from ocr_merge import (
+    merge_ocr_records_for_page,
+)
 import overlay_text
 import paddle_ocr_image
+from placement_detection import (
+    detect_expansions_page,
+    dominant_text_container_brightness,
+    expand_region,
+    expand_region_to_container_width,
+    normalized_box_to_region,
+    parse_expansion_value,
+    parse_fraction_value,
+    percentile,
+    region_to_normalized_box,
+    sampled_pixel_values,
+)
+from pipeline_types import (
+    LanguageConfig,
+    OCRConfig,
+    Page,
+    PipelineCancelled,
+    PipelineConfig,
+    PipelineError,
+    PostprocessConfig,
+    SourceLanguageProfile,
+    TargetLanguageProfile,
+    VLMConfig,
+)
+from prompt_templates import load_prompt
+from vlm_client import call_vlm, finalize_vlm_config, format_elapsed
 
 
 # File suffixes treated as CBZ page images during extraction and resume loading.
@@ -108,6 +141,16 @@ DEFAULT_TARGET_LANGUAGE = "en"
 # Default VLM response budget when max_tokens is omitted from the config.
 DEFAULT_VLM_MAX_TOKENS = 32768
 
+# Maximum records sent in one proofreading request. This leaves completion room
+# in models where the prompt and response share one context window.
+PROOFREADING_BATCH_MAX_RECORDS = 80
+
+# Maximum compact input characters sent in one proofreading request.
+PROOFREADING_BATCH_MAX_CHARACTERS = 16_000
+
+# Number of corrected records from the previous batch included for continuity.
+PROOFREADING_CONTEXT_RECORDS = 24
+
 # Default VLM sampling temperature when temperature is omitted from the config.
 DEFAULT_VLM_TEMPERATURE = 0.7
 
@@ -124,11 +167,12 @@ DEFAULT_VLM_THINKING_BUDGET_TOKENS = 2048
 # Number of times to retry a VLM call when JSON parsing or validation fails.
 DEFAULT_VLM_RETRIES = 3
 
-# Number of extra request-level retries for cold-start/model-loading HTTP 503s.
-DEFAULT_VLM_MODEL_LOADING_RETRIES = 6
+# Page-level worker defaults. Higher values increase CPU and memory use.
+DEFAULT_OCR_PAGE_WORKERS = 1
+DEFAULT_LAMA_WORKERS = 1
+DEFAULT_IMAGEMAGICK_WORKERS = 1
+MAX_PAGE_WORKERS = 32
 
-# Wait schedule in seconds for model-loading retries before the request is retried.
-VLM_MODEL_LOADING_BACKOFF_SECONDS = (10, 20, 40, 60, 60, 60)
 
 # Default outline width around rendered text; overlay_text may scale this upward on high-res pages.
 DEFAULT_RENDER_STROKE_WIDTH = 3
@@ -148,161 +192,18 @@ VLM_PLACEMENT_DEBUG_COLOR = "#00a86b"
 # Debug box color for detected/expanded non-open-lettering container regions.
 PLACEMENT_EXPAND_DEBUG_COLOR = "#ff9500"
 
-# Stroke width for debug bounding boxes drawn over page images.
-VLM_DEBUG_BOX_WIDTH = 3
+# Minimum stroke width for debug bounding boxes drawn over page images.
+VLM_DEBUG_BOX_WIDTH_MIN = 3
 
-# Font size for numeric debug labels drawn on bounding boxes.
-VLM_DEBUG_FONT_SIZE = 18
+# Box stroke width as a fraction of the page's shorter dimension.
+VLM_DEBUG_BOX_WIDTH_RATIO = 0.003
 
-# Minimum vertical overlap ratio required before neighboring OCR boxes can side-merge.
-OCR_MERGE_SIDE_OVERLAP_RATIO = 0.1
+# Minimum font size for numeric debug labels drawn on bounding boxes.
+VLM_DEBUG_FONT_SIZE_MIN = 18
 
-# Minimum horizontal overlap ratio required before stacked OCR boxes can merge.
-OCR_MERGE_STACK_OVERLAP_RATIO = 0.1
+# Debug label font size as a fraction of the page's shorter dimension.
+VLM_DEBUG_FONT_SIZE_RATIO = 0.025
 
-# Lower bound in pixels for the allowed horizontal gap between side-merged OCR boxes.
-OCR_MERGE_SIDE_GAP_MIN = 8
-
-# Upper bound in pixels for the allowed horizontal gap between side-merged OCR boxes.
-OCR_MERGE_SIDE_GAP_MAX = 12
-
-# Lower bound in pixels for the allowed vertical gap between stacked OCR boxes.
-OCR_MERGE_STACK_GAP_MIN = 4
-
-# Upper bound in pixels for the allowed vertical gap between stacked OCR boxes.
-OCR_MERGE_STACK_GAP_MAX = 8
-
-# Largest allowed height ratio between side-merged OCR boxes; prevents merging mismatched lines.
-OCR_MERGE_SIDE_HEIGHT_RATIO_MAX = 3.0
-
-# Fraction of the shorter box height used to limit side-merge centerline drift.
-OCR_MERGE_SIDE_CENTER_RATIO = 0.55
-
-# Minimum centerline drift tolerance in pixels for side-merge checks.
-OCR_MERGE_SIDE_CENTER_MIN = 12
-
-# Maximum centerline drift tolerance in pixels for side-merge checks.
-OCR_MERGE_SIDE_CENTER_MAX = 96
-
-# Vertical overlap ratio used by the special narrow-vertical-text side-merge path.
-OCR_MERGE_VERTICAL_SIDE_OVERLAP_RATIO = 0.25
-
-# Maximum horizontal gap for merging adjacent narrow vertical text columns.
-OCR_MERGE_VERTICAL_SIDE_GAP_MAX = 24
-
-# Minimum height/width ratio for a box to be treated as narrow vertical text.
-OCR_MERGE_VERTICAL_ASPECT_RATIO = 2.2
-
-# Maximum width in pixels for a box to qualify as narrow vertical text.
-OCR_MERGE_VERTICAL_MAX_WIDTH = 48
-
-# Maximum combined width after merging adjacent narrow vertical text boxes.
-OCR_MERGE_VERTICAL_COMBINED_WIDTH_MAX = 120
-
-# Centerline tolerance multiplier for adjacent narrow vertical text merges.
-OCR_MERGE_VERTICAL_CENTER_RATIO = 1.05
-
-# Maximum top-edge offset allowed when merging adjacent vertical text columns.
-OCR_MERGE_VERTICAL_TOP_ALIGNMENT_MAX = 32
-
-# Pixel color tolerances tried when detecting the containing white/blank text region.
-PLACEMENT_DETECT_TOLERANCES = (28, 42)
-
-# Minimum search padding around an OCR box when looking for a containing region.
-PLACEMENT_DETECT_MIN_SEARCH_PAD = 80
-
-# Multiplier used to grow the search area relative to the original OCR box size.
-PLACEMENT_DETECT_SEARCH_SCALE = 3.0
-
-# Reject detected regions larger than this fraction of the whole image.
-PLACEMENT_DETECT_MAX_IMAGE_AREA_RATIO = 0.50
-
-# Minimum inward trim applied to detected container regions before rendering text.
-PLACEMENT_DETECT_INSET_MIN = 4
-
-# Image-size-relative inward trim applied to detected container regions.
-PLACEMENT_DETECT_INSET_RATIO = 0.01
-
-# Fallback width expansion factor when container detection cannot find a better region.
-PLACEMENT_DETECT_FALLBACK_WIDENING = 1.0
-
-# Fallback height expansion factor when container detection cannot find a better region.
-PLACEMENT_DETECT_FALLBACK_HEIGHT_INCREASE = 0.25
-
-# Rays cast from an OCR box center to estimate container boundaries in eight directions.
-PLACEMENT_RAY_DIRECTIONS = (
-    ("left", -1.0, 0.0),
-    ("right", 1.0, 0.0),
-    ("up", 0.0, -1.0),
-    ("down", 0.0, 1.0),
-    ("up_left", -math.sqrt(0.5), -math.sqrt(0.5)),
-    ("up_right", math.sqrt(0.5), -math.sqrt(0.5)),
-    ("down_left", -math.sqrt(0.5), math.sqrt(0.5)),
-    ("down_right", math.sqrt(0.5), math.sqrt(0.5)),
-)
-
-# Thickness in pixels for sampling each placement boundary ray.
-PLACEMENT_RAY_THICKNESS = 3
-
-# Pixels near the original OCR box ignored so rays do not immediately hit the text itself.
-PLACEMENT_RAY_IGNORE_MARGIN = 4
-
-# Consecutive boundary-like pixels required before a ray treats an edge as a hit.
-PLACEMENT_RAY_BOUNDARY_RUN = 3
-
-# Grayscale value below which a sampled pixel counts as a dark boundary candidate.
-PLACEMENT_RAY_DARK_BOUNDARY = 110
-
-# Grayscale value above which a sampled pixel counts as a light background candidate.
-PLACEMENT_RAY_LIGHT_BOUNDARY = 145
-
-# Contrast threshold for mid-tone boundary detection in textured manga panels.
-PLACEMENT_RAY_MID_CONTRAST = 65
-
-# Per-step grayscale gradient threshold for detecting strong drawn edges.
-PLACEMENT_RAY_GRADIENT = 45
-
-# Minimum total ray hits required before ray-based placement expansion is trusted.
-PLACEMENT_RAY_MIN_HIT_COUNT = 4
-
-# Cardinal ray names used to require left/right/up/down evidence separately.
-PLACEMENT_RAY_CARDINAL_DIRECTIONS = {"left", "right", "up", "down"}
-
-# Minimum cardinal direction hits required before ray-based expansion is trusted.
-PLACEMENT_RAY_MIN_CARDINAL_HIT_COUNT = 3
-
-# Minimum horizontal padding around text boxes treated as blockers during expansion.
-PLACEMENT_BLOCKER_PAD_X_MIN = 2
-
-# Maximum horizontal padding around text boxes treated as blockers during expansion.
-PLACEMENT_BLOCKER_PAD_X_MAX = 6
-
-# Minimum vertical padding around text boxes treated as blockers during expansion.
-PLACEMENT_BLOCKER_PAD_Y_MIN = 4
-
-# Maximum vertical padding around text boxes treated as blockers during expansion.
-PLACEMENT_BLOCKER_PAD_Y_MAX = 8
-
-# Horizontal blocker padding as a fraction of the blocker text box width.
-PLACEMENT_BLOCKER_PAD_X_RATIO = 0.05
-
-# Vertical blocker padding as a fraction of the blocker text box height.
-PLACEMENT_BLOCKER_PAD_Y_RATIO = 0.04
-
-# Minimum downward shadow padding used to keep expansion away from nearby lower text.
-PLACEMENT_BLOCKER_SHADOW_PAD_Y_MIN = 24
-
-# Maximum downward shadow padding used to keep expansion away from nearby lower text.
-PLACEMENT_BLOCKER_SHADOW_PAD_Y_MAX = 48
-
-# Downward shadow padding as a fraction of blocker height.
-PLACEMENT_BLOCKER_SHADOW_PAD_Y_RATIO = 0.22
-
-# Minimum width for the downward blocker shadow region.
-PLACEMENT_BLOCKER_SHADOW_WIDTH_MIN = 18
-
-# Downward blocker shadow width as a fraction of blocker width.
-PLACEMENT_BLOCKER_SHADOW_WIDTH_RATIO = 0.55
 
 # Ordered phase names accepted by --resume-from.
 RESUME_PHASES = (
@@ -321,131 +222,10 @@ RESUME_PHASES = (
 # Resume phases that can safely regenerate exactly one page and reuse existing later files.
 SINGLE_PAGE_PHASES = {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}
 
-# Possible streaming delta fields used by OpenAI-compatible endpoints for hidden reasoning text.
-REASONING_FIELD_NAMES = (
-    "reasoning_content",
-    "reasoning",
-    "reasoning_delta",
-    "thoughts",
-    "thinking",
-    "analysis",
-)
-
-
-class PipelineError(RuntimeError):
-    """Raised when the pipeline cannot continue safely."""
-
-
-class PipelineCancelled(PipelineError):
-    """Raised when the pipeline receives a termination signal."""
 
 
 def handle_cancel_signal(signum: int, _frame: Any) -> None:
     raise PipelineCancelled(f"received signal {signum}; cancelling pipeline")
-
-
-@dataclass(frozen=True)
-class Page:
-    index: int
-    image_path: Path
-
-
-@dataclass(frozen=True)
-class VLMConfig:
-    base_url: str
-    api_key: str
-    model: str | None
-    temperature: float
-    max_tokens: int
-    thinking_budget_tokens: int
-    timeout: float
-    provider: dict[str, Any] | None
-
-
-@dataclass(frozen=True)
-class VLMStreamResult:
-    output: str
-    reasoning: str
-    elapsed_seconds: float
-    generated_tokens: int
-    completion_tokens: int | None
-    reasoning_chunks: int
-    output_chunks: int
-
-
-@dataclass(frozen=True)
-class OCRConfig:
-    engine: str
-    service_url: str | None
-    service_timeout: float
-    lang: str
-    device: str
-    min_score: float
-    text_det_limit_side_len: int | None
-    text_det_limit_type: str | None
-    use_doc_preprocessor: bool
-    use_textline_orientation: bool
-    ocr_version: str | None
-    text_detection_model_name: str | None
-    text_recognition_model_name: str | None
-    text_detection_model_dir: str | None
-    text_recognition_model_dir: str | None
-    text_det_thresh: float | None
-    text_det_box_thresh: float | None
-    text_det_unclip_ratio: float | None
-    text_rec_score_thresh: float | None
-    tile_enabled: bool
-    tile_width: int
-    tile_height: int
-    tile_overlap: int
-    tile_include_full_image: bool
-    tile_dedupe_iou: float
-    tile_dedupe_containment: float
-    paddleocr_vl_server_url: str
-    paddleocr_vl_model: str
-    paddleocr_vl_api_key: str | None
-    paddleocr_vl_max_concurrency: int | None
-
-
-@dataclass(frozen=True)
-class SourceLanguageProfile:
-    code: str
-    name: str
-    ocr_lang: str
-    reading_order: str
-    structure_context: str
-
-
-@dataclass(frozen=True)
-class TargetLanguageProfile:
-    code: str
-    name: str
-
-
-@dataclass(frozen=True)
-class LanguageConfig:
-    source: SourceLanguageProfile
-    target: TargetLanguageProfile
-
-
-@dataclass(frozen=True)
-class PostprocessConfig:
-    proofread_translations: bool
-    write_translation_notes: bool
-
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    vlm: VLMConfig | None
-    language: LanguageConfig
-    render_font: str
-    render_fill: str
-    render_gravity: str
-    webp_quality: int
-    jxl_quality: int
-    alt_placement_enabled: bool
-    ocr: OCRConfig
-    postprocess: PostprocessConfig
 
 
 SOURCE_LANGUAGE_PROFILES: dict[str, SourceLanguageProfile] = {
@@ -592,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--translation-boxno",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--skip-package",
         action="store_true",
         help=(
@@ -615,6 +400,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON file with job/page translation notes for VLM translation prompts.",
     )
     parser.add_argument(
+        "--editor-manifest",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--editor-baseline-dir",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--thinking-budget-tokens",
         type=int,
         help=(
@@ -625,6 +420,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vlm-base-url",
         help="Override the OpenAI-compatible VLM base URL from the config.",
+    )
+    parser.add_argument(
+        "--vlm-api-key",
+        help="Override the OpenAI-compatible VLM API key from the config.",
     )
     parser.add_argument(
         "--source-language",
@@ -687,8 +486,23 @@ def parse_args() -> argparse.Namespace:
         help="Override the hidden PaddleOCR-VL request concurrency.",
     )
     parser.add_argument(
+        "--ocr-workers",
+        type=int,
+        help="Concurrent PaddleOCR-VL page workers. Regular PaddleOCR stays serial.",
+    )
+    parser.add_argument(
+        "--lama-workers",
+        type=int,
+        help="Concurrent LaMa page-cleaning workers.",
+    )
+    parser.add_argument(
+        "--imagemagick-workers",
+        type=int,
+        help="Concurrent ImageMagick page-typesetting workers.",
+    )
+    parser.add_argument(
         "--stop-after",
-        choices=("ocr_raw",),
+        choices=("ocr_merged",),
         help="Stop successfully after the named phase instead of running the full pipeline.",
     )
     return parser.parse_args()
@@ -696,6 +510,22 @@ def parse_args() -> argparse.Namespace:
 
 def reject_nonfinite_json(value: str) -> Any:
     raise ValueError(f"non-finite number {value}")
+
+
+def normalize_page_workers(value: Any, label: str) -> int:
+    if isinstance(value, bool):
+        raise PipelineError(f"{label} must be an integer from 1 to {MAX_PAGE_WORKERS}.")
+    if isinstance(value, float) and not value.is_integer():
+        raise PipelineError(f"{label} must be an integer from 1 to {MAX_PAGE_WORKERS}.")
+    try:
+        workers = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(
+            f"{label} must be an integer from 1 to {MAX_PAGE_WORKERS}."
+        ) from exc
+    if workers < 1 or workers > MAX_PAGE_WORKERS:
+        raise PipelineError(f"{label} must be from 1 to {MAX_PAGE_WORKERS}.")
+    return workers
 
 
 def load_json(path: Path, label: str) -> Any:
@@ -978,6 +808,9 @@ def load_config(path: Path | None, fixture_dir: Path | None) -> PipelineConfig:
             DEFAULT_ALT_PLACEMENT_ENABLED if fixture_dir is None else False,
             "alt_placement",
         ),
+        ocr_page_workers=DEFAULT_OCR_PAGE_WORKERS,
+        lama_workers=DEFAULT_LAMA_WORKERS,
+        imagemagick_workers=DEFAULT_IMAGEMAGICK_WORKERS,
         ocr=load_ocr_config(ocr, language),
         postprocess=load_postprocess_config(postprocess, fixture_dir is None),
     )
@@ -1297,419 +1130,6 @@ def translated_jxl_cbz_path(output_dir: Path) -> Path:
     return output_dir / TRANSLATED_JXL_CBZ_NAME
 
 
-def load_image_data_url(path: Path) -> str:
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
-def chat_content_to_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        return "\n".join(parts)
-    return str(content)
-
-
-def object_field(value: Any, key: str, default: Any = None) -> Any:
-    if value is None:
-        return default
-    if isinstance(value, dict):
-        return value.get(key, default)
-    if hasattr(value, key):
-        return getattr(value, key)
-    model_extra = getattr(value, "model_extra", None)
-    if isinstance(model_extra, dict) and key in model_extra:
-        return model_extra[key]
-    pydantic_extra = getattr(value, "__pydantic_extra__", None)
-    if isinstance(pydantic_extra, dict) and key in pydantic_extra:
-        return pydantic_extra[key]
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        try:
-            dumped = model_dump()
-        except TypeError:
-            dumped = {}
-        if isinstance(dumped, dict):
-            return dumped.get(key, default)
-    return default
-
-
-def text_from_delta_field(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return chat_content_to_text(value)
-    return str(value)
-
-
-def answer_delta_text(delta: Any) -> str:
-    return text_from_delta_field(object_field(delta, "content"))
-
-
-def reasoning_delta_text(delta: Any) -> str:
-    for field_name in REASONING_FIELD_NAMES:
-        text = text_from_delta_field(object_field(delta, field_name))
-        if text:
-            return text
-    return ""
-
-
-def chunk_choices(chunk: Any) -> list[Any]:
-    choices = object_field(chunk, "choices", [])
-    if choices is None:
-        return []
-    return list(choices)
-
-
-def usage_completion_tokens(chunk: Any) -> int | None:
-    usage = object_field(chunk, "usage")
-    if usage is None:
-        return None
-    completion_tokens = object_field(usage, "completion_tokens")
-    if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
-        return completion_tokens
-    return None
-
-
-def vlm_status_live_updates_enabled() -> bool:
-    return sys.stderr.isatty()
-
-
-def write_vlm_status_line(text: str, previous_length: int) -> int:
-    if not vlm_status_live_updates_enabled():
-        return previous_length
-    clear = " " * max(0, previous_length - len(text))
-    print(f"\r{text}{clear}", end="", file=sys.stderr, flush=True)
-    return len(text)
-
-
-def clear_vlm_status_line(previous_length: int) -> None:
-    if previous_length and vlm_status_live_updates_enabled():
-        print(f"\r{' ' * previous_length}\r", end="", file=sys.stderr, flush=True)
-
-
-def format_elapsed(seconds: float) -> str:
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    minutes = int(seconds // 60)
-    remaining_seconds = seconds - minutes * 60
-    return f"{minutes}m{remaining_seconds:04.1f}s"
-
-
-def vlm_status_text(label: str, state: str, token_count: int, elapsed: float) -> str:
-    return (
-        f"{label}: {state} | {format_elapsed(elapsed)} elapsed | "
-        f"{token_count} tokens | {token_count / max(elapsed, 0.001):.1f} tok/s"
-    )
-
-
-def finish_vlm_status_line(
-    label: str,
-    state: str,
-    generated_tokens: int,
-    elapsed: float,
-    previous_length: int,
-    completion_tokens: int | None,
-) -> None:
-    token_count = completion_tokens if completion_tokens is not None else generated_tokens
-    status = vlm_status_text(label, f"done {state}", token_count, elapsed)
-    if vlm_status_live_updates_enabled():
-        write_vlm_status_line(status, previous_length)
-        print(file=sys.stderr, flush=True)
-    else:
-        print(status, file=sys.stderr, flush=True)
-
-
-def close_vlm_stream(stream: Any) -> None:
-    close = getattr(stream, "close", None)
-    if callable(close):
-        try:
-            close()
-        except Exception:
-            pass
-
-
-def stream_vlm_response(stream: Any, label: str) -> VLMStreamResult:
-    started_at = time.monotonic()
-    generated_tokens = 0
-    completion_tokens: int | None = None
-    reasoning_chunks = 0
-    output_chunks = 0
-    state = "waiting"
-    previous_length = write_vlm_status_line(vlm_status_text(label, state, 0, 0.0), 0)
-    reasoning_parts: list[str] = []
-    answer_parts: list[str] = []
-
-    try:
-        for chunk in stream:
-            maybe_completion_tokens = usage_completion_tokens(chunk)
-            if maybe_completion_tokens is not None:
-                completion_tokens = maybe_completion_tokens
-
-            chunk_changed = maybe_completion_tokens is not None
-            for choice in chunk_choices(chunk):
-                delta = object_field(choice, "delta", {})
-                reasoning_text = reasoning_delta_text(delta)
-                answer_text = answer_delta_text(delta)
-                if reasoning_text:
-                    state = "reasoning"
-                    generated_tokens += 1
-                    reasoning_chunks += 1
-                    chunk_changed = True
-                    reasoning_parts.append(reasoning_text)
-                if answer_text:
-                    state = "answering"
-                    generated_tokens += 1
-                    output_chunks += 1
-                    chunk_changed = True
-                    answer_parts.append(answer_text)
-
-            if chunk_changed:
-                elapsed = max(time.monotonic() - started_at, 0.001)
-                token_count = completion_tokens if completion_tokens is not None else generated_tokens
-                previous_length = write_vlm_status_line(
-                    vlm_status_text(label, state, token_count, elapsed),
-                    previous_length,
-                )
-    except Exception:
-        clear_vlm_status_line(previous_length)
-        raise
-    finally:
-        close_vlm_stream(stream)
-
-    elapsed = max(time.monotonic() - started_at, 0.001)
-    finish_vlm_status_line(
-        label,
-        state,
-        generated_tokens,
-        elapsed,
-        previous_length,
-        completion_tokens,
-    )
-    return VLMStreamResult(
-        output="".join(answer_parts),
-        reasoning="".join(reasoning_parts),
-        elapsed_seconds=elapsed,
-        generated_tokens=generated_tokens,
-        completion_tokens=completion_tokens,
-        reasoning_chunks=reasoning_chunks,
-        output_chunks=output_chunks,
-    )
-
-
-def stream_options_unsupported(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "stream_options" in message or "include_usage" in message
-
-
-def vlm_exception_status_code(exc: Exception) -> int | None:
-    status_code = getattr(exc, "status_code", None)
-    if isinstance(status_code, int) and not isinstance(status_code, bool):
-        return status_code
-    response = getattr(exc, "response", None)
-    response_status = getattr(response, "status_code", None)
-    if isinstance(response_status, int) and not isinstance(response_status, bool):
-        return response_status
-    return None
-
-
-def vlm_exception_text(exc: Exception) -> str:
-    parts = [str(exc)]
-    for attr in ("body", "response", "message"):
-        value = getattr(exc, attr, None)
-        if value is not None:
-            parts.append(str(value))
-    return "\n".join(parts).lower()
-
-
-def vlm_model_loading_error(exc: Exception) -> bool:
-    status_code = vlm_exception_status_code(exc)
-    text = vlm_exception_text(exc)
-    has_503 = status_code == 503 or "error code: 503" in text or "'code': 503" in text
-    if not has_503:
-        return False
-    return (
-        "loading model" in text
-        or "model loading" in text
-        or "unavailable_error" in text
-        or "unavailable" in text
-    )
-
-
-def create_vlm_stream(client: Any, request_args: dict[str, Any], include_usage: bool) -> Any:
-    if include_usage:
-        return client.chat.completions.create(
-            **request_args,
-            stream_options={"include_usage": True},
-        )
-    return client.chat.completions.create(**request_args)
-
-
-def call_vlm_once(client: Any, request_args: dict[str, Any], label: str) -> VLMStreamResult:
-    try:
-        return stream_vlm_response(create_vlm_stream(client, request_args, True), label)
-    except PipelineCancelled:
-        raise
-    except Exception as exc:
-        if not stream_options_unsupported(exc):
-            raise
-        print(
-            f"{label}: endpoint rejected stream_options; retrying without usage stats",
-            file=sys.stderr,
-        )
-
-    return stream_vlm_response(create_vlm_stream(client, request_args, False), label)
-
-
-def openai_client(config: VLMConfig) -> Any:
-    try:
-        from openai import OpenAI
-    except ModuleNotFoundError as exc:
-        raise PipelineError(
-            "The OpenAI Python client is not installed. Run `uv add openai` in this project."
-        ) from exc
-
-    return OpenAI(
-        base_url=config.base_url,
-        api_key=config.api_key,
-        timeout=config.timeout,
-    )
-
-
-def close_openai_client(client: Any) -> None:
-    close = getattr(client, "close", None)
-    if not callable(close):
-        return
-    try:
-        close()
-    except Exception as exc:
-        print(f"warning: failed to close VLM client: {exc}", file=sys.stderr)
-
-
-def vlm_extra_body(config: VLMConfig) -> dict[str, Any]:
-    extra_body: dict[str, Any] = {}
-    if config.provider is not None:
-        extra_body["provider"] = config.provider
-    if config.thinking_budget_tokens >= 0:
-        extra_body["thinking_budget_tokens"] = config.thinking_budget_tokens
-        if config.thinking_budget_tokens == 0:
-            chat_template_kwargs = extra_body.setdefault("chat_template_kwargs", {})
-            if isinstance(chat_template_kwargs, dict):
-                chat_template_kwargs["enable_thinking"] = False
-    return extra_body
-
-
-def finalize_vlm_config(config: PipelineConfig) -> PipelineConfig:
-    if config.vlm is None or config.vlm.model:
-        return config
-
-    client = openai_client(config.vlm)
-    try:
-        model = resolve_vlm_model(client, config.vlm)
-    finally:
-        close_openai_client(client)
-    return replace(config, vlm=replace(config.vlm, model=model))
-
-
-def call_vlm(
-    config: VLMConfig,
-    prompt: str,
-    image_path: Path | None,
-    label: str,
-    system_prompt: str = "Return only valid JSON. Do not include markdown or explanations.",
-) -> VLMStreamResult:
-    client = openai_client(config)
-    if not config.model:
-        raise PipelineError("VLM model was not resolved before calling the VLM.")
-    user_content: Any = prompt
-    if image_path is not None:
-        user_content = [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": load_image_data_url(image_path)}},
-        ]
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
-    ]
-    request_args = {
-        "model": config.model,
-        "temperature": config.temperature,
-        "max_tokens": config.max_tokens,
-        "messages": messages,
-        "stream": True,
-    }
-    extra_body = vlm_extra_body(config)
-    if extra_body:
-        request_args["extra_body"] = extra_body
-
-    try:
-        for loading_attempt in range(1, DEFAULT_VLM_MODEL_LOADING_RETRIES + 2):
-            try:
-                return call_vlm_once(client, request_args, label)
-            except PipelineCancelled:
-                raise
-            except Exception as exc:
-                if (
-                    loading_attempt > DEFAULT_VLM_MODEL_LOADING_RETRIES
-                    or not vlm_model_loading_error(exc)
-                ):
-                    raise PipelineError(f"VLM request failed for {label}: {exc}") from exc
-                wait_seconds = VLM_MODEL_LOADING_BACKOFF_SECONDS[
-                    min(loading_attempt - 1, len(VLM_MODEL_LOADING_BACKOFF_SECONDS) - 1)
-                ]
-                print(
-                    (
-                        f"{label}: model is loading/unavailable; waiting {wait_seconds}s "
-                        f"before request retry {loading_attempt}/{DEFAULT_VLM_MODEL_LOADING_RETRIES}"
-                    ),
-                    file=sys.stderr,
-                )
-                time.sleep(wait_seconds)
-    finally:
-        close_openai_client(client)
-
-    raise PipelineError(f"VLM request failed for {label}: exhausted model-loading retries")
-
-
-def resolve_vlm_model(client: Any, config: VLMConfig) -> str:
-    if config.model:
-        return config.model
-
-    try:
-        models = client.models.list()
-    except PipelineCancelled:
-        raise
-    except Exception as exc:
-        raise PipelineError(
-            f"Config model is empty and model discovery failed at {config.base_url}: {exc}"
-        ) from exc
-
-    data = getattr(models, "data", None)
-    if not data:
-        raise PipelineError(
-            f"Config model is empty and no models were returned by {config.base_url}."
-        )
-
-    first = data[0]
-    model_id = getattr(first, "id", None)
-    if not isinstance(model_id, str) or not model_id:
-        raise PipelineError(
-            f"Config model is empty and the first discovered model has no string id: {first!r}"
-        )
-    print(f"Using discovered VLM model: {model_id}", file=sys.stderr)
-    return model_id
 
 
 def strip_markdown_code_fence(raw_text: str) -> str:
@@ -1818,13 +1238,6 @@ def parse_json_array(raw_text: str, raw_path: Path) -> list[Any]:
     return parsed
 
 
-def vlm_attempt_stem(page: Page, attempt: int | None = None) -> str:
-    stem = page_name(page.index)
-    if attempt is None:
-        return stem
-    return f"{stem}.attempt_{attempt}"
-
-
 def vlm_named_attempt_stem(stem: str, attempt: int | None = None) -> str:
     if attempt is None:
         return stem
@@ -1856,7 +1269,7 @@ def call_vlm_named(
     config: VLMConfig,
     image_path: Path | None = None,
     attempt: int | None = None,
-    system_prompt: str = "Return only valid JSON. Do not include markdown or explanations.",
+    system_prompt: str | None = None,
 ) -> str:
     raw_path = vlm_raw_named_path(output_dir, phase, stem, attempt)
     raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2040,12 +1453,10 @@ def prompt_with_validation_feedback(
 ) -> str:
     if last_error is None:
         return prompt
-    return (
-        prompt
-        + "\n\nVALIDATION RETRY:\n"
-        + f"The previous response was rejected: {last_error}\n"
-        + "Return the complete response again, correcting that error and following "
-        + "the requested schema exactly. Do not explain the correction."
+    return load_prompt(
+        "validation_retry.txt",
+        prompt=prompt,
+        error=last_error,
     )
 
 
@@ -2105,65 +1516,6 @@ def get_validated_vlm_array(
     )
 
 
-def get_validated_vlm_array_named(
-    phase: str,
-    stem: str,
-    label: str,
-    prompt: str,
-    output_dir: Path,
-    config: VLMConfig | None,
-    fixture_dir: Path | None,
-    validator: Callable[[list[Any]], Any],
-) -> Any:
-    if fixture_dir is not None:
-        fixture_path = fixture_dir / phase / f"{stem}.json"
-        data = load_json(fixture_path, f"{phase} fixture")
-        if isinstance(data, dict) and isinstance(data.get("rows"), list):
-            return validator(data["rows"])
-        if not isinstance(data, list):
-            raise PipelineError(f"Fixture must be a JSON array or object with rows: {fixture_path}")
-        return validator(data)
-    if config is None:
-        raise PipelineError("VLM config is missing.")
-
-    last_error: Exception | None = None
-    for attempt in range(1, DEFAULT_VLM_RETRIES + 1):
-        try:
-            raw_text = call_vlm_named(
-                phase,
-                stem,
-                label,
-                prompt_with_validation_feedback(prompt, last_error),
-                output_dir,
-                config,
-                attempt=attempt,
-            )
-            items = parse_json_array(raw_text, vlm_raw_named_path(output_dir, phase, stem, attempt))
-            validated = validator(items)
-        except PipelineCancelled:
-            raise
-        except PipelineError as exc:
-            last_error = exc
-            mark_vlm_named_attempt_failed(phase, stem, output_dir, config, None, attempt, exc)
-            print(
-                (
-                    f"warning: {label} attempt {attempt}/{DEFAULT_VLM_RETRIES} "
-                    f"failed: {exc}"
-                ),
-                file=sys.stderr,
-            )
-            if attempt == DEFAULT_VLM_RETRIES:
-                raise PipelineError(
-                    f"{label} failed after {DEFAULT_VLM_RETRIES} attempts: {exc}"
-                ) from exc
-            continue
-
-        promote_vlm_named_attempt_files(output_dir, phase, stem, attempt)
-        return validated
-
-    raise PipelineError(f"{label} failed after {DEFAULT_VLM_RETRIES} attempts: {last_error}")
-
-
 def get_vlm_text_named(
     phase: str,
     stem: str,
@@ -2185,10 +1537,7 @@ def get_vlm_text_named(
         prompt,
         output_dir,
         config,
-        system_prompt=(
-            "Write concise plain text. Do not use JSON, markdown code fences, or explanations "
-            "outside the requested notes."
-        ),
+        system_prompt=load_prompt("system_plain_text_notes.txt"),
     )
 
 
@@ -2201,16 +1550,15 @@ def get_validated_vlm_text_named(
     config: VLMConfig | None,
     fixture_dir: Path | None,
     validator: Callable[[str], Any],
-    system_prompt: str = (
-        "Return only the requested plain text. Do not use JSON, markdown code fences, "
-        "bullets, numbering, or explanations."
-    ),
+    system_prompt: str | None = None,
 ) -> Any:
     if fixture_dir is not None:
         fixture_path = fixture_dir / phase / f"{stem}.txt"
         return validator(fixture_path.read_text(encoding="utf-8"))
     if config is None:
         raise PipelineError("VLM config is missing.")
+    if system_prompt is None:
+        system_prompt = load_prompt("system_plain_text_lines.txt")
 
     last_error: Exception | None = None
     for attempt in range(1, DEFAULT_VLM_RETRIES + 1):
@@ -2258,18 +1606,18 @@ def run_ocr(
     end_page: int | None = None,
     existing_by_page: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
-    if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
-        ocr = paddle_ocr_image.create_paddleocr_vl(
-            config.ocr.device,
-            config.ocr.paddleocr_vl_server_url,
-            config.ocr.paddleocr_vl_model,
-            api_key=config.ocr.paddleocr_vl_api_key,
-            max_concurrency=config.ocr.paddleocr_vl_max_concurrency,
-            service_url=config.ocr.service_url,
-            service_timeout=config.ocr.service_timeout,
-        )
-    else:
-        ocr = paddle_ocr_image.create_paddle_ocr(
+    def create_engine() -> Any:
+        if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
+            return paddle_ocr_image.create_paddleocr_vl(
+                config.ocr.device,
+                config.ocr.paddleocr_vl_server_url,
+                config.ocr.paddleocr_vl_model,
+                api_key=config.ocr.paddleocr_vl_api_key,
+                max_concurrency=config.ocr.paddleocr_vl_max_concurrency,
+                service_url=config.ocr.service_url,
+                service_timeout=config.ocr.service_timeout,
+            )
+        return paddle_ocr_image.create_paddle_ocr(
             config.ocr.lang,
             config.ocr.device,
             config.ocr.text_det_limit_side_len,
@@ -2289,8 +1637,7 @@ def run_ocr(
             service_timeout=config.ocr.service_timeout,
         )
 
-    by_page: dict[int, list[dict[str, Any]]] = dict(existing_by_page or {})
-    for page in pages_in_range(pages, start_page, end_page):
+    def extract_page(ocr: Any, page: Page) -> list[dict[str, Any]]:
         print(f"OCR page {page.index}", file=sys.stderr)
         if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
             print(
@@ -2300,51 +1647,100 @@ def run_ocr(
                 ),
                 file=sys.stderr,
             )
-            records = paddle_ocr_image.extract_paddleocr_vl_image_records(
+            return paddle_ocr_image.extract_paddleocr_vl_image_records(
                 ocr,
                 page.image_path,
                 page.index,
                 config.ocr.min_score,
             )
-        else:
-            if config.ocr.tile_enabled:
-                print(
-                    (
-                        f"OCR page {page.index}: tiled "
-                        f"{config.ocr.tile_width}x{config.ocr.tile_height} "
-                        f"overlap {config.ocr.tile_overlap}"
-                    ),
-                    file=sys.stderr,
-                )
-            records = paddle_ocr_image.extract_image_records(
-                ocr,
-                page.image_path,
-                page.index,
-                config.ocr.min_score,
-                tile_enabled=config.ocr.tile_enabled,
-                tile_width=config.ocr.tile_width,
-                tile_height=config.ocr.tile_height,
-                tile_overlap=config.ocr.tile_overlap,
-                tile_include_full_image=config.ocr.tile_include_full_image,
-                tile_dedupe_iou=config.ocr.tile_dedupe_iou,
-                tile_dedupe_containment=config.ocr.tile_dedupe_containment,
-            )
-        if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL and config.ocr.tile_enabled:
+        if config.ocr.tile_enabled:
             print(
-                f"OCR page {page.index}: warning: tiled OCR is ignored by PaddleOCR-VL.",
+                (
+                    f"OCR page {page.index}: tiled "
+                    f"{config.ocr.tile_width}x{config.ocr.tile_height} "
+                    f"overlap {config.ocr.tile_overlap}"
+                ),
                 file=sys.stderr,
             )
-        by_page[page.index] = records
-        write_json(data_page_path(output_dir, "ocr_raw", page), records)
+        return paddle_ocr_image.extract_image_records(
+            ocr,
+            page.image_path,
+            page.index,
+            config.ocr.min_score,
+            tile_enabled=config.ocr.tile_enabled,
+            tile_width=config.ocr.tile_width,
+            tile_height=config.ocr.tile_height,
+            tile_overlap=config.ocr.tile_overlap,
+            tile_include_full_image=config.ocr.tile_include_full_image,
+            tile_dedupe_iou=config.ocr.tile_dedupe_iou,
+            tile_dedupe_containment=config.ocr.tile_dedupe_containment,
+        )
+
+    def store_page(page: Page, records: list[dict[str, Any]]) -> None:
+        by_page[page.index] = editor_runtime.reconcile_records(
+            "ocr_raw", page.index, records, "ocr"
+        )
+        write_json(data_page_path(output_dir, "ocr_raw", page), by_page[page.index])
+        box_width, font_size = debug_annotation_size(page.image_path)
         paddle_ocr_image.draw_boxes(
-            records,
+            by_page[page.index],
             page.image_path,
             debug_image_path(output_dir, "ocr_raw_img", page),
             "#ff2d55",
-            3,
-            18,
+            box_width,
+            font_size,
         )
-    paddle_ocr_image.close_ocr_engine(ocr)
+
+    selected_pages = pages_in_range(pages, start_page, end_page)
+    by_page: dict[int, list[dict[str, Any]]] = dict(existing_by_page or {})
+    if not selected_pages:
+        ensure_all_pages(by_page, pages, "OCR records")
+        return by_page
+    worker_count = (
+        config.ocr_page_workers
+        if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL
+        else 1
+    )
+    if config.ocr.engine != paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL and config.ocr_page_workers > 1:
+        print("warning: OCR page workers are ignored for regular PaddleOCR.", file=sys.stderr)
+    if config.ocr.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL and config.ocr.tile_enabled:
+        print("warning: tiled OCR is ignored by PaddleOCR-VL.", file=sys.stderr)
+
+    if worker_count == 1 or len(selected_pages) < 2:
+        ocr = create_engine()
+        try:
+            for page in selected_pages:
+                store_page(page, extract_page(ocr, page))
+        finally:
+            paddle_ocr_image.close_ocr_engine(ocr)
+    else:
+        worker_state = threading.local()
+        engines: list[Any] = []
+        engines_lock = threading.Lock()
+
+        def parallel_extract(page: Page) -> list[dict[str, Any]]:
+            ocr = getattr(worker_state, "ocr", None)
+            if ocr is None:
+                ocr = create_engine()
+                worker_state.ocr = ocr
+                with engines_lock:
+                    engines.append(ocr)
+            return extract_page(ocr, page)
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=min(worker_count, len(selected_pages)),
+                thread_name_prefix="tetolate-ocr",
+            ) as executor:
+                futures = {
+                    page.index: executor.submit(parallel_extract, page)
+                    for page in selected_pages
+                }
+                for page in selected_pages:
+                    store_page(page, futures[page.index].result())
+        finally:
+            for ocr in engines:
+                paddle_ocr_image.close_ocr_engine(ocr)
     ensure_all_pages(by_page, pages, "OCR records")
     return by_page
 
@@ -2354,6 +1750,20 @@ def flatten_pages(by_page: dict[int, list[dict[str, Any]]]) -> list[dict[str, An
     for page in sorted(by_page):
         records.extend(by_page[page])
     return records
+
+
+def debug_annotation_size(image_path: Path) -> tuple[int, int]:
+    with Image.open(image_path) as image:
+        shorter_dimension = min(image.size)
+    box_width = max(
+        VLM_DEBUG_BOX_WIDTH_MIN,
+        round(shorter_dimension * VLM_DEBUG_BOX_WIDTH_RATIO),
+    )
+    font_size = max(
+        VLM_DEBUG_FONT_SIZE_MIN,
+        round(shorter_dimension * VLM_DEBUG_FONT_SIZE_RATIO),
+    )
+    return box_width, font_size
 
 
 def draw_region_debug_image(
@@ -2376,13 +1786,14 @@ def draw_region_debug_image(
                     "region": region,
                 }
             )
+    box_width, font_size = debug_annotation_size(page.image_path)
     paddle_ocr_image.draw_boxes(
         debug_records,
         page.image_path,
         output_path,
         color,
-        VLM_DEBUG_BOX_WIDTH,
-        VLM_DEBUG_FONT_SIZE,
+        box_width,
+        font_size,
     )
     return output_path
 
@@ -2392,16 +1803,13 @@ def ensure_structured_debug_image(
     page: Page,
     output_dir: Path,
 ) -> Path:
-    output_path = debug_image_path(output_dir, "ocr_structured_img", page)
-    if not output_path.exists():
-        draw_region_debug_image(
-            records,
-            page,
-            output_dir,
-            "ocr_structured_img",
-            VLM_STRUCTURED_DEBUG_COLOR,
-        )
-    return output_path
+    return draw_region_debug_image(
+        records,
+        page,
+        output_dir,
+        "ocr_structured_img",
+        VLM_STRUCTURED_DEBUG_COLOR,
+    )
 
 
 def pages_before(pages: list[Page], page_index: int) -> list[Page]:
@@ -2453,13 +1861,6 @@ def load_phase_records(
         records = load_json_array(path, f"{label} page {page.index}")
         by_page[page.index] = [require_object(record, f"{label} page {page.index} item {index}") for index, record in enumerate(records)]
     return by_page
-
-
-def summarize_records(records: list[dict[str, Any]], fields: tuple[str, ...]) -> str:
-    compact: list[dict[str, Any]] = []
-    for record in records:
-        compact.append({field: record[field] for field in fields if field in record})
-    return json.dumps(compact, ensure_ascii=False, indent=2)
 
 
 def compact_prompt_value(value: Any) -> Any:
@@ -2640,242 +2041,6 @@ def font_use_prompt(backup_font: str) -> str:
     return "\n".join(lines)
 
 
-def region_width(region: list[int | float]) -> float:
-    return max(0.0, float(region[2]) - float(region[0]))
-
-
-def region_height(region: list[int | float]) -> float:
-    return max(0.0, float(region[3]) - float(region[1]))
-
-
-def region_center_x(region: list[int | float]) -> float:
-    return (float(region[0]) + float(region[2])) / 2.0
-
-
-def region_center_y(region: list[int | float]) -> float:
-    return (float(region[1]) + float(region[3])) / 2.0
-
-
-def axis_overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> float:
-    return max(0.0, min(a_max, b_max) - max(a_min, b_min))
-
-
-def axis_gap(a_min: float, a_max: float, b_min: float, b_max: float) -> float:
-    return max(0.0, max(a_min, b_min) - min(a_max, b_max))
-
-
-def merge_side_gap_limit(a: list[int | float], b: list[int | float]) -> float:
-    min_width = min(region_width(a), region_width(b))
-    min_height = min(region_height(a), region_height(b))
-    return max(
-        OCR_MERGE_SIDE_GAP_MIN,
-        min(OCR_MERGE_SIDE_GAP_MAX, max(min_width * 1.2, min_height * 0.06)),
-    )
-
-
-def merge_stack_gap_limit(a: list[int | float], b: list[int | float]) -> float:
-    min_width = min(region_width(a), region_width(b))
-    min_height = min(region_height(a), region_height(b))
-    return max(
-        OCR_MERGE_STACK_GAP_MIN,
-        min(OCR_MERGE_STACK_GAP_MAX, max(min_width * 0.8, min_height * 0.05)),
-    )
-
-
-def merge_side_center_limit(a: list[int | float], b: list[int | float]) -> float:
-    min_height = min(region_height(a), region_height(b))
-    return max(
-        OCR_MERGE_SIDE_CENTER_MIN,
-        min(OCR_MERGE_SIDE_CENTER_MAX, min_height * OCR_MERGE_SIDE_CENTER_RATIO),
-    )
-
-
-def can_side_merge_ocr_records(
-    a_region: list[int | float],
-    b_region: list[int | float],
-    a_height: float,
-    b_height: float,
-) -> bool:
-    height_ratio = max(a_height, b_height) / min(a_height, b_height)
-    if height_ratio > OCR_MERGE_SIDE_HEIGHT_RATIO_MAX:
-        return False
-
-    center_delta = abs(region_center_y(a_region) - region_center_y(b_region))
-    return center_delta <= merge_side_center_limit(a_region, b_region)
-
-
-def is_narrow_vertical_text_region(width: float, height: float) -> bool:
-    return width <= OCR_MERGE_VERTICAL_MAX_WIDTH and height / max(1.0, width) >= OCR_MERGE_VERTICAL_ASPECT_RATIO
-
-
-def can_vertical_side_merge_ocr_records(
-    a_region: list[int | float],
-    b_region: list[int | float],
-    a_width: float,
-    b_width: float,
-    a_height: float,
-    b_height: float,
-    x_gap: float,
-    y_overlap_ratio: float,
-) -> bool:
-    if not (
-        is_narrow_vertical_text_region(a_width, a_height)
-        and is_narrow_vertical_text_region(b_width, b_height)
-    ):
-        return False
-    if y_overlap_ratio < OCR_MERGE_VERTICAL_SIDE_OVERLAP_RATIO:
-        return False
-    if x_gap > OCR_MERGE_VERTICAL_SIDE_GAP_MAX:
-        return False
-
-    combined_width = max(a_region[2], b_region[2]) - min(a_region[0], b_region[0])
-    if combined_width > OCR_MERGE_VERTICAL_COMBINED_WIDTH_MAX:
-        return False
-
-    top_delta = abs(float(a_region[1]) - float(b_region[1]))
-    if top_delta > OCR_MERGE_VERTICAL_TOP_ALIGNMENT_MAX:
-        return False
-
-    center_delta = abs(region_center_y(a_region) - region_center_y(b_region))
-    center_limit = max(
-        OCR_MERGE_SIDE_CENTER_MIN,
-        min(region_height(a_region), region_height(b_region)) * OCR_MERGE_VERTICAL_CENTER_RATIO,
-    )
-    return center_delta <= center_limit
-
-
-def should_merge_ocr_records(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    a_region = a["region"]
-    b_region = b["region"]
-    a_width = region_width(a_region)
-    b_width = region_width(b_region)
-    a_height = region_height(a_region)
-    b_height = region_height(b_region)
-    if min(a_width, b_width, a_height, b_height) <= 0:
-        return False
-
-    x_overlap = axis_overlap(a_region[0], a_region[2], b_region[0], b_region[2])
-    y_overlap = axis_overlap(a_region[1], a_region[3], b_region[1], b_region[3])
-    x_gap = axis_gap(a_region[0], a_region[2], b_region[0], b_region[2])
-    y_gap = axis_gap(a_region[1], a_region[3], b_region[1], b_region[3])
-    x_overlap_ratio = x_overlap / min(a_width, b_width)
-    y_overlap_ratio = y_overlap / min(a_height, b_height)
-
-    if (
-        y_overlap_ratio >= OCR_MERGE_SIDE_OVERLAP_RATIO
-        and x_gap <= merge_side_gap_limit(a_region, b_region)
-        and can_side_merge_ocr_records(a_region, b_region, a_height, b_height)
-    ):
-        return True
-
-    if can_vertical_side_merge_ocr_records(
-        a_region,
-        b_region,
-        a_width,
-        b_width,
-        a_height,
-        b_height,
-        x_gap,
-        y_overlap_ratio,
-    ):
-        return True
-
-    if (
-        x_overlap_ratio >= OCR_MERGE_STACK_OVERLAP_RATIO
-        and y_gap <= merge_stack_gap_limit(a_region, b_region)
-    ):
-        return True
-
-    return False
-
-
-def find_parent(parents: dict[int, int], item: int) -> int:
-    parent = parents[item]
-    if parent != item:
-        parents[item] = find_parent(parents, parent)
-    return parents[item]
-
-
-def union_parent(parents: dict[int, int], a: int, b: int) -> None:
-    a_parent = find_parent(parents, a)
-    b_parent = find_parent(parents, b)
-    if a_parent != b_parent:
-        parents[b_parent] = a_parent
-
-
-def raw_record_source_key(
-    record: dict[str, Any],
-    right_to_left: bool,
-) -> tuple[float, float, int]:
-    region = record["region"]
-    center_x = region_center_x(region)
-    return (
-        -center_x if right_to_left else center_x,
-        region_center_y(region),
-        int(record["boxno"]),
-    )
-
-
-def merged_record_page_key(
-    record: dict[str, Any],
-    right_to_left: bool = True,
-) -> tuple[int, float, float, int]:
-    region = record["region"]
-    center_x = region_center_x(region)
-    # A coarse top band keeps upper panels before lower panels while preserving source order inside a band.
-    return (
-        round(float(region[1]) / 80.0),
-        -center_x if right_to_left else center_x,
-        region_center_y(region),
-        record["boxno"],
-    )
-
-
-def merge_ocr_records_for_page(
-    page: Page,
-    raw_records: list[dict[str, Any]],
-    right_to_left: bool = True,
-) -> list[dict[str, Any]]:
-    if not raw_records:
-        return []
-
-    parents = {int(record["boxno"]): int(record["boxno"]) for record in raw_records}
-    raw_by_boxno = {int(record["boxno"]): record for record in raw_records}
-    for index, record in enumerate(raw_records):
-        for other in raw_records[index + 1 :]:
-            if should_merge_ocr_records(record, other):
-                union_parent(parents, int(record["boxno"]), int(other["boxno"]))
-
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for boxno, record in raw_by_boxno.items():
-        grouped.setdefault(find_parent(parents, boxno), []).append(record)
-
-    merged: list[dict[str, Any]] = []
-    for group in grouped.values():
-        ordered_sources = sorted(
-            group,
-            key=lambda record: raw_record_source_key(record, right_to_left),
-        )
-        source_regions = [record["region"] for record in ordered_sources]
-        source_texts = [str(record.get("text", "")) for record in ordered_sources]
-        text_separator = "" if right_to_left else "\n"
-        merged.append(
-            {
-                "page": page.index,
-                "boxno": len(merged),
-                "sourceBoxnos": [int(record["boxno"]) for record in ordered_sources],
-                "sourceTexts": source_texts,
-                "region": union_regions(source_regions, page.image_path),
-                "text": text_separator.join(source_texts),
-            }
-        )
-
-    merged.sort(key=lambda record: merged_record_page_key(record, right_to_left))
-    for boxno, record in enumerate(merged):
-        record["boxno"] = boxno
-    return merged
-
-
 def write_merged_ocr_outputs(
     pages: list[Page],
     merged_by_page: dict[int, list[dict[str, Any]]],
@@ -2899,64 +2064,64 @@ def structure_prompt(
     language: LanguageConfig,
 ) -> str:
     page_ocr = merged_by_page[page.index]
-    source_name = language.source.name
-    return f"""
-You are classifying and ordering OCR groups for one comic page.
-{language.source.structure_context}
-Reading order guidance: use {language.source.reading_order}.
+    return load_prompt(
+        "structure.txt",
+        structure_context=language.source.structure_context,
+        reading_order=language.source.reading_order,
+        source_name=language.source.name,
+        target_name=language.target.name,
+        record_count=len(page_ocr),
+        page_index=page.index,
+        records_table=compact_records_table(
+            page_ocr, ("boxno", "sourceBoxnos", "region", "text")
+        ),
+    )
 
-You are given the page image and script-merged OCR groups for the current page.
-The groups are already merged geometrically. Do not merge groups. Do not split groups. Do not drop groups.
-Your job is only to put real {source_name} text groups in reading order, reject only clear OCR false positives,
-and classify each kept group.
-Return only a compact JSON array of rows for the current page.
-Row format:
-[mergedBoxno,classification]
-or, only when correcting OCR:
-[mergedBoxno,classification,textCorrection]
-- mergedBoxno: one script-merged OCR group boxno from this page.
-- classification: exactly one of "text", "sfx", or "reject".
-- textCorrection: optional corrected OCR text string. Omit it when no correction is needed.
 
-The array order itself is the reading order. There is no output-order field.
-The first value in every row is always a numbered image label, never an output position.
-For example, if labels 2, 0, and 1 are normal text in that reading order, return:
-[[2,"text"],[0,"text"],[1,"text"]]
-Never return rows such as [0,0,2,...] with a separate order number.
+def character_in_ranges(character: str, ranges: tuple[tuple[int, int], ...]) -> bool:
+    value = ord(character)
+    return any(start <= value <= end for start, end in ranges)
 
-Rejection policy is intentionally conservative:
-- Default to reject false.
-- Set reject true only when the box is clearly not intentional text or lettering visible in the image.
-- Reject only obvious false positives such as screen tone texture, hatching, panel borders, character art,
-  background art, dust/noise, random isolated punctuation, cropped fragments with no readable character,
-  or OCR boxes that contain only furigana/reading marks separated from their base text.
-- Do not reject readable {source_name} text, even if the OCR string is wrong, garbled, incomplete, badly ordered,
-  split oddly, mixes furigana with base text, or contains extra punctuation.
-- Do not reject text inside speech bubbles, thought bubbles, caption boxes, narration boxes, rectangular
-  boxes, signs, labels, UI-like boxes, bordered areas, white/blank text areas, or decorative containers.
-- Do not reject text because it is short. One-character or punctuation-only speech/SFX can be intentional.
-- If a human comic reader would treat the mark as intentional text or sound effect, reject must be false.
-- If unsure whether a group is text/noise/artifact, choose reject false.
 
-The OCR text is already provided. Do not retype it unless correction is needed. If the OCR text is clearly
-wrong and you can confidently correct it, put the corrected text in textCorrection. Otherwise omit it.
+def text_needs_translation(text: str, language: LanguageConfig) -> bool:
+    value = text.strip()
+    if not value:
+        return False
+    source_ranges = {
+        "jp": (
+            (0x3040, 0x30FF),
+            (0x31F0, 0x31FF),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xF900, 0xFAFF),
+            (0xFF66, 0xFF9D),
+        ),
+        "cn": (
+            (0x3100, 0x312F),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xF900, 0xFAFF),
+        ),
+        "kr": (
+            (0x1100, 0x11FF),
+            (0x3130, 0x318F),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xAC00, 0xD7AF),
+            (0xF900, 0xFAFF),
+        ),
+    }.get(language.source.code, ())
+    if any(character_in_ranges(character, source_ranges) for character in value):
+        return True
 
-Return exactly {len(page_ocr)} rows. Every mergedBoxno from this page must appear exactly once, including
-rejected boxes. No mergedBoxno may appear twice.
-
-Return kept rows in the requested reading order. Rejected rows may appear where they occur visually.
-Do not include page, sourceBoxnos, region, text, markdown, or explanations.
-
-Region coordinates are [left,top,right,bottom] pixels with the origin at the image's top-left.
-The numbered labels drawn on the image match mergedBoxno. Use those labels and the image directly;
-do not re-derive or debate the coordinate convention. Make one concise classification/order pass and return.
-
-Current page index:
-{page.index}
-
-Current page script-merged OCR groups compact table:
-{compact_records_table(page_ocr, ("boxno", "sourceBoxnos", "region", "text"))}
-""".strip()
+    letters = [character for character in value if character.isalpha()]
+    if not letters:
+        return False
+    if language.target.code == "en" and all(
+        "LATIN" in unicodedata.name(character, "") for character in letters
+    ):
+        return False
+    return True
 
 
 def require_object(value: Any, label: str) -> dict[str, Any]:
@@ -3018,9 +2183,13 @@ def require_non_negative_int(record: dict[str, Any], key: str, label: str) -> in
 
 
 def parse_non_negative_int_value(value: Any, label: str, key: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise PipelineError(f"{label} must include non-negative integer `{key}`.")
-    return value
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"(?:0|[1-9][0-9]*)", stripped):
+            return int(stripped)
+    raise PipelineError(f"{label} must include non-negative integer `{key}`.")
 
 
 def source_boxnos(record: dict[str, Any], label: str) -> list[int]:
@@ -3033,24 +2202,6 @@ def source_boxnos(record: dict[str, Any], label: str) -> list[int]:
             raise PipelineError(f"{label} sourceBoxnos must be non-negative integers.")
         result.append(item)
     return result
-
-
-def union_regions(regions: list[list[int | float]], image_path: Path) -> list[int]:
-    with Image.open(image_path) as image:
-        width, height = image.size
-
-    left = round(min(region[0] for region in regions))
-    top = round(min(region[1] for region in regions))
-    right = round(max(region[2] for region in regions))
-    bottom = round(max(region[3] for region in regions))
-
-    left = max(0, left)
-    top = max(0, top)
-    right = min(width, right)
-    bottom = min(height, bottom)
-    if right <= left or bottom <= top:
-        raise PipelineError(f"Merged region does not overlap image bounds: {[left, top, right, bottom]}")
-    return [left, top, right, bottom]
 
 
 def merged_boxno_from_order_record(
@@ -3172,15 +2323,13 @@ def validate_ordered_merged_page(
     return structured
 
 
-def run_structure_phase(
+def run_ocr_merge_phase(
     pages: list[Page],
     raw_by_page: dict[int, list[dict[str, Any]]],
     output_dir: Path,
     config: PipelineConfig,
-    fixture_dir: Path | None,
     start_page: int = 0,
     end_page: int | None = None,
-    existing_by_page: dict[int, list[dict[str, Any]]] | None = None,
     use_existing_merged: bool = False,
 ) -> dict[int, list[dict[str, Any]]]:
     ensure_all_pages(raw_by_page, pages, "OCR records")
@@ -3201,6 +2350,38 @@ def run_structure_phase(
                 right_to_left=config.language.source.code != "kr",
             )
     write_merged_ocr_outputs(selected_pages, merged_by_page, output_dir)
+    for page in selected_pages:
+        merged_by_page[page.index] = editor_runtime.reconcile_records(
+            "ocr_merged", page.index, merged_by_page[page.index], "ocr"
+        )
+        write_json(
+            data_page_path(output_dir, "ocr_merged", page),
+            merged_by_page[page.index],
+        )
+    return merged_by_page
+
+
+def run_structure_phase(
+    pages: list[Page],
+    raw_by_page: dict[int, list[dict[str, Any]]],
+    output_dir: Path,
+    config: PipelineConfig,
+    fixture_dir: Path | None,
+    start_page: int = 0,
+    end_page: int | None = None,
+    existing_by_page: dict[int, list[dict[str, Any]]] | None = None,
+    use_existing_merged: bool = False,
+) -> dict[int, list[dict[str, Any]]]:
+    selected_pages = pages_in_range(pages, start_page, end_page)
+    merged_by_page = run_ocr_merge_phase(
+        pages,
+        raw_by_page,
+        output_dir,
+        config,
+        start_page=start_page,
+        end_page=end_page,
+        use_existing_merged=use_existing_merged,
+    )
 
     structured_by_page: dict[int, list[dict[str, Any]]] = dict(existing_by_page or {})
     for page in selected_pages:
@@ -3240,6 +2421,32 @@ def run_structure_phase(
             ),
             merged_debug_path,
         )
+        skipped = [
+            record
+            for record in structured
+            if not text_needs_translation(
+                str(record.get("text", "")), config.language
+            )
+        ]
+        if skipped:
+            labels = ", ".join(str(record.get("boxno", "?")) for record in skipped)
+            print(
+                f"Skip translation-free text page {page.index} boxnos: {labels}",
+                file=sys.stderr,
+            )
+            structured = [
+                record
+                for record in structured
+                if text_needs_translation(
+                    str(record.get("text", "")), config.language
+                )
+            ]
+            for boxno, record in enumerate(structured):
+                record["boxno"] = boxno
+        structured_by_page[page.index] = structured
+        structured = editor_runtime.reconcile_records(
+            "ocr_structured", page.index, structured, "structure"
+        )
         structured_by_page[page.index] = structured
         write_json(data_page_path(output_dir, "ocr_structured", page), structured)
         draw_region_debug_image(
@@ -3272,47 +2479,16 @@ def alt_placement_prompt(
     structured_records: list[dict[str, Any]],
     language: LanguageConfig,
 ) -> str:
-    source_name = language.source.name
-    target_name = language.target.name
-    return f"""
-You are deciding erase safety for one comic page.
-{language.source.structure_context}
-
-For each structured {source_name} text box, decide whether the original source text can be safely erased
-and redrawn in the same region, or whether the {target_name} translation needs alternate placement.
-
-Return only a compact JSON array of rows. Row format:
-[boxno,safeToEraseOriginal,reasonCode]
-- boxno: one current-page structured box number.
-- safeToEraseOriginal: use 1 when the original text can be cleaned/erased safely, 0 when it needs alternate placement.
-- reasonCode: use 0=bubble, 1=caption_box, 2=bordered_box, 3=blank_text_area, 4=sign_label,
-  5=over_art, 6=over_face_body, 7=integrated_sfx, or 8=unclear.
-- All three values are integers. Do not emit reason names in the JSON.
-- The outer array is mandatory, including for one record. A one-record response looks like [[0,1,0]].
-
-Policy:
-- Default to safeToEraseOriginal=1.
-- Use 1 for text inside speech balloons, thought balloons, caption boxes, narration boxes, rectangular/torn-edge boxes,
-  signs, labels, panels reserved for text, or white/blank text areas.
-- Use 1 for normal dialogue or narration that has a clear container or intentionally blank text area, even if the
-  container is large, irregular, partially cropped, or sits over artwork.
-- Use 0 only when erasing the original text would likely damage important page art: faces, bodies, clothing,
-  props, action lines, speed lines, detailed backgrounds, or hand-drawn SFX integrated into the artwork.
-- Use 0 for text clearly free-floating directly on artwork/background with no enclosing visual container and no
-  dedicated blank/white text area.
-- SFX can be unsafe only when the lettering itself is integrated into the art with no safe blank/container area.
-  SFX inside a bubble, caption box, panel space, or white sound-effect area is safe.
-- If uncertain, choose safeToEraseOriginal=1. The purpose is to avoid unnecessary alternate placement.
-
-The page image is annotated with the current box numbers. Return one row for every input record and no others.
-Do not include source text, page number, markdown, or explanations.
-
-Current page index:
-{page.index}
-
-Structured records compact table:
-{compact_records_table(structured_records, ("boxno", "region", "text", "sfx"))}
-""".strip()
+    return load_prompt(
+        "alt_placement.txt",
+        structure_context=language.source.structure_context,
+        source_name=language.source.name,
+        target_name=language.target.name,
+        page_index=page.index,
+        records_table=compact_records_table(
+            structured_records, ("boxno", "region", "text", "sfx")
+        ),
+    )
 
 
 def normalize_alt_placement_reason(value: Any, safe_to_erase: bool) -> str:
@@ -3450,8 +2626,15 @@ def run_alt_placement_phase(
                 structured_debug_path,
             )
         by_page[page.index] = alt_placements
+        alt_placements = editor_runtime.reconcile_records(
+            "alt_placement", page.index, alt_placements, "erase"
+        )
+        by_page[page.index] = alt_placements
         write_json(data_page_path(output_dir, "alt_placement", page), alt_placements)
         apply_alt_placements_to_records(structured_records, alt_placements)
+        structured_records[:] = editor_runtime.reconcile_records(
+            "ocr_structured", page.index, structured_records, "erase"
+        )
         write_json(data_page_path(output_dir, "ocr_structured", page), structured_records)
         draw_region_debug_image(
             structured_records,
@@ -3574,53 +2757,41 @@ def translation_prompt(
     structured_by_page: dict[int, list[dict[str, Any]]],
     translation_notes: dict[str, Any],
     language: LanguageConfig,
+    current_records: list[dict[str, Any]] | None = None,
 ) -> str:
     master = flatten_pages(structured_by_page)
-    current_records = structured_by_page[page.index]
+    records_to_translate = (
+        structured_by_page[page.index]
+        if current_records is None
+        else current_records
+    )
     previous_translations = previous_translation_records(page, structured_by_page)
     notes_section = translation_notes_prompt_section(page, translation_notes)
-    source_name = language.source.name
-    target_name = language.target.name
-    return f"""
-You are given an annotated page image and the structured {source_name} text for the CBZ.
-Translate from {source_name} to {target_name}.
-Translate only the current page records listed in "Current page records to translate".
-Do not translate records from any other page.
-Do not invent records, page numbers, or box numbers.
-Every returned row must use one boxno from the current page records.
-If there are no current page records, return [].
-Preserve tone and context.
-Use previous completed translations to keep names, terms, pronouns, style, and voice consistent.
-Return only a compact JSON array of rows. Row format:
-[boxno,englishText]
-The complete response must begin with the outer `[` and end with the outer `]`.
-Example with two records: [[0,"First translation"],[1,"Second translation"]]
-Never emit bare rows such as [0,"First translation"],[1,"Second translation"] without enclosing them.
-Do not echo page numbers or source text.
-englishText must contain the {target_name} translation.
-When translating SFX, if it cannot be meaningfully translated then return an empty translation for that text.
-
-Reading order guidance: use {language.source.reading_order}.
-
-Full structured text compact table:
-{compact_records_table(master, ("page", "boxno", "text", "sfx", "openLettering"))}
-
-Previous completed translations compact table:
-{compact_records_table(previous_translations, ("page", "boxno", "text", "englishText", "sfx", "openLettering"))}
-
-Current page index:
-{page.index}
-
-Current page records to translate compact table:
-{compact_records_table(current_records, ("boxno", "text", "sfx", "openLettering"))}
-{notes_section}
-""".strip()
+    return load_prompt(
+        "translation.txt",
+        source_name=language.source.name,
+        target_name=language.target.name,
+        reading_order=language.source.reading_order,
+        master_table=compact_records_table(
+            master, ("page", "boxno", "text", "sfx", "openLettering")
+        ),
+        previous_translations_table=compact_records_table(
+            previous_translations,
+            ("page", "boxno", "text", "englishText", "sfx", "openLettering"),
+        ),
+        page_index=page.index,
+        current_records_table=compact_records_table(
+            records_to_translate, ("boxno", "text", "sfx", "openLettering")
+        ),
+        notes_section=notes_section,
+    )
 
 
 def validate_translation_page(
     page: Page,
     structured_records: list[dict[str, Any]],
     vlm_items: list[Any],
+    require_non_empty: bool = True,
 ) -> list[dict[str, Any]]:
     by_boxno = {record["boxno"]: record for record in structured_records}
     seen: set[int] = set()
@@ -3656,6 +2827,12 @@ def validate_translation_page(
         if boxno in seen:
             raise PipelineError(f"{label} duplicates boxno {boxno}.")
         seen.add(boxno)
+        if require_non_empty and not english_text.strip():
+            record_type = "SFX" if by_boxno[boxno].get("sfx") else "text"
+            raise PipelineError(
+                f"{label} returns an empty translation for kept {record_type} "
+                f"boxno {boxno}; provide visible target-language text."
+            )
         if source_text_echo is not None and source_text_echo != by_boxno[boxno]["text"]:
             print(
                 f"warning: translation text mismatch page {page.index} boxno {boxno}",
@@ -3679,13 +2856,23 @@ def attach_translations(
     pages: list[Page],
     output_dir: Path,
     structured_by_page: dict[int, list[dict[str, Any]]],
+    require_non_empty: bool = True,
 ) -> dict[int, list[dict[str, Any]]]:
     translations_by_page: dict[int, list[dict[str, Any]]] = {}
     for page in pages:
         path = data_page_path(output_dir, "translations", page)
         data = load_json_array(path, f"translation page {page.index}")
-        translations = validate_translation_page(page, structured_by_page[page.index], data)
+        translations = validate_translation_page(
+            page,
+            structured_by_page[page.index],
+            data,
+            require_non_empty=require_non_empty,
+        )
+        translations = editor_runtime.apply_protected_records(
+            "translations", page.index, translations, "translation"
+        )
         translations_by_page[page.index] = translations
+        write_json(path, translations)
         by_boxno = {item["boxno"]: item for item in translations}
         for record in structured_by_page[page.index]:
             record["englishText"] = by_boxno[record["boxno"]]["englishText"]
@@ -3698,9 +2885,11 @@ def ensure_translated_pages(
 ) -> None:
     for page in pages:
         for record in structured_by_page[page.index]:
-            if not isinstance(record.get("englishText"), str):
+            english_text = record.get("englishText")
+            if not isinstance(english_text, str) or not english_text.strip():
                 raise PipelineError(
-                    f"Missing englishText for page {page.index} boxno {record['boxno']}"
+                    f"Missing non-empty englishText for page {page.index} "
+                    f"boxno {record['boxno']}"
                 )
 
 
@@ -3714,6 +2903,7 @@ def run_translation_phase(
     start_page: int = 0,
     end_page: int | None = None,
     existing_by_page: dict[int, list[dict[str, Any]]] | None = None,
+    selected_boxno: int | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     ensure_all_pages(structured_by_page, pages, "Structured OCR records")
     translations_by_page: dict[int, list[dict[str, Any]]] = dict(existing_by_page or {})
@@ -3726,33 +2916,83 @@ def run_translation_phase(
             data_page_path(output_dir, "translations_raw", page).unlink(missing_ok=True)
             continue
 
-        print(f"VLM translate page {page.index}", file=sys.stderr)
+        records_to_translate = structured_records
+        existing_translations: list[dict[str, Any]] | None = None
+        if selected_boxno is not None:
+            records_to_translate = [
+                record
+                for record in structured_records
+                if record.get("boxno") == selected_boxno
+            ]
+            if not records_to_translate:
+                raise PipelineError(
+                    f"Translation page {page.index} has no boxno {selected_boxno}."
+                )
+            existing_data = load_json_array(
+                data_page_path(output_dir, "translations", page),
+                f"translation page {page.index}",
+            )
+            existing_translations = validate_translation_page(
+                page,
+                structured_records,
+                existing_data,
+            )
+
+        translation_label = (
+            f"page {page.index} boxno {selected_boxno}"
+            if selected_boxno is not None
+            else f"page {page.index}"
+        )
+        print(f"VLM translate {translation_label}", file=sys.stderr)
         structured_debug_path = ensure_structured_debug_image(
             structured_records,
             page,
             output_dir,
         )
-        translations = get_validated_vlm_array(
+        generated_translations = get_validated_vlm_array(
             "translations",
             page,
-            translation_prompt(page, structured_by_page, translation_notes, config.language),
+            translation_prompt(
+                page,
+                structured_by_page,
+                translation_notes,
+                config.language,
+                records_to_translate,
+            ),
             output_dir,
             config.vlm,
             fixture_dir,
             lambda items, current_page=page: validate_translation_page(
                 current_page,
-                structured_by_page[current_page.index],
+                records_to_translate,
                 items,
             ),
             structured_debug_path,
         )
+        if selected_boxno is None:
+            translations = editor_runtime.reconcile_records(
+                "translations", page.index, generated_translations, "translation"
+            )
+        else:
+            assert existing_translations is not None
+            translations = editor_runtime.reconcile_record_subset(
+                "translations",
+                page.index,
+                generated_translations,
+                existing_translations,
+                "translation",
+                "boxno",
+            )
         translations_by_page[page.index] = translations
         by_boxno = {item["boxno"]: item for item in translations}
         for record in structured_records:
             record["englishText"] = by_boxno[record["boxno"]]["englishText"]
         write_json(data_page_path(output_dir, "translations", page), translations)
         data_page_path(output_dir, "translations_raw", page).unlink(missing_ok=True)
-    ensure_translated_pages(pages, structured_by_page)
+    ensure_translated_pages(
+        pages_in_range(pages, start_page, end_page),
+        structured_by_page,
+    )
     return translations_by_page
 
 
@@ -3805,6 +3045,73 @@ def compact_proofreading_input(records: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def compact_proofreading_batch_input(records: list[dict[str, Any]]) -> str:
+    lines = ["row\tpage:box\tsfx\tsourceText\tenglishText"]
+    for row, record in enumerate(records):
+        lines.append(
+            "\t".join(
+                (
+                    str(row),
+                    f"{record['page']}:{record['boxno']}",
+                    "S" if record.get("sfx") else "-",
+                    compact_proofreading_field(record.get("text", "")),
+                    compact_proofreading_field(record.get("englishText", "")),
+                )
+            )
+        )
+    return "\n".join(lines)
+
+
+def compact_proofreading_context(records: list[dict[str, Any]]) -> str:
+    lines = ["page:box\tsfx\tsourceText\tenglishText"]
+    for record in records:
+        lines.append(
+            "\t".join(
+                (
+                    f"{record['page']}:{record['boxno']}",
+                    "S" if record.get("sfx") else "-",
+                    compact_proofreading_field(record.get("text", "")),
+                    compact_proofreading_field(record.get("englishText", "")),
+                )
+            )
+        )
+    return "\n".join(lines)
+
+
+def proofreading_record_batches(
+    records: list[dict[str, Any]],
+    max_records: int = PROOFREADING_BATCH_MAX_RECORDS,
+    max_characters: int = PROOFREADING_BATCH_MAX_CHARACTERS,
+) -> list[list[dict[str, Any]]]:
+    if max_records <= 0 or max_characters <= 0:
+        raise ValueError("Proofreading batch limits must be positive.")
+
+    page_groups: list[list[dict[str, Any]]] = []
+    for record in records:
+        if not page_groups or page_groups[-1][0]["page"] != record["page"]:
+            page_groups.append([])
+        page_groups[-1].append(record)
+
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_characters = 0
+    for page_records in page_groups:
+        page_characters = len(compact_proofreading_input(page_records))
+        would_exceed_limit = current and (
+            len(current) + len(page_records) > max_records
+            or current_characters + page_characters > max_characters
+        )
+        if would_exceed_limit:
+            batches.append(current)
+            current = []
+            current_characters = 0
+        current.extend(page_records)
+        current_characters += page_characters
+    if current:
+        batches.append(current)
+    return batches
+
+
 def translation_notes_book_prompt_section(translation_notes: dict[str, Any]) -> str:
     job_note = translation_notes.get("job", "")
     pages = translation_notes.get("pages", {})
@@ -3828,72 +3135,90 @@ def proofreading_prompt(
     structured_by_page: dict[int, list[dict[str, Any]]],
     translation_notes: dict[str, Any],
     language: LanguageConfig,
+    prior_context: list[dict[str, Any]] | None = None,
 ) -> str:
     records = proofread_records_in_order(structured_by_page)
-    source_name = language.source.name
-    target_name = language.target.name
-    return f"""
-Proofread the complete comic translation as one whole-book pass.
-
-You are given every translated record with {source_name} source text and current {target_name} text,
-plus user translation notes. Input rows are tab-separated and already sorted in correct
-page/boxno order. Improve consistency and natural {target_name} flow across the entire CBZ while
-preserving meaning.
-
-Goals:
-- Keep names, terms, pronouns, titles, attacks, magic, locations, and recurring phrases consistent.
-- Improve awkward phrasing, grammar, and dialogue flow.
-- Preserve character voice, tone, and scene context.
-- Keep translations concise enough for comic lettering.
-- Do not rewrite good translations merely to be different.
-- Do not invent new records or translate text that is not present.
-- Preserve empty englishText for SFX or records intentionally left untranslated unless a concise useful
-  translation is clearly warranted.
-
-Output format:
-- Return exactly {len(records)} lines.
-- Line 1 is the final englishText for input row 1, line 2 for input row 2, and so on.
-- Keep the exact input page/boxno order.
-- Do not include page numbers, box numbers, labels, bullets, quotes, markdown, JSON, or explanations.
-- Each line must contain only the final {target_name} text for that record.
-- If the final {target_name} text should be blank, output exactly <EMPTY> on that line.
-- Do not add or remove lines.
-
-User translation notes:
-{translation_notes_book_prompt_section(translation_notes)}
-
-Input rows:
-{compact_proofreading_input(records)}
-""".strip()
+    page_indexes = sorted({int(record["page"]) for record in records})
+    if not page_indexes:
+        batch_scope = "an empty batch"
+    elif page_indexes[0] == page_indexes[-1]:
+        batch_scope = f"page {page_indexes[0]}"
+    else:
+        batch_scope = f"pages {page_indexes[0]} through {page_indexes[-1]}"
+    prior_context_table = (
+        compact_proofreading_context(prior_context)
+        if prior_context
+        else "No earlier corrected records are available."
+    )
+    return load_prompt(
+        "proofreading.txt",
+        source_name=language.source.name,
+        target_name=language.target.name,
+        batch_scope=batch_scope,
+        translation_notes=translation_notes_book_prompt_section(translation_notes),
+        prior_context=prior_context_table,
+        records_table=compact_proofreading_batch_input(records),
+    )
 
 
-def validate_proofread_translations(
-    pages: list[Page],
-    structured_by_page: dict[int, list[dict[str, Any]]],
+def validate_proofread_record_batch(
+    records: list[dict[str, Any]],
     raw_text: str,
-) -> dict[int, list[dict[str, Any]]]:
-    records = proofread_records_in_order(structured_by_page)
-    lines = strip_markdown_code_fence(raw_text).splitlines()
-    if len(lines) != len(records):
-        raise PipelineError(
-            f"Proofreading returned {len(lines)} lines, expected {len(records)}."
-        )
-    by_page: dict[int, list[dict[str, Any]]] = {page.index: [] for page in pages}
-    for source, line in zip(records, lines, strict=True):
-        english_text = line.strip()
-        if english_text == "<EMPTY>":
-            english_text = ""
-        by_page[source["page"]].append(
+) -> list[dict[str, Any]]:
+    text = strip_markdown_code_fence(raw_text).strip()
+    replacements: dict[int, str] = {}
+    if text != "<NO_CHANGES>":
+        if not text:
+            raise PipelineError(
+                "Proofreading returned an empty response; expected changed rows or <NO_CHANGES>."
+            )
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            fields = line.split("\t", 1)
+            if len(fields) != 2:
+                raise PipelineError(
+                    f"Proofreading output line {line_number} must be row<TAB>englishText."
+                )
+            try:
+                row = int(fields[0].strip())
+            except ValueError as exc:
+                raise PipelineError(
+                    f"Proofreading output line {line_number} has invalid row {fields[0]!r}."
+                ) from exc
+            if row < 0 or row >= len(records):
+                raise PipelineError(
+                    f"Proofreading output line {line_number} references missing row {row}."
+                )
+            if row in replacements:
+                raise PipelineError(f"Proofreading output duplicates row {row}.")
+            english_text = fields[1].strip()
+            if not english_text:
+                raise PipelineError(
+                    f"Proofreading output row {row} has empty text."
+                )
+            if english_text == "<EMPTY>":
+                raise PipelineError(
+                    f"Proofreading output row {row} must not remove translated text."
+                )
+            replacements[row] = english_text
+
+    corrected: list[dict[str, Any]] = []
+    for row, source in enumerate(records):
+        english_text = replacements.get(row, source.get("englishText", ""))
+        if not isinstance(english_text, str) or not english_text.strip():
+            raise PipelineError(
+                f"Proofreading row {row} has no translated text; provide a correction."
+            )
+        corrected.append(
             {
                 "page": source["page"],
                 "boxno": source["boxno"],
-                "text": source["text"],
+                "text": source.get("text", ""),
                 "englishText": english_text,
+                "sfx": source.get("sfx", False),
+                "openLettering": source.get("openLettering", False),
             }
         )
-    for page_records in by_page.values():
-        page_records.sort(key=lambda item: item["boxno"])
-    return by_page
+    return corrected
 
 
 def apply_translation_records(
@@ -3903,7 +3228,12 @@ def apply_translation_records(
     output_dir: Path,
 ) -> None:
     for page in pages:
-        translations = translations_by_page.get(page.index, [])
+        translations = editor_runtime.reconcile_records(
+            "translations",
+            page.index,
+            translations_by_page.get(page.index, []),
+            "translation",
+        )
         by_boxno = {item["boxno"]: item for item in translations}
         for record in structured_by_page[page.index]:
             if record["boxno"] in by_boxno:
@@ -3940,21 +3270,53 @@ def run_proofreading_phase(
     fixture_dir: Path | None,
     translation_notes: dict[str, Any],
 ) -> None:
-    records = all_translated_records_for_review(structured_by_page)
+    records = proofread_records_in_order(structured_by_page)
     if not records:
         print("Skip VLM proofread translations: no translated records", file=sys.stderr)
         return
-    print("VLM proofread translations", file=sys.stderr)
-    translations_by_page = get_validated_vlm_text_named(
-        "proofreading",
-        "book",
-        "VLM proofread translations",
-        proofreading_prompt(structured_by_page, translation_notes, config.language),
-        output_dir,
-        config.vlm,
-        fixture_dir,
-        lambda text: validate_proofread_translations(pages, structured_by_page, text),
+    batches = proofreading_record_batches(records)
+    print(
+        (
+            f"VLM proofread {len(records)} translations in "
+            f"{len(batches)} batch(es)"
+        ),
+        file=sys.stderr,
     )
+    translations_by_page: dict[int, list[dict[str, Any]]] = {
+        page.index: [] for page in pages
+    }
+    prior_context: list[dict[str, Any]] = []
+    for batch_index, batch_records in enumerate(batches, start=1):
+        page_indexes = sorted({int(record["page"]) for record in batch_records})
+        batch_by_page: dict[int, list[dict[str, Any]]] = {}
+        for record in batch_records:
+            batch_by_page.setdefault(int(record["page"]), []).append(record)
+        stem = f"batch_{batch_index:04d}_pages_{page_indexes[0]:04d}-{page_indexes[-1]:04d}"
+        label = (
+            f"VLM proofread translations batch {batch_index}/{len(batches)} "
+            f"(pages {page_indexes[0]}-{page_indexes[-1]})"
+        )
+        corrected = get_validated_vlm_text_named(
+            "proofreading",
+            stem,
+            label,
+            proofreading_prompt(
+                batch_by_page,
+                translation_notes,
+                config.language,
+                prior_context,
+            ),
+            output_dir,
+            config.vlm,
+            fixture_dir,
+            lambda text, expected=batch_records: validate_proofread_record_batch(
+                expected, text
+            ),
+        )
+        for record in corrected:
+            translations_by_page[record["page"]].append(record)
+        prior_context = (prior_context + corrected)[-PROOFREADING_CONTEXT_RECORDS:]
+
     snapshot_raw_translation_records(pages, structured_by_page, output_dir)
     apply_translation_records(pages, structured_by_page, translations_by_page, output_dir)
 
@@ -3969,31 +3331,13 @@ def generated_translation_notes_prompt(
     language: LanguageConfig,
 ) -> str:
     records = all_translated_records_for_review(structured_by_page)
-    source_name = language.source.name
-    target_name = language.target.name
-    return f"""
-Create reusable translation notes for translating related CBZs in the same series.
-
-You are given the complete {source_name} source text, final {target_name} translation, and user-provided
-translation notes. Write concise plain-text notes that would help keep future related volumes
-consistent.
-
-Include useful items such as:
-- Character names and consistent romanization/spelling.
-- Places, organizations, magic/skill names, titles, honorific choices, and recurring terms.
-- Character voice, formality, catchphrases, relationship context, and pronoun choices.
-- Ambiguities or unresolved terms a future translator should watch.
-- Any user-provided preferences that should carry forward.
-
-Do not write a page-by-page summary unless a page-specific note is genuinely reusable.
-Do not include JSON. Do not include markdown code fences.
-
-User translation notes:
-{translation_notes_book_prompt_section(translation_notes)}
-
-Final translation records, tab-separated as page, boxno, sfx, openLettering, sourceText, englishText:
-{compact_proofreading_input(records)}
-""".strip()
+    return load_prompt(
+        "translation_notes.txt",
+        source_name=language.source.name,
+        target_name=language.target.name,
+        translation_notes=translation_notes_book_prompt_section(translation_notes),
+        records_table=compact_proofreading_input(records),
+    )
 
 
 def run_generated_translation_notes_phase(
@@ -4061,41 +3405,37 @@ def non_open_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [record for record in records if not record["openLettering"]]
 
 
+def labeled_open_placement_records(
+    structured_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "label": label,
+            "region": record["region"],
+            "text": record["text"],
+            "englishText": record.get("englishText"),
+            "sfx": record["sfx"],
+        }
+        for label, record in enumerate(open_lettering_records(structured_records))
+    ]
+
+
 def placement_open_prompt(
     page: Page,
     structured_records: list[dict[str, Any]],
     language: LanguageConfig,
 ) -> str:
-    open_records = open_lettering_records(structured_records)
-    source_name = language.source.name
-    target_name = language.target.name
-    return f"""
-For open-lettering translations only, choose unobtrusive margin/nearby placement boxes
-where the {target_name} text can be readable. Open-lettering text was marked this way because
-cleaning the original {source_name} would likely damage important page art, so do not place
-the translation over faces, bodies, detailed artwork, action lines, panel borders, or
-other important visual content. Do not place text in a tiny sliver directly below or
-beside the original if that would force very small {target_name} text.
-
-Coordinates must use Gemma-style normalized box_2d: [y_min, x_min, y_max, x_max],
-where each value is an integer from 0 to 1000.
-All four box_2d values must be inside 0..1000 inclusive. Never return negative
-coordinates and never return coordinates greater than 1000. If a placement would go
-outside the page, move or shrink it so y_min, x_min, y_max, and x_max all remain in 0..1000.
-Ensure y_min < y_max and x_min < x_max after applying the 0..1000 limit.
-
-Return only a compact JSON array of rows. Row format:
-[boxno,box_2d]
-Return one row for every input record below and no others.
-
-Reading order guidance: use {language.source.reading_order}.
-
-Current page index:
-{page.index}
-
-Open-lettering records compact table:
-{compact_records_table(open_records, ("boxno", "region", "text", "englishText", "sfx"))}
-""".strip()
+    open_records = labeled_open_placement_records(structured_records)
+    return load_prompt(
+        "placement_open.txt",
+        target_name=language.target.name,
+        source_name=language.source.name,
+        reading_order=language.source.reading_order,
+        page_index=page.index,
+        records_table=compact_records_table(
+            open_records, ("label", "region", "text", "englishText", "sfx")
+        ),
+    )
 
 
 def placement_style_records(
@@ -4127,897 +3467,26 @@ def placement_style_prompt(
     language: LanguageConfig,
     backup_font: str,
 ) -> str:
-    target_name = language.target.name
-    return f"""
-Choose a font and fill color for each translated text record. The image provided is the
-original comic page; use the listed placement boxes to judge background brightness and text
-style.
-
-Available fonts; return the exact font filename in the font field:
-{font_use_prompt(backup_font)}
-
-Backup font: {backup_font}
-Use the backup font when no user-provided font is available or suitable.
-
-Choose fill as either "black" or "white" based on the chosen placement area's background.
-The primary purpose of fill is legibility of the main letter shape. Readability is more
-important than matching the original style for the {target_name} translation.
-- Use black fill on white, pale, light gray, or mostly light backgrounds.
-- Use white fill only on dark or mostly black backgrounds.
-- If the area is mixed, choose the fill that is readable over most of the placement box.
-- If uncertain, choose black.
-- Do not choose white fill on a white or pale speech bubble/caption/blank area; that is
-  white-on-white and is incorrect even though the renderer adds an outline.
-- Do not rely on the outline to make the fill readable; choose the fill as if there were
-  no outline. The renderer will automatically add the opposite outline color.
-
-Return only a compact JSON array of rows. Row format:
-[boxno,font,fill]
-Return one row for every input record below and no others.
-
-Reading order guidance: use {language.source.reading_order}.
-
-Current page index:
-{page.index}
-
-Records compact table:
-{compact_records_table(placement_style_records(structured_records, placements), ("boxno", "text", "englishText", "openLettering", "sfx", "box_2d", "placementRegion"))}
-""".strip()
-
-
-def normalized_box_to_region(box: list[int | float], image_path: Path) -> list[int]:
-    if len(box) != 4:
-        raise PipelineError("box_2d must have four values.")
-    values: list[float] = []
-    for value in box:
-        if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise PipelineError(f"box_2d values must be numbers: {box}")
-        values.append(float(value))
-
-    y_min, x_min, y_max, x_max = values
-    if x_max <= x_min or y_max <= y_min:
-        raise PipelineError(f"box_2d must have positive width and height before clamping: {box}")
-
-    adjusted = list(values)
-    y_min, x_min, y_max, x_max = adjusted
-    box_width = x_max - x_min
-    box_height = y_max - y_min
-    if x_min < 0 and x_max <= 1000:
-        adjusted[3] = min(1000, x_max - x_min)
-        adjusted[1] = 0
-    elif x_max > 1000 and x_min >= 0:
-        adjusted[1] = max(0, 1000 - box_width)
-        adjusted[3] = 1000
-    if y_min < 0 and y_max <= 1000:
-        adjusted[2] = min(1000, y_max - y_min)
-        adjusted[0] = 0
-    elif y_max > 1000 and y_min >= 0:
-        adjusted[0] = max(0, 1000 - box_height)
-        adjusted[2] = 1000
-
-    clamped = [min(1000, max(0, value)) for value in adjusted]
-    if clamped != values:
-        printable = [
-            round(float(value)) if float(value).is_integer() else value
-            for value in clamped
-        ]
-        print(f"warning: adjusted box_2d from {box} to {printable}", file=sys.stderr)
-
-    y_min, x_min, y_max, x_max = clamped
-    if x_max <= x_min or y_max <= y_min:
-        raise PipelineError(f"box_2d must have positive width and height after clamping: {box}")
-    with Image.open(image_path) as image:
-        width, height = image.size
-    return [
-        round(x_min / 1000 * width),
-        round(y_min / 1000 * height),
-        round(x_max / 1000 * width),
-        round(y_max / 1000 * height),
-    ]
-
-
-def region_to_normalized_box(region: list[int | float], image_path: Path) -> list[int]:
-    left, top, right, bottom = region
-    with Image.open(image_path) as image:
-        width, height = image.size
-    return [
-        round(top / height * 1000),
-        round(left / width * 1000),
-        round(bottom / height * 1000),
-        round(right / width * 1000),
-    ]
-
-
-def parse_expansion_value(value: Any, label: str, key: str) -> float:
-    if isinstance(value, bool):
-        raise PipelineError(f"{label} {key} must be a non-negative number.")
-    if isinstance(value, (int, float)):
-        result = float(value)
-    elif isinstance(value, str):
-        raw_value = value.strip()
-        try:
-            result = float(raw_value[:-1]) / 100 if raw_value.endswith("%") else float(raw_value)
-        except ValueError as exc:
-            raise PipelineError(f"{label} {key} must be a non-negative number.") from exc
-    else:
-        raise PipelineError(f"{label} {key} must be a non-negative number.")
-
-    if not math.isfinite(result) or result < 0:
-        raise PipelineError(f"{label} {key} must be a non-negative finite number.")
-    return result
-
-
-def parse_fraction_value(value: Any, label: str, key: str) -> float:
-    if isinstance(value, bool):
-        raise PipelineError(f"{label} {key} must be a number.")
-    if isinstance(value, (int, float)):
-        result = float(value)
-    elif isinstance(value, str):
-        raw_value = value.strip()
-        try:
-            result = float(raw_value[:-1]) / 100 if raw_value.endswith("%") else float(raw_value)
-        except ValueError as exc:
-            raise PipelineError(f"{label} {key} must be a number.") from exc
-    else:
-        raise PipelineError(f"{label} {key} must be a number.")
-
-    if not math.isfinite(result):
-        raise PipelineError(f"{label} {key} must be a finite number.")
-
-    clamped = min(1.0, max(0.0, result))
-    if clamped != result:
-        print(f"warning: clamped {label} {key} from {result} to {clamped}", file=sys.stderr)
-    return clamped
-
-
-def expand_region(
-    region: list[int | float],
-    box_widening: float,
-    height_increase: float,
-    image_path: Path,
-) -> list[int]:
-    left, top, right, bottom = (float(value) for value in region)
-    width = right - left
-    height = bottom - top
-    if width <= 0 or height <= 0:
-        raise PipelineError(f"Cannot expand non-positive region: {region}")
-
-    center_x = (left + right) / 2
-    center_y = (top + bottom) / 2
-    expanded_width = width * (1 + box_widening)
-    expanded_height = height * (1 + height_increase)
-
-    with Image.open(image_path) as image:
-        image_width, image_height = image.size
-
-    expanded = [
-        round(center_x - expanded_width / 2),
-        round(center_y - expanded_height / 2),
-        round(center_x + expanded_width / 2),
-        round(center_y + expanded_height / 2),
-    ]
-    expanded[0] = max(0, expanded[0])
-    expanded[1] = max(0, expanded[1])
-    expanded[2] = min(image_width, expanded[2])
-    expanded[3] = min(image_height, expanded[3])
-    if expanded[2] <= expanded[0] or expanded[3] <= expanded[1]:
-        raise PipelineError(f"Expanded region does not overlap image bounds: {expanded}")
-    return expanded
-
-
-def expand_region_to_container_width(
-    region: list[int | float],
-    target_width_ratio: float,
-    container_x_min: float,
-    container_x_max: float,
-    height_increase: float,
-    image_path: Path,
-) -> list[int]:
-    left, top, right, bottom = (float(value) for value in region)
-    width = right - left
-    height = bottom - top
-    if width <= 0 or height <= 0:
-        raise PipelineError(f"Cannot expand non-positive region: {region}")
-    if target_width_ratio <= 0:
-        raise PipelineError(f"target_width_ratio must be greater than 0: {target_width_ratio}")
-    if container_x_max <= container_x_min:
-        raise PipelineError(
-            f"container_x_max must be greater than container_x_min: "
-            f"{container_x_min}, {container_x_max}"
-        )
-
-    with Image.open(image_path) as image:
-        image_width, image_height = image.size
-
-    container_left = container_x_min * image_width
-    container_right = container_x_max * image_width
-    container_width = container_right - container_left
-    target_width = min(container_width, max(width, container_width * target_width_ratio))
-    if target_width <= 0:
-        raise PipelineError(
-            f"Expanded target width must be positive for container: "
-            f"{container_x_min}, {container_x_max}"
-        )
-
-    center_x = (left + right) / 2
-    center_y = (top + bottom) / 2
-    expanded_height = height * (1 + height_increase)
-
-    expanded_left = center_x - target_width / 2
-    expanded_right = center_x + target_width / 2
-    if expanded_left < container_left:
-        expanded_right += container_left - expanded_left
-        expanded_left = container_left
-    if expanded_right > container_right:
-        expanded_left -= expanded_right - container_right
-        expanded_right = container_right
-
-    expanded = [
-        round(max(0, expanded_left)),
-        round(max(0, center_y - expanded_height / 2)),
-        round(min(image_width, expanded_right)),
-        round(min(image_height, center_y + expanded_height / 2)),
-    ]
-    if expanded[2] <= expanded[0] or expanded[3] <= expanded[1]:
-        raise PipelineError(f"Expanded region does not overlap image bounds: {expanded}")
-    return expanded
-
-
-def clip_region_values(
-    region: Any,
-    image_width: int,
-    image_height: int,
-    label: str,
-) -> list[int]:
-    if not isinstance(region, list) or len(region) != 4:
-        raise PipelineError(f"{label} must be a region array of four numbers.")
-    values: list[int] = []
-    for coordinate in region:
-        if not isinstance(coordinate, (int, float)) or isinstance(coordinate, bool):
-            raise PipelineError(f"{label} region values must be numbers.")
-        values.append(round(coordinate))
-    left, top, right, bottom = values
-    clipped = [
-        max(0, min(image_width, left)),
-        max(0, min(image_height, top)),
-        max(0, min(image_width, right)),
-        max(0, min(image_height, bottom)),
-    ]
-    if clipped[2] <= clipped[0] or clipped[3] <= clipped[1]:
-        raise PipelineError(f"{label} region does not overlap image bounds: {region}")
-    return clipped
-
-
-def expanded_region_bounds(
-    region: list[int],
-    image_width: int,
-    image_height: int,
-    pad_x: int,
-    pad_y: int,
-) -> list[int]:
-    left, top, right, bottom = region
-    return [
-        max(0, left - pad_x),
-        max(0, top - pad_y),
-        min(image_width, right + pad_x),
-        min(image_height, bottom + pad_y),
-    ]
-
-
-def sample_stride(bounds: list[int], max_samples: int = 12000) -> int:
-    left, top, right, bottom = bounds
-    area = max(1, (right - left) * (bottom - top))
-    return max(1, math.ceil(math.sqrt(area / max_samples)))
-
-
-def percentile(values: list[int], ratio: float) -> int:
-    if not values:
-        raise PipelineError("Cannot calculate percentile for an empty sample.")
-    ordered = sorted(values)
-    index = round((len(ordered) - 1) * ratio)
-    return ordered[max(0, min(len(ordered) - 1, index))]
-
-
-def sampled_pixel_values(pixels: Any, bounds: list[int], max_samples: int = 12000) -> list[int]:
-    stride = sample_stride(bounds, max_samples)
-    values: list[int] = []
-    for y in range(bounds[1], bounds[3], stride):
-        for x in range(bounds[0], bounds[2], stride):
-            values.append(int(pixels[x, y]))
-    return values
-
-
-def dominant_text_container_brightness(values: list[int]) -> int | None:
-    if not values:
-        return None
-    bright_values = [value for value in values if value >= 180]
-    dark_values = [value for value in values if value <= 90]
-    bright_ratio = len(bright_values) / len(values)
-    dark_ratio = len(dark_values) / len(values)
-
-    if bright_ratio >= 0.20 and bright_ratio >= dark_ratio * 0.75:
-        return percentile(bright_values, 0.70)
-    if dark_ratio >= 0.20 and dark_ratio > bright_ratio:
-        return percentile(dark_values, 0.30)
-    return None
-
-
-def estimate_background_brightness(
-    pixels: Any,
-    region: list[int],
-    image_width: int,
-    image_height: int,
-) -> int:
-    left, top, right, bottom = region
-    region_width = right - left
-    region_height = bottom - top
-    max_dimension = max(region_width, region_height)
-    inner_bounds = expanded_region_bounds(region, image_width, image_height, 8, 8)
-    inner_background = dominant_text_container_brightness(
-        sampled_pixel_values(pixels, inner_bounds, 5000)
-    )
-    if inner_background is not None:
-        return inner_background
-
-    pad_x = max(16, round(min(max(region_width * 0.75, max_dimension * 0.20), 120)))
-    pad_y = max(16, round(min(max(region_height * 0.50, max_dimension * 0.15), 80)))
-    bounds = expanded_region_bounds(region, image_width, image_height, pad_x, pad_y)
-    values = sampled_pixel_values(pixels, bounds)
-
-    if not values:
-        return 255
-
-    bright_count = sum(1 for value in values if value >= 180)
-    dark_count = sum(1 for value in values if value <= 90)
-    if bright_count >= dark_count and bright_count >= len(values) * 0.25:
-        return percentile(values, 0.85)
-    if dark_count >= len(values) * 0.25:
-        return percentile(values, 0.15)
-    return percentile(values, 0.50)
-
-
-def background_pixel_matches(value: int, background: int, tolerance: int) -> bool:
-    if background >= 170:
-        return value >= max(0, background - tolerance)
-    if background <= 85:
-        return value <= min(255, background + tolerance)
-    return abs(value - background) <= tolerance
-
-
-def placement_detection_search_bounds(
-    region: list[int],
-    image_width: int,
-    image_height: int,
-) -> list[int]:
-    left, top, right, bottom = region
-    region_width = right - left
-    region_height = bottom - top
-    max_dimension = max(region_width, region_height)
-    pad_x = max(
-        PLACEMENT_DETECT_MIN_SEARCH_PAD,
-        round(region_width * PLACEMENT_DETECT_SEARCH_SCALE),
-        round(max_dimension * 1.50),
-    )
-    pad_y = max(
-        PLACEMENT_DETECT_MIN_SEARCH_PAD,
-        round(region_height * PLACEMENT_DETECT_SEARCH_SCALE),
-        round(max_dimension * 1.50),
-    )
-    return expanded_region_bounds(region, image_width, image_height, pad_x, pad_y)
-
-
-def find_background_seed(
-    pixels: Any,
-    region: list[int],
-    search_bounds: list[int],
-    background: int,
-    tolerance: int,
-) -> tuple[int, int] | None:
-    left, top, right, bottom = region
-    center_x = (left + right - 1) / 2
-    center_y = (top + bottom - 1) / 2
-    radius = max(
-        PLACEMENT_DETECT_MIN_SEARCH_PAD,
-        round(max(right - left, bottom - top) * 1.5),
-    )
-    seed_bounds = [
-        max(search_bounds[0], math.floor(center_x - radius)),
-        max(search_bounds[1], math.floor(center_y - radius)),
-        min(search_bounds[2], math.ceil(center_x + radius) + 1),
-        min(search_bounds[3], math.ceil(center_y + radius) + 1),
-    ]
-    best_seed: tuple[int, int] | None = None
-    best_distance: float | None = None
-    for y in range(seed_bounds[1], seed_bounds[3]):
-        for x in range(seed_bounds[0], seed_bounds[2]):
-            if not background_pixel_matches(int(pixels[x, y]), background, tolerance):
-                continue
-            distance = (x - center_x) ** 2 + (y - center_y) ** 2
-            if best_distance is None or distance < best_distance:
-                best_seed = (x, y)
-                best_distance = distance
-    return best_seed
-
-
-def point_in_bounds(x: float, y: float, bounds: list[int]) -> bool:
-    return bounds[0] <= x < bounds[2] and bounds[1] <= y < bounds[3]
-
-
-def point_in_region_with_margin(x: float, y: float, region: list[int], margin: int) -> bool:
-    return (
-        region[0] - margin <= x < region[2] + margin
-        and region[1] - margin <= y < region[3] + margin
-    )
-
-
-def point_in_any_region_with_margin(
-    x: float,
-    y: float,
-    regions: list[list[int]],
-    margin: int,
-) -> bool:
-    return any(point_in_region_with_margin(x, y, region, margin) for region in regions)
-
-
-def opposite_boundary_pixel(value: int, background: int) -> bool:
-    if background >= 170:
-        return value <= PLACEMENT_RAY_DARK_BOUNDARY
-    if background <= 85:
-        return value >= PLACEMENT_RAY_LIGHT_BOUNDARY
-    return abs(value - background) >= PLACEMENT_RAY_MID_CONTRAST
-
-
-def local_gradient(
-    pixels: Any,
-    x: int,
-    y: int,
-    image_width: int,
-    image_height: int,
-) -> int:
-    value = int(pixels[x, y])
-    gradients: list[int] = []
-    if x > 0:
-        gradients.append(abs(value - int(pixels[x - 1, y])))
-    if x < image_width - 1:
-        gradients.append(abs(value - int(pixels[x + 1, y])))
-    if y > 0:
-        gradients.append(abs(value - int(pixels[x, y - 1])))
-    if y < image_height - 1:
-        gradients.append(abs(value - int(pixels[x, y + 1])))
-    return max(gradients) if gradients else 0
-
-
-def ray_sample_is_boundary(
-    pixels: Any,
-    x: float,
-    y: float,
-    perpendicular_x: float,
-    perpendicular_y: float,
-    image_width: int,
-    image_height: int,
-    search_bounds: list[int],
-    background: int,
-) -> bool:
-    half_thickness = PLACEMENT_RAY_THICKNESS // 2
-    boundary_votes = 0
-    sample_count = 0
-    for offset in range(-half_thickness, half_thickness + 1):
-        sample_x = round(x + perpendicular_x * offset)
-        sample_y = round(y + perpendicular_y * offset)
-        if sample_x < search_bounds[0] or sample_x >= search_bounds[2]:
-            continue
-        if sample_y < search_bounds[1] or sample_y >= search_bounds[3]:
-            continue
-        if sample_x < 0 or sample_x >= image_width or sample_y < 0 or sample_y >= image_height:
-            continue
-        sample_count += 1
-        value = int(pixels[sample_x, sample_y])
-        if opposite_boundary_pixel(value, background):
-            boundary_votes += 1
-            continue
-        if local_gradient(pixels, sample_x, sample_y, image_width, image_height) >= PLACEMENT_RAY_GRADIENT:
-            boundary_votes += 1
-    return sample_count == 0 or boundary_votes > 0
-
-
-def cast_placement_ray(
-    pixels: Any,
-    seed: tuple[int, int],
-    direction_name: str,
-    direction_x: float,
-    direction_y: float,
-    original_region: list[int],
-    blocker_regions: list[list[int]],
-    search_bounds: list[int],
-    background: int,
-    image_width: int,
-    image_height: int,
-) -> dict[str, Any]:
-    perpendicular_x = -direction_y
-    perpendicular_y = direction_x
-    start_x, start_y = seed
-    last_clear = (float(start_x), float(start_y))
-    boundary_start = last_clear
-    boundary_run = 0
-    max_steps = math.ceil(
-        math.hypot(search_bounds[2] - search_bounds[0], search_bounds[3] - search_bounds[1])
-    ) + 2
-
-    for step in range(1, max_steps + 1):
-        x = start_x + direction_x * step
-        y = start_y + direction_y * step
-        if not point_in_bounds(x, y, search_bounds):
-            reached_image_edge = (
-                (x < search_bounds[0] and search_bounds[0] == 0)
-                or (x >= search_bounds[2] and search_bounds[2] == image_width)
-                or (y < search_bounds[1] and search_bounds[1] == 0)
-                or (y >= search_bounds[3] and search_bounds[3] == image_height)
-            )
-            return {
-                "direction": direction_name,
-                "x": round(last_clear[0]),
-                "y": round(last_clear[1]),
-                "hitBoundary": reached_image_edge,
-                "stopReason": "image_bounds" if reached_image_edge else "search_bounds",
-            }
-        if point_in_region_with_margin(x, y, original_region, PLACEMENT_RAY_IGNORE_MARGIN):
-            last_clear = (x, y)
-            boundary_run = 0
-            continue
-        if point_in_any_region_with_margin(x, y, blocker_regions, PLACEMENT_RAY_IGNORE_MARGIN):
-            return {
-                "direction": direction_name,
-                "x": round(last_clear[0]),
-                "y": round(last_clear[1]),
-                "hitBoundary": True,
-                "stopReason": "nearby_text_region",
-            }
-
-        if ray_sample_is_boundary(
-            pixels,
-            x,
-            y,
-            perpendicular_x,
-            perpendicular_y,
-            image_width,
-            image_height,
-            search_bounds,
-            background,
-        ):
-            if boundary_run == 0:
-                boundary_start = last_clear
-            boundary_run += 1
-            if boundary_run >= PLACEMENT_RAY_BOUNDARY_RUN:
-                return {
-                    "direction": direction_name,
-                    "x": round(boundary_start[0]),
-                    "y": round(boundary_start[1]),
-                    "hitBoundary": True,
-                    "stopReason": "boundary",
-                }
-        else:
-            last_clear = (x, y)
-            boundary_run = 0
-
-    return {
-        "direction": direction_name,
-        "x": round(last_clear[0]),
-        "y": round(last_clear[1]),
-        "hitBoundary": False,
-        "stopReason": "max_steps",
-    }
-
-
-def ray_cast_component(
-    pixels: Any,
-    seed: tuple[int, int],
-    original_region: list[int],
-    blocker_regions: list[list[int]],
-    search_bounds: list[int],
-    background: int,
-    image_width: int,
-    image_height: int,
-) -> dict[str, Any]:
-    ray_endpoints = [
-        cast_placement_ray(
-            pixels,
-            seed,
-            direction_name,
-            direction_x,
-            direction_y,
-            original_region,
-            blocker_regions,
-            search_bounds,
-            background,
-            image_width,
-            image_height,
-        )
-        for direction_name, direction_x, direction_y in PLACEMENT_RAY_DIRECTIONS
-    ]
-    by_direction = {endpoint["direction"]: endpoint for endpoint in ray_endpoints}
-    up_endpoint = by_direction["up"]
-    down_endpoint = by_direction["down"]
-
-    left_endpoints = [
-        by_direction[direction]
-        for direction in ("left", "up_left", "down_left")
-        if by_direction[direction]["hitBoundary"]
-    ]
-    right_endpoints = [
-        by_direction[direction]
-        for direction in ("right", "up_right", "down_right")
-        if by_direction[direction]["hitBoundary"]
-    ]
-
-    # A center ray can pass through touching balloons. The most inward result on
-    # each side gives a rectangle supported by all three rays on that side.
-    left = max(
-        (endpoint["x"] for endpoint in left_endpoints),
-        default=original_region[0],
-    )
-    right = min(
-        (endpoint["x"] + 1 for endpoint in right_endpoints),
-        default=original_region[2],
-    )
-    top = up_endpoint["y"] if up_endpoint["hitBoundary"] else original_region[1]
-    bottom = down_endpoint["y"] + 1 if down_endpoint["hitBoundary"] else original_region[3]
-
-    for endpoint in ray_endpoints:
-        endpoint["usedForRegion"] = bool(endpoint["hitBoundary"])
-
-    return {
-        "region": [
-            max(0, min(image_width, min(left, original_region[0]))),
-            max(0, min(image_height, min(top, original_region[1]))),
-            max(0, min(image_width, max(right, original_region[2]))),
-            max(0, min(image_height, max(bottom, original_region[3]))),
-        ],
-        "rayEndpoints": ray_endpoints,
-        "hitRayCount": sum(1 for endpoint in ray_endpoints if endpoint["hitBoundary"]),
-        "cardinalHitRayCount": sum(
-            1
-            for endpoint in ray_endpoints
-            if endpoint["hitBoundary"] and endpoint["direction"] in PLACEMENT_RAY_CARDINAL_DIRECTIONS
-        ),
-        "seed": [seed[0], seed[1]],
-    }
-
-
-def ray_rejection_reason(
-    component: dict[str, Any],
-    original_region: list[int],
-    image_width: int,
-    image_height: int,
-) -> str | None:
-    left, top, right, bottom = component["region"]
-    width = right - left
-    height = bottom - top
-    original_width = original_region[2] - original_region[0]
-    original_height = original_region[3] - original_region[1]
-    area = width * height
-    image_area = image_width * image_height
-
-    if component["cardinalHitRayCount"] < PLACEMENT_RAY_MIN_CARDINAL_HIT_COUNT:
-        return "insufficient_cardinal_ray_boundaries"
-    if component["hitRayCount"] < PLACEMENT_RAY_MIN_HIT_COUNT:
-        return "insufficient_total_ray_boundaries"
-    if width < 8 or height < 8:
-        return "ray_region_too_small"
-    if area > image_area * PLACEMENT_DETECT_MAX_IMAGE_AREA_RATIO:
-        return "ray_region_too_large"
-    if (
-        width <= max(original_width + 4, round(original_width * 1.15))
-        and height <= max(original_height + 4, round(original_height * 1.05))
-    ):
-        return "ray_region_not_larger_than_ocr_box"
-    return None
-
-
-def inset_detected_region(region: list[int]) -> tuple[list[int], int]:
-    left, top, right, bottom = region
-    width = right - left
-    height = bottom - top
-    inset = max(PLACEMENT_DETECT_INSET_MIN, round(min(width, height) * PLACEMENT_DETECT_INSET_RATIO))
-    if width <= inset * 2 + 4 or height <= inset * 2 + 4:
-        return region, 0
-    return [left + inset, top + inset, right - inset, bottom - inset], inset
-
-
-def fallback_detected_region(
-    region: list[int],
-    image_width: int,
-    image_height: int,
-) -> list[int]:
-    left, top, right, bottom = region
-    width = right - left
-    height = bottom - top
-    center_x = (left + right) / 2
-    center_y = (top + bottom) / 2
-    expanded_width = width * (1 + PLACEMENT_DETECT_FALLBACK_WIDENING)
-    expanded_height = height * (1 + PLACEMENT_DETECT_FALLBACK_HEIGHT_INCREASE)
-    expanded = [
-        round(center_x - expanded_width / 2),
-        round(center_y - expanded_height / 2),
-        round(center_x + expanded_width / 2),
-        round(center_y + expanded_height / 2),
-    ]
-    return [
-        max(0, expanded[0]),
-        max(0, expanded[1]),
-        min(image_width, expanded[2]),
-        min(image_height, expanded[3]),
-    ]
-
-
-def padded_region(
-    region: list[int],
-    image_width: int,
-    image_height: int,
-    pad_x: int,
-    pad_y: int,
-) -> list[int]:
-    return [
-        max(0, region[0] - pad_x),
-        max(0, region[1] - pad_y),
-        min(image_width, region[2] + pad_x),
-        min(image_height, region[3] + pad_y),
-    ]
-
-
-def placement_blocker_regions(
-    region: list[int],
-    image_width: int,
-    image_height: int,
-) -> list[list[int]]:
-    width = region[2] - region[0]
-    height = region[3] - region[1]
-    hard_pad_x = round(
-        max(
-            PLACEMENT_BLOCKER_PAD_X_MIN,
-            min(PLACEMENT_BLOCKER_PAD_X_MAX, width * PLACEMENT_BLOCKER_PAD_X_RATIO),
-        )
-    )
-    hard_pad_y = round(
-        max(
-            PLACEMENT_BLOCKER_PAD_Y_MIN,
-            min(PLACEMENT_BLOCKER_PAD_Y_MAX, height * PLACEMENT_BLOCKER_PAD_Y_RATIO),
-        )
-    )
-    hard_region = padded_region(region, image_width, image_height, hard_pad_x, hard_pad_y)
-
-    shadow_pad_y = round(
-        max(
-            PLACEMENT_BLOCKER_SHADOW_PAD_Y_MIN,
-            min(
-                PLACEMENT_BLOCKER_SHADOW_PAD_Y_MAX,
-                height * PLACEMENT_BLOCKER_SHADOW_PAD_Y_RATIO,
+    return load_prompt(
+        "placement_style.txt",
+        font_uses=font_use_prompt(backup_font),
+        backup_font=backup_font,
+        target_name=language.target.name,
+        reading_order=language.source.reading_order,
+        page_index=page.index,
+        records_table=compact_records_table(
+            placement_style_records(structured_records, placements),
+            (
+                "boxno",
+                "text",
+                "englishText",
+                "openLettering",
+                "sfx",
+                "box_2d",
+                "placementRegion",
             ),
-        )
+        ),
     )
-    shadow_width = min(
-        width,
-        max(PLACEMENT_BLOCKER_SHADOW_WIDTH_MIN, round(width * PLACEMENT_BLOCKER_SHADOW_WIDTH_RATIO)),
-    )
-    center_x = (region[0] + region[2]) / 2
-    shadow_region = [
-        max(0, round(center_x - shadow_width / 2)),
-        max(0, region[1] - shadow_pad_y),
-        min(image_width, round(center_x + shadow_width / 2)),
-        min(image_height, region[3] + shadow_pad_y),
-    ]
-
-    return [hard_region, shadow_region]
-
-
-def detect_record_placement_region(
-    pixels: Any,
-    record: dict[str, Any],
-    blocker_regions: list[list[int]],
-    image_width: int,
-    image_height: int,
-) -> dict[str, Any]:
-    label = f"page {record['page']} boxno {record['boxno']}"
-    original_region = clip_region_values(record["region"], image_width, image_height, label)
-    search_bounds = placement_detection_search_bounds(original_region, image_width, image_height)
-    background = estimate_background_brightness(pixels, original_region, image_width, image_height)
-    fallback_reason = "no_background_seed_found"
-
-    for tolerance in PLACEMENT_DETECT_TOLERANCES:
-        seed = find_background_seed(pixels, original_region, search_bounds, background, tolerance)
-        if seed is None:
-            continue
-        component = ray_cast_component(
-            pixels,
-            seed,
-            original_region,
-            blocker_regions,
-            search_bounds,
-            background,
-            image_width,
-            image_height,
-        )
-        rejection_reason = ray_rejection_reason(
-            component,
-            original_region,
-            image_width,
-            image_height,
-        )
-        if rejection_reason is not None:
-            fallback_reason = rejection_reason
-            continue
-
-        placement_region, inset = inset_detected_region(component["region"])
-        return {
-            "label": record["boxno"],
-            "boxno": record["boxno"],
-            "placementRegion": placement_region,
-            "placementMethod": "ray_cast",
-            "detectedBackground": background,
-            "tolerance": tolerance,
-            "raySeed": component["seed"],
-            "rayEndpoints": component["rayEndpoints"],
-            "hitRayCount": component["hitRayCount"],
-            "cardinalHitRayCount": component["cardinalHitRayCount"],
-            "searchRegion": search_bounds,
-            "blockerRegions": blocker_regions,
-            "inset": inset,
-        }
-
-    return {
-        "label": record["boxno"],
-        "boxno": record["boxno"],
-        "placementRegion": fallback_detected_region(original_region, image_width, image_height),
-        "placementMethod": "fallback_expand_region",
-        "fallbackReason": fallback_reason,
-        "detectedBackground": background,
-        "searchRegion": search_bounds,
-        "blockerRegions": blocker_regions,
-        "box_widening": PLACEMENT_DETECT_FALLBACK_WIDENING,
-        "height_increase": PLACEMENT_DETECT_FALLBACK_HEIGHT_INCREASE,
-    }
-
-
-def detect_expansions_page(
-    page: Page,
-    structured_records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    expansions: list[dict[str, Any]] = []
-    records_to_expand = non_open_records(structured_records)
-    with Image.open(page.image_path) as image:
-        grayscale = image.convert("L")
-        pixels = grayscale.load()
-        image_width, image_height = grayscale.size
-        clipped_by_boxno = {
-            record["boxno"]: clip_region_values(
-                record["region"],
-                image_width,
-                image_height,
-                f"page {record['page']} boxno {record['boxno']}",
-            )
-            for record in structured_records
-        }
-        for record in records_to_expand:
-            blocker_regions = [
-                blocker_region
-                for boxno, region in clipped_by_boxno.items()
-                if boxno != record["boxno"]
-                for blocker_region in placement_blocker_regions(region, image_width, image_height)
-            ]
-            expansion = detect_record_placement_region(
-                pixels,
-                record,
-                blocker_regions,
-                image_width,
-                image_height,
-            )
-            expansion["box_2d"] = [
-                round(expansion["placementRegion"][1] / image_height * 1000),
-                round(expansion["placementRegion"][0] / image_width * 1000),
-                round(expansion["placementRegion"][3] / image_height * 1000),
-                round(expansion["placementRegion"][2] / image_width * 1000),
-            ]
-            expansions.append(expansion)
-    return sorted(expansions, key=lambda item: item["label"])
 
 
 def validate_open_placements_page(
@@ -5025,7 +3494,8 @@ def validate_open_placements_page(
     structured_records: list[dict[str, Any]],
     vlm_items: list[Any],
 ) -> list[dict[str, Any]]:
-    expected_boxnos = {record["boxno"] for record in open_lettering_records(structured_records)}
+    open_records = open_lettering_records(structured_records)
+    expected_labels = set(range(len(open_records)))
     placements: list[dict[str, Any]] = []
     seen: set[int] = set()
     for index, value in enumerate(vlm_items):
@@ -5033,21 +3503,22 @@ def validate_open_placements_page(
         if isinstance(value, list):
             row = require_row(value, label, 2)
             item_page = page.index
-            boxno = parse_non_negative_int_value(row[0], label, "boxno")
+            item_label = parse_non_negative_int_value(row[0], label, "label")
             box = row[1]
         else:
             record = require_object(value, label)
             item_page = require_non_negative_int(record, "page", label) if "page" in record else page.index
-            boxno = require_non_negative_int(record, "boxno", label)
+            item_label = require_non_negative_int(record, "label", label)
             box = record.get("box_2d")
         if item_page != page.index:
             raise PipelineError(f"{label} has page {item_page}, expected {page.index}.")
-        if boxno not in expected_boxnos:
-            raise PipelineError(f"{label} references missing boxno {boxno}.")
-        if boxno in seen:
-            raise PipelineError(f"{label} duplicates boxno {boxno}.")
+        if item_label not in expected_labels:
+            raise PipelineError(f"{label} references missing label {item_label}.")
+        if item_label in seen:
+            raise PipelineError(f"{label} duplicates label {item_label}.")
         if not isinstance(box, list):
             raise PipelineError(f"{label} must include box_2d array.")
+        boxno = open_records[item_label]["boxno"]
         placement = {
             "page": page.index,
             "boxno": boxno,
@@ -5055,10 +3526,10 @@ def validate_open_placements_page(
             "placementRegion": normalized_box_to_region(box, page.image_path),
         }
         placements.append(placement)
-        seen.add(boxno)
-    missing = sorted(expected_boxnos - seen)
+        seen.add(item_label)
+    missing = sorted(expected_labels - seen)
     if missing:
-        raise PipelineError(f"Open placement missing page {page.index} boxnos: {missing}")
+        raise PipelineError(f"Open placement missing page {page.index} labels: {missing}")
     return sorted(placements, key=lambda item: item["boxno"])
 
 
@@ -5241,8 +3712,11 @@ def validate_placements_page(
         if boxno in seen:
             raise PipelineError(f"{label} duplicates boxno {boxno}.")
         box = record.get("box_2d")
+        placement_region = record.get("placementRegion")
+        if isinstance(placement_region, list) and len(placement_region) == 4:
+            box = region_to_normalized_box(placement_region, page.image_path)
         if not isinstance(box, list):
-            raise PipelineError(f"{label} must include box_2d array.")
+            raise PipelineError(f"{label} must include box_2d or placementRegion array.")
         placement = {
             "page": page.index,
             "boxno": boxno,
@@ -5267,6 +3741,7 @@ def validate_placements_page(
             "rayEndpoints",
             "hitRayCount",
             "cardinalHitRayCount",
+            "overlapAdjusted",
         ):
             if optional_key in record:
                 placement[optional_key] = record[optional_key]
@@ -5276,6 +3751,17 @@ def validate_placements_page(
         fill = normalize_fill(record.get("fill", record.get("color", record.get("colour"))))
         if fill is not None:
             placement["fill"] = fill
+        for optional_key in (
+            "stroke",
+            "strokeWidth",
+            "gravity",
+            "fontSizeWidthPercent",
+            "manualLineBreaks",
+            "minPointSize",
+            "maxPointSize",
+        ):
+            if optional_key in record:
+                placement[optional_key] = record[optional_key]
         placements.append(placement)
         seen.add(boxno)
     missing = sorted(expected_boxnos - seen)
@@ -5347,6 +3833,7 @@ def preliminary_placements(
                 "rayEndpoints",
                 "hitRayCount",
                 "cardinalHitRayCount",
+                "overlapAdjusted",
             ):
                 if optional_key in expansion:
                     placement[optional_key] = expansion[optional_key]
@@ -5381,10 +3868,19 @@ def apply_placements_to_records(
         placement = by_boxno[record["boxno"]]
         record["box_2d"] = placement["box_2d"]
         record["placementRegion"] = placement["placementRegion"]
-        if "font" in placement:
-            record["font"] = placement["font"]
-        if "fill" in placement:
-            record["fill"] = placement["fill"]
+        for field in (
+            "font",
+            "fill",
+            "stroke",
+            "strokeWidth",
+            "gravity",
+            "fontSizeWidthPercent",
+            "manualLineBreaks",
+            "minPointSize",
+            "maxPointSize",
+        ):
+            if field in placement:
+                record[field] = placement[field]
 
 
 def placement_expand_fixture_items(
@@ -5409,6 +3905,10 @@ def attach_placements(
         path = data_page_path(output_dir, "placements", page)
         data = load_json_array(path, f"placement page {page.index}")
         placements = validate_placements_page(page, structured_by_page[page.index], data)
+        placements = editor_runtime.apply_protected_records(
+            "placements", page.index, placements, "placement"
+        )
+        write_json(path, placements)
         placements_by_page[page.index] = placements
         apply_placements_to_records(structured_by_page[page.index], placements)
     return placements_by_page
@@ -5437,7 +3937,10 @@ def run_placement_phase(
     existing_by_page: dict[int, list[dict[str, Any]]] | None = None,
 ) -> dict[int, list[dict[str, Any]]]:
     ensure_all_pages(structured_by_page, pages, "Structured OCR records")
-    ensure_translated_pages(pages, structured_by_page)
+    ensure_translated_pages(
+        pages_in_range(pages, start_page, end_page),
+        structured_by_page,
+    )
     placements_by_page: dict[int, list[dict[str, Any]]] = dict(existing_by_page or {})
     for page in pages_in_range(pages, start_page, end_page):
         structured_records = structured_by_page[page.index]
@@ -5447,6 +3950,13 @@ def run_placement_phase(
             open_records = open_lettering_records(structured_records)
             if open_records:
                 print(f"VLM open placement page {page.index}", file=sys.stderr)
+                open_placement_debug_path = draw_region_debug_image(
+                    labeled_open_placement_records(structured_records),
+                    page,
+                    output_dir,
+                    "placement_open_input_img",
+                    VLM_PLACEMENT_DEBUG_COLOR,
+                )
                 open_placements = get_validated_vlm_array(
                     "placement_open",
                     page,
@@ -5459,6 +3969,7 @@ def run_placement_phase(
                         structured_by_page[current_page.index],
                         items,
                     ),
+                    open_placement_debug_path,
                 )
             else:
                 open_placements = []
@@ -5494,6 +4005,14 @@ def run_placement_phase(
                 open_placements,
                 expansions,
             )
+            preliminary_debug_path = draw_region_debug_image(
+                preliminary,
+                page,
+                output_dir,
+                "placement_preliminary_img",
+                VLM_PLACEMENT_DEBUG_COLOR,
+                "placementRegion",
+            )
 
             print(f"VLM style placement page {page.index}", file=sys.stderr)
             styles = get_validated_vlm_array(
@@ -5515,11 +4034,17 @@ def run_placement_phase(
                     items,
                     config.render_font,
                 ),
+                preliminary_debug_path,
             )
             write_json(trace_page_path(output_dir, "placement_style", page), styles)
             placements = merge_placement_styles(page, preliminary, styles)
             apply_placements_to_records(structured_records, placements)
         placements_by_page[page.index] = placements
+        placements = editor_runtime.reconcile_records(
+            "placements", page.index, placements, "placement"
+        )
+        placements_by_page[page.index] = placements
+        apply_placements_to_records(structured_records, placements)
         write_json(data_page_path(output_dir, "placements", page), placements)
         draw_region_debug_image(
             placements,
@@ -5534,17 +4059,15 @@ def run_placement_phase(
     return placements_by_page
 
 
-def render_page(
+def clean_render_page(
     page: Page,
     records: list[dict[str, Any]],
     output_dir: Path,
-    config: PipelineConfig,
+    lama_session: lama_inpaint.LaMaSession | None,
 ) -> None:
-    print(f"Render page {page.index}", file=sys.stderr)
+    print(f"Clean page {page.index}", file=sys.stderr)
     cleaned_path = cleaned_pages_dir(output_dir) / f"{page.image_path.stem}.png"
-    final_path = final_pages_dir(output_dir) / f"{page.image_path.stem}.png"
     keep_mask = debug_image_path(output_dir, "masks", page)
-
     clean_entries = [record for record in records if not record["openLettering"]]
     clean_text_regions.clean_text_regions(
         clean_entries,
@@ -5556,8 +4079,19 @@ def render_page(
         clean_text_regions.DEFAULT_CROP_TRIGGER_SIZE,
         clean_text_regions.DEFAULT_CROP_MARGIN,
         keep_mask,
+        lama_session,
     )
 
+
+def typeset_render_page(
+    page: Page,
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    config: PipelineConfig,
+) -> None:
+    print(f"Render page {page.index}", file=sys.stderr)
+    cleaned_path = cleaned_pages_dir(output_dir) / f"{page.image_path.stem}.png"
+    final_path = final_pages_dir(output_dir) / f"{page.image_path.stem}.png"
     overlay_entries: list[dict[str, Any]] = []
     for record in records:
         english_text = record.get("englishText")
@@ -5578,6 +4112,32 @@ def render_page(
                 "stroke": outline_for_fill(fill),
                 "strokeWidth": DEFAULT_RENDER_STROKE_WIDTH,
                 "gravity": config.render_gravity,
+                **(
+                    {"fontSizeWidthPercent": record["fontSizeWidthPercent"]}
+                    if isinstance(record.get("fontSizeWidthPercent"), (int, float))
+                    else {}
+                ),
+                **(
+                    {"englishText": record["manualLineBreaks"]}
+                    if isinstance(record.get("manualLineBreaks"), str)
+                    and record["manualLineBreaks"].strip()
+                    else {}
+                ),
+                **(
+                    {"stroke": record["stroke"]}
+                    if isinstance(record.get("stroke"), str)
+                    else {}
+                ),
+                **(
+                    {"strokeWidth": record["strokeWidth"]}
+                    if isinstance(record.get("strokeWidth"), (int, float))
+                    else {}
+                ),
+                **(
+                    {"gravity": record["gravity"]}
+                    if isinstance(record.get("gravity"), str)
+                    else {}
+                ),
             }
         )
 
@@ -5594,11 +4154,59 @@ def render_pages(
     end_page: int | None = None,
 ) -> None:
     ensure_all_pages(structured_by_page, pages, "Structured OCR records")
-    ensure_translated_pages(pages, structured_by_page)
-    ensure_placed_pages(pages, structured_by_page)
     selected_pages = pages_in_range(pages, start_page, end_page)
-    for page in selected_pages:
-        render_page(page, structured_by_page[page.index], output_dir, config)
+    if not selected_pages:
+        return
+    ensure_translated_pages(selected_pages, structured_by_page)
+    ensure_placed_pages(selected_pages, structured_by_page)
+
+    needs_lama = any(
+        not record["openLettering"]
+        for page in selected_pages
+        for record in structured_by_page[page.index]
+    )
+    lama_session = (
+        lama_inpaint.LaMaSession(clean_text_regions.DEFAULT_DEVICE)
+        if needs_lama
+        else None
+    )
+    try:
+        with ThreadPoolExecutor(
+            max_workers=min(config.lama_workers, len(selected_pages)),
+            thread_name_prefix="tetolate-lama",
+        ) as executor:
+            futures = {
+                page.index: executor.submit(
+                    clean_render_page,
+                    page,
+                    structured_by_page[page.index],
+                    output_dir,
+                    lama_session,
+                )
+                for page in selected_pages
+            }
+            for page in selected_pages:
+                futures[page.index].result()
+    finally:
+        if lama_session is not None:
+            lama_session.close()
+
+    with ThreadPoolExecutor(
+        max_workers=min(config.imagemagick_workers, len(selected_pages)),
+        thread_name_prefix="tetolate-imagemagick",
+    ) as executor:
+        futures = {
+            page.index: executor.submit(
+                typeset_render_page,
+                page,
+                structured_by_page[page.index],
+                output_dir,
+                config,
+            )
+            for page in selected_pages
+        }
+        for page in selected_pages:
+            futures[page.index].result()
 
 
 def copy_zipinfo_for_deflated_write(info: zipfile.ZipInfo) -> zipfile.ZipInfo:
@@ -5839,8 +4447,9 @@ def run_full_pipeline(
 
     pages = extract_cbz(args.input_cbz, args.output_dir)
     raw_by_page = run_ocr(pages, args.output_dir, config)
-    if args.stop_after == "ocr_raw":
-        print("Stopped after OCR raw", file=sys.stderr)
+    if args.stop_after == "ocr_merged":
+        run_ocr_merge_phase(pages, raw_by_page, args.output_dir, config)
+        print("Stopped after OCR merge", file=sys.stderr)
         return
     structured_by_page = run_structure_phase(
         pages, raw_by_page, args.output_dir, config, args.fixture_dir
@@ -5883,6 +4492,7 @@ def run_single_page_resume_pipeline(
         )
 
     other_pages = pages_except(pages, target_page)
+    selected_pages = pages_in_range(pages, target_page, target_page)
 
     if phase == "ocr_raw":
         raw_existing = load_phase_records(
@@ -5934,6 +4544,7 @@ def run_single_page_resume_pipeline(
             other_pages,
             args.output_dir,
             structured_by_page,
+            require_non_empty=False,
         )
         run_translation_phase(
             pages,
@@ -5945,9 +4556,13 @@ def run_single_page_resume_pipeline(
             start_page=target_page,
             end_page=target_page,
             existing_by_page=translation_existing,
+            selected_boxno=args.translation_boxno,
         )
     else:
-        attach_translations(pages, args.output_dir, structured_by_page)
+        attach_translations(selected_pages, args.output_dir, structured_by_page)
+
+    if args.translation_boxno is not None:
+        return
 
     if phase in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements"}:
         placement_existing = attach_placements(
@@ -5966,7 +4581,7 @@ def run_single_page_resume_pipeline(
             existing_by_page=placement_existing,
         )
     else:
-        attach_placements(pages, args.output_dir, structured_by_page)
+        attach_placements(selected_pages, args.output_dir, structured_by_page)
 
     render_pages(
         pages,
@@ -6299,7 +4914,7 @@ def run_resume_pipeline(
 def needs_vlm(args: argparse.Namespace) -> bool:
     if args.fixture_dir is not None:
         return False
-    if args.stop_after == "ocr_raw":
+    if args.stop_after == "ocr_merged":
         return False
     return args.resume_from not in {"render", "package"}
 
@@ -6308,6 +4923,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_cancel_signal)
     signal.signal(signal.SIGINT, handle_cancel_signal)
     args = parse_args()
+    if (args.editor_manifest is None) != (args.editor_baseline_dir is None):
+        print(
+            "error: --editor-manifest and --editor-baseline-dir must be provided together.",
+            file=sys.stderr,
+        )
+        return 1
+    editor_runtime.configure(args.editor_manifest, args.editor_baseline_dir)
     started_at = time.monotonic()
     try:
         if args.resume_from is None and args.resume_page != 0:
@@ -6316,6 +4938,13 @@ def main() -> int:
             raise PipelineError("--single-page requires --resume-from.")
         if args.skip_package and not args.single_page:
             raise PipelineError("--skip-package requires --single-page.")
+        if args.translation_boxno is not None:
+            if args.translation_boxno < 0:
+                raise PipelineError("--translation-boxno must be zero or greater.")
+            if args.resume_from != "translations" or not args.single_page:
+                raise PipelineError(
+                    "--translation-boxno requires --resume-from translations and --single-page."
+                )
         if args.stop_after is not None and args.resume_from is not None:
             raise PipelineError("--stop-after cannot be combined with --resume-from.")
         config = load_config(args.config, args.fixture_dir)
@@ -6347,6 +4976,35 @@ def main() -> int:
                     else config.jxl_quality
                 ),
             )
+        if any(
+            value is not None
+            for value in (
+                args.ocr_workers,
+                args.lama_workers,
+                args.imagemagick_workers,
+            )
+        ):
+            config = replace(
+                config,
+                ocr_page_workers=(
+                    normalize_page_workers(args.ocr_workers, "--ocr-workers")
+                    if args.ocr_workers is not None
+                    else config.ocr_page_workers
+                ),
+                lama_workers=(
+                    normalize_page_workers(args.lama_workers, "--lama-workers")
+                    if args.lama_workers is not None
+                    else config.lama_workers
+                ),
+                imagemagick_workers=(
+                    normalize_page_workers(
+                        args.imagemagick_workers,
+                        "--imagemagick-workers",
+                    )
+                    if args.imagemagick_workers is not None
+                    else config.imagemagick_workers
+                ),
+            )
         if args.vlm_base_url is not None:
             if config.vlm is None:
                 raise PipelineError("--vlm-base-url requires a VLM config.")
@@ -6357,6 +5015,13 @@ def main() -> int:
                     base_url=normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url"),
                 ),
             )
+        vlm_api_key = args.vlm_api_key
+        if vlm_api_key is None:
+            vlm_api_key = os.environ.get("TETOLATE_VLM_API_KEY")
+        if vlm_api_key is not None:
+            if config.vlm is None:
+                raise PipelineError("A VLM API key requires a VLM config.")
+            config = replace(config, vlm=replace(config.vlm, api_key=vlm_api_key))
         if args.thinking_budget_tokens is not None and config.vlm is not None:
             config = replace(
                 config,
@@ -6419,7 +5084,8 @@ def main() -> int:
                     paddleocr_vl_api_key=(
                         args.paddleocr_vl_api_key
                         if args.paddleocr_vl_api_key is not None
-                        else config.ocr.paddleocr_vl_api_key
+                        else os.environ.get("TETOLATE_PADDLEOCR_VL_API_KEY")
+                        or config.ocr.paddleocr_vl_api_key
                     ),
                     paddleocr_vl_max_concurrency=(
                         args.paddleocr_vl_max_concurrency

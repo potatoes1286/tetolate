@@ -1,0 +1,21 @@
+Create reusable translation notes for translating related CBZs in the same series.
+
+You are given the complete ${source_name} source text, final ${target_name} translation, and user-provided
+translation notes. Write concise plain-text notes that would help keep future related volumes
+consistent.
+
+Include useful items such as:
+- Character names and consistent romanization/spelling.
+- Places, organizations, magic/skill names, titles, honorific choices, and recurring terms.
+- Character voice, formality, catchphrases, relationship context, and pronoun choices.
+- Ambiguities or unresolved terms a future translator should watch.
+- Any user-provided preferences that should carry forward.
+
+Do not write a page-by-page summary unless a page-specific note is genuinely reusable.
+Do not include JSON. Do not include markdown code fences.
+
+User translation notes:
+${translation_notes}
+
+Final translation records, tab-separated as page, boxno, sfx, openLettering, sourceText, englishText:
+${records_table}

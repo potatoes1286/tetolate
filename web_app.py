@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import html
 import json
 import os
 import queue
@@ -32,8 +31,24 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from starlette.concurrency import run_in_threadpool
 
 import paddle_ocr_image
+import editor_v2
+import lama_inpaint
 import translate_cbz
+from web_editor_backend import (
+    EditorManagerMixin,
+    parse_region,
+)
+from web_pages import (
+    admin_dashboard_page,
+    admin_login_page,
+    category_delete_page,
+    category_jobs_page,
+    editor_page,
+    job_page,
+    job_viewer_page,
+)
 import web_security
+from web_storage import write_json_atomic
 
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -57,6 +72,7 @@ DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
 DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
+OCR_REVIEW_CHECKPOINT = "ocr"
 GENERATED_TRANSLATION_NOTES_NAME = translate_cbz.GENERATED_TRANSLATION_NOTES_NAME
 DEFAULT_LISTEN = "127.0.0.1:8088"
 DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -73,7 +89,7 @@ WEB_CONFIG_FIELDS = {
     "max_upload_bytes",
 }
 UPLOAD_CHUNK_SIZE = 1024 * 1024
-LOG_TAIL_BYTES = 256 * 1024
+LOG_TAIL_BYTES = 2 * 1024 * 1024
 UPLOAD_PAGE_IMAGE_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -104,20 +120,13 @@ RESUME_PHASE_BY_PROGRESS = {
     "Open placement": "placements",
     "Placement expansion": "placements",
     "Placement style": "placements",
+    "Clean": "render",
     "Render": "render",
     "Package": "package",
 }
 RESUME_PHASES = frozenset(RESUME_PHASE_BY_PROGRESS.values())
 TERMINAL_JOB_STATUSES = frozenset(("complete", "failed", "cancelled"))
 OCR_MERGE_EDITOR_STAGE = "ocr_merge"
-EDITABLE_STAGES = frozenset(
-    ("ocr_raw", "ocr_merged", "ocr_structured", "translations", "placements")
-)
-EDITOR_UI_STAGES = frozenset((OCR_MERGE_EDITOR_STAGE, "ocr_structured", "translations", "placements"))
-EDITOR_DATA_STAGES = EDITABLE_STAGES | frozenset((OCR_MERGE_EDITOR_STAGE,))
-EDITOR_RERUN_STAGES = frozenset(
-    (OCR_MERGE_EDITOR_STAGE, "ocr_raw", "ocr_merged", "ocr_structured", "translations", "placements", "render")
-)
 RERUN_STAGE_MAP = {
     OCR_MERGE_EDITOR_STAGE: "ocr_structured",
     "ocr_raw": "ocr_raw",
@@ -146,28 +155,9 @@ RERUN_JOB_STAGE_RESUME = {
 }
 RERUN_JOB_PACKAGE_STAGE = "package"
 EDITOR_META_DIRNAME = "web_meta"
-EDITOR_META_FILENAME = "editor.json"
 TRANSLATION_NOTES_FILENAME = "translation_notes.json"
+JOB_SECRETS_FILENAME = ".job-secrets.json"
 CATEGORY_ADVANCED_OPTIONS_FILENAME = "advanced_options.json"
-EDITOR_STAGE_ORDER = (OCR_MERGE_EDITOR_STAGE, "ocr_structured", "translations", "placements")
-EDITOR_STAGE_LABELS = {
-    OCR_MERGE_EDITOR_STAGE: "OCR merge",
-    "ocr_structured": "Structured",
-    "translations": "Translations",
-    "placements": "Placements",
-}
-EDITOR_STAGE_RERUN_FROM = {
-    OCR_MERGE_EDITOR_STAGE: "ocr_structured",
-    "ocr_structured": "translations",
-    "translations": "placements",
-    "placements": "render",
-}
-EDITOR_STAGE_UPSTREAM = {
-    OCR_MERGE_EDITOR_STAGE: (),
-    "ocr_structured": (OCR_MERGE_EDITOR_STAGE,),
-    "translations": (OCR_MERGE_EDITOR_STAGE, "ocr_structured"),
-    "placements": (OCR_MERGE_EDITOR_STAGE, "ocr_structured", "translations"),
-}
 PAGE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 DELETE_JOB_CONFIRM = "Delete this job and its generated files?"
 CATEGORY_DELETE_CONFIRM = (
@@ -304,6 +294,17 @@ def parse_optional_text_form(value: str, default: str) -> str:
     return value or default
 
 
+def parse_auth_token_form(value: str) -> str | None:
+    token = value.strip()
+    if not token:
+        return None
+    if len(token) > 16_384:
+        raise HTTPException(status_code=400, detail="Auth token is too long.")
+    if any(character in token for character in ("\0", "\r", "\n")):
+        raise HTTPException(status_code=400, detail="Auth token contains an invalid character.")
+    return token
+
+
 def validate_vlm_base_url(value: str, default: str) -> str:
     endpoint = value.strip() or default
     try:
@@ -358,6 +359,13 @@ def parse_paddleocr_vl_server_url_form(
 
 def parse_checkbox(value: str | None) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
+
+
+def parse_page_workers_form(value: str, label: str) -> int:
+    try:
+        return translate_cbz.normalize_page_workers(value, label)
+    except translate_cbz.PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def thinking_budget_text(value: Any) -> str:
@@ -579,6 +587,40 @@ def age_text(seconds: float | int | None) -> str:
     return f"{days}d {remaining_hours}h"
 
 
+def stored_elapsed_seconds(status: dict[str, Any]) -> float:
+    try:
+        value = float(status.get("elapsedSeconds", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, value)
+
+
+def start_active_runtime(
+    status: dict[str, Any],
+    now: datetime | None = None,
+) -> None:
+    now = now or datetime.now(timezone.utc)
+    timestamp = now.isoformat()
+    if parse_timestamp(status.get("startedAt")) is None:
+        status["startedAt"] = timestamp
+    if parse_timestamp(status.get("activeStartedAt")) is None:
+        status["activeStartedAt"] = timestamp
+
+
+def stop_active_runtime(
+    status: dict[str, Any],
+    now: datetime | None = None,
+) -> float:
+    now = now or datetime.now(timezone.utc)
+    elapsed = stored_elapsed_seconds(status)
+    active_started_at = parse_timestamp(status.get("activeStartedAt"))
+    if active_started_at is not None:
+        elapsed += max(0.0, (now - active_started_at).total_seconds())
+    status["elapsedSeconds"] = round(elapsed, 3)
+    status.pop("activeStartedAt", None)
+    return elapsed
+
+
 def job_timing(status: dict[str, Any], now: datetime | None = None) -> JobTiming:
     now = now or datetime.now(timezone.utc)
     created_at = (
@@ -587,13 +629,15 @@ def job_timing(status: dict[str, Any], now: datetime | None = None) -> JobTiming
         or parse_timestamp(status.get("startedAt"))
         or parse_timestamp(status.get("finishedAt"))
     )
-    started_at = parse_timestamp(status.get("startedAt"))
-    finished_at = parse_timestamp(status.get("finishedAt"))
-    if finished_at is not None and started_at is not None:
-        elapsed_seconds = (finished_at - started_at).total_seconds()
-    elif started_at is not None:
-        elapsed_seconds = (now - started_at).total_seconds()
-    else:
+    elapsed_seconds = stored_elapsed_seconds(status)
+    active_started_at = parse_timestamp(status.get("activeStartedAt"))
+    if active_started_at is not None:
+        elapsed_seconds += max(0.0, (now - active_started_at).total_seconds())
+    if (
+        elapsed_seconds == 0
+        and active_started_at is None
+        and parse_timestamp(status.get("startedAt")) is None
+    ):
         elapsed_seconds = None
     age_seconds = (now - created_at).total_seconds() if created_at is not None else None
     return JobTiming(age_seconds=age_seconds, elapsed_seconds=elapsed_seconds)
@@ -797,34 +841,7 @@ def quality_for_display(value: Any, default: int) -> int:
         return default
 
 
-def escape(value: Any) -> str:
-    return html.escape("" if value is None else str(value), quote=True)
-
-
-def write_json_atomic(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    output_mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as file:
-            temp_path = Path(file.name)
-            json.dump(data, file, ensure_ascii=False, indent=2, allow_nan=False)
-            file.write("\n")
-        os.chmod(temp_path, output_mode)
-        os.replace(temp_path, path)
-    finally:
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
-
-
-def safe_log_lines(path: Path, limit: int = 40) -> list[str]:
+def safe_log_lines(path: Path, limit: int = 1000) -> list[str]:
     if not path.exists():
         return []
     try:
@@ -860,6 +877,7 @@ def parse_progress_line(line: str) -> tuple[str, int | None] | None:
         (re.compile(r"^VLM open placement page (\d+)"), "Open placement"),
         (re.compile(r"^Detect placement containers page (\d+)"), "Placement expansion"),
         (re.compile(r"^VLM style placement page (\d+)"), "Placement style"),
+        (re.compile(r"^Clean page (\d+)"), "Clean"),
         (re.compile(r"^Render page (\d+)"), "Render"),
         (re.compile(r"^Wrote .+translated\.cbz"), "Package"),
     )
@@ -951,102 +969,6 @@ def parse_rerun_job_stages(values: list[str]) -> tuple[str | None, bool]:
     return resume_from, RERUN_JOB_PACKAGE_STAGE in selected
 
 
-def validate_stage(stage: str, allowed: frozenset[str] = EDITABLE_STAGES) -> str:
-    stage = stage.strip()
-    if stage not in allowed:
-        raise HTTPException(status_code=404, detail="Unknown editor stage.")
-    return stage
-
-
-def lock_stages_for_editor_stage(stage: str) -> tuple[str, ...]:
-    stage = validate_stage(stage, EDITOR_DATA_STAGES)
-    if stage == OCR_MERGE_EDITOR_STAGE:
-        return ("ocr_raw", "ocr_merged")
-    return (validate_stage(stage),)
-
-
-def page_key(page: int) -> str:
-    return str(page)
-
-
-def default_editor_meta() -> dict[str, Any]:
-    return {
-        "locks": {},
-        "changedStages": {},
-        "translationNotes": {
-            "job": "",
-            "pages": {},
-        },
-    }
-
-
-def normalize_editor_meta(value: Any) -> dict[str, Any]:
-    meta = default_editor_meta()
-    if not isinstance(value, dict):
-        return meta
-
-    locks = value.get("locks")
-    if isinstance(locks, dict):
-        normalized_locks: dict[str, dict[str, bool]] = {}
-        for raw_page, raw_stages in locks.items():
-            if not isinstance(raw_stages, dict):
-                continue
-            page_locks = {
-                stage: bool(raw_stages.get(stage))
-                for stage in EDITABLE_STAGES
-                if raw_stages.get(stage) is not None
-            }
-            if page_locks:
-                normalized_locks[str(raw_page)] = page_locks
-        meta["locks"] = normalized_locks
-
-    changed_stages = value.get("changedStages")
-    if isinstance(changed_stages, dict):
-        normalized_changed: dict[str, dict[str, str]] = {}
-        for raw_page, raw_stages in changed_stages.items():
-            if not isinstance(raw_stages, dict):
-                continue
-            page_changes: dict[str, str] = {}
-            for stage in EDITOR_STAGE_ORDER:
-                changed_value = raw_stages.get(stage)
-                if changed_value is None or changed_value is False:
-                    continue
-                page_changes[stage] = (
-                    changed_value if isinstance(changed_value, str) else now_utc()
-                )
-            if page_changes:
-                normalized_changed[str(raw_page)] = page_changes
-        meta["changedStages"] = normalized_changed
-
-    notes = value.get("translationNotes")
-    if isinstance(notes, dict):
-        job_note = notes.get("job", "")
-        pages = notes.get("pages", {})
-        meta["translationNotes"] = {
-            "job": job_note if isinstance(job_note, str) else "",
-            "pages": {
-                str(raw_page): note
-                for raw_page, note in pages.items()
-                if isinstance(note, str)
-            }
-            if isinstance(pages, dict)
-            else {},
-        }
-    return meta
-
-
-def parse_region(value: Any, label: str) -> list[int]:
-    if not isinstance(value, list) or len(value) != 4:
-        raise HTTPException(status_code=400, detail=f"{label} must be a four-number array.")
-    try:
-        left, top, right, bottom = [round(float(item)) for item in value]
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=f"{label} values must be numbers.") from exc
-    if right <= left or bottom <= top:
-        raise HTTPException(status_code=400, detail=f"{label} must have positive width and height.")
-    return [left, top, right, bottom]
-
-
 def optional_non_negative_int(value: Any, label: str) -> int | None:
     if value is None:
         return None
@@ -1061,48 +983,7 @@ def optional_non_negative_int(value: Any, label: str) -> int | None:
     return parsed
 
 
-def offset_record_region(record: dict[str, Any], left: int, top: int, width: int, height: int) -> dict[str, Any] | None:
-    shifted = dict(record)
-    region = shifted.get("region")
-    if not isinstance(region, list) or len(region) != 4:
-        return None
-    try:
-        x0, y0, x1, y1 = [round(float(value)) for value in region]
-    except (TypeError, ValueError):
-        return None
-    x0 += left
-    x1 += left
-    y0 += top
-    y1 += top
-    x0 = max(0, min(width, x0))
-    x1 = max(0, min(width, x1))
-    y0 = max(0, min(height, y0))
-    y1 = max(0, min(height, y1))
-    if x1 <= x0 or y1 <= y0:
-        return None
-    shifted["region"] = [x0, y0, x1, y1]
-
-    polygon = shifted.get("polygon")
-    if isinstance(polygon, list):
-        shifted_polygon: list[list[int]] = []
-        for point in polygon:
-            if not isinstance(point, list) or len(point) != 2:
-                shifted_polygon = []
-                break
-            try:
-                px = max(0, min(width, round(float(point[0])) + left))
-                py = max(0, min(height, round(float(point[1])) + top))
-            except (TypeError, ValueError):
-                shifted_polygon = []
-                break
-            shifted_polygon.append([px, py])
-        if shifted_polygon:
-            shifted["polygon"] = shifted_polygon
-    shifted["ocrSource"] = "manual_crop"
-    return shifted
-
-
-class JobManager:
+class JobManager(EditorManagerMixin):
     def __init__(self, config: WebConfig) -> None:
         self.config = config
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -1118,6 +999,8 @@ class JobManager:
         self._admin_sessions: dict[str, float] = {}
         self._admin_login_failures: dict[str, list[float]] = {}
         self._password_workers = threading.BoundedSemaphore(2)
+        self._editor_lama_lock = threading.Lock()
+        self._editor_lama_session: lama_inpaint.LaMaSession | None = None
         self._instance_lock_file: Any | None = None
         self._instance_lock_kind = ""
 
@@ -1159,6 +1042,10 @@ class JobManager:
         self._queue.put(None)
         if self._worker is not None:
             self._worker.join(timeout=5)
+        with self._editor_lama_lock:
+            if self._editor_lama_session is not None:
+                self._editor_lama_session.close()
+                self._editor_lama_session = None
         self.release_instance_lock()
 
     def instance_lock_path(self) -> Path:
@@ -1582,9 +1469,11 @@ class JobManager:
         if status.get("pendingTermination"):
             return
         if signal_sent:
+            paused_at = datetime.now(timezone.utc)
+            stop_active_runtime(status, paused_at)
             status["status"] = "paused"
             status["isPaused"] = True
-            status["pausedAt"] = now_utc()
+            status["pausedAt"] = paused_at.isoformat()
             status["message"] = "Paused by admin."
         else:
             status["message"] = "Pause requested, but the active process could not be suspended."
@@ -1595,6 +1484,7 @@ class JobManager:
         if status.get("pendingTermination"):
             return
         if signal_sent or status.get("status") == "paused":
+            start_active_runtime(status)
             status["status"] = "running"
             status["isPaused"] = False
             status.pop("pausedAt", None)
@@ -1725,6 +1615,9 @@ class JobManager:
             "ocrEngine": self.config.default_ocr_engine,
             "paddleocrVlServerUrl": self.config.default_paddleocr_vl_server_url,
             "paddleocrVlModel": self.config.default_paddleocr_vl_model,
+            "ocrPageWorkers": translate_cbz.DEFAULT_OCR_PAGE_WORKERS,
+            "lamaWorkers": translate_cbz.DEFAULT_LAMA_WORKERS,
+            "imagemagickWorkers": translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         }
 
     def normalize_category_advanced_options(self, data: Any) -> dict[str, Any]:
@@ -1773,6 +1666,17 @@ class JobManager:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 normalized[key] = value.strip()
+        for key, label in (
+            ("ocrPageWorkers", "OCR workers"),
+            ("lamaWorkers", "LaMa workers"),
+            ("imagemagickWorkers", "ImageMagick workers"),
+        ):
+            try:
+                normalized[key] = translate_cbz.normalize_page_workers(
+                    data.get(key, defaults[key]), label
+                )
+            except translate_cbz.PipelineError:
+                pass
         return normalized
 
     def load_category_advanced_options(self, code: str) -> dict[str, Any]:
@@ -1799,6 +1703,9 @@ class JobManager:
         ocr_engine: str,
         paddleocr_vl_server_url: str,
         paddleocr_vl_model: str,
+        ocr_page_workers: int = translate_cbz.DEFAULT_OCR_PAGE_WORKERS,
+        lama_workers: int = translate_cbz.DEFAULT_LAMA_WORKERS,
+        imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         translation_notes: str | None = None,
     ) -> None:
         with self._lock:
@@ -1815,6 +1722,9 @@ class JobManager:
                     "ocrEngine": ocr_engine,
                     "paddleocrVlServerUrl": paddleocr_vl_server_url,
                     "paddleocrVlModel": paddleocr_vl_model,
+                    "ocrPageWorkers": ocr_page_workers,
+                    "lamaWorkers": lama_workers,
+                    "imagemagickWorkers": imagemagick_workers,
                 }
             )
             if translation_notes is not None:
@@ -1832,6 +1742,57 @@ class JobManager:
 
     def status_path(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / "status.json"
+
+    def job_secrets_path(self, code: str, job_id: str) -> Path:
+        return self.job_dir(code, job_id) / JOB_SECRETS_FILENAME
+
+    def load_job_secrets(self, code: str, job_id: str) -> dict[str, str]:
+        path = self.job_secrets_path(code, job_id)
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            key: value
+            for key, value in data.items()
+            if key in {"vlmAuthToken", "paddleocrVlAuthToken"}
+            and isinstance(value, str)
+            and value
+        }
+
+    def update_job_auth_tokens(
+        self,
+        code: str,
+        job_id: str,
+        *,
+        vlm_auth_token: str | None,
+        paddleocr_vl_auth_token: str | None,
+        clear_vlm_auth_token: bool = False,
+        clear_paddleocr_vl_auth_token: bool = False,
+        preserve_existing: bool = True,
+    ) -> None:
+        secrets = self.load_job_secrets(code, job_id) if preserve_existing else {}
+        for key, token, clear in (
+            ("vlmAuthToken", vlm_auth_token, clear_vlm_auth_token),
+            (
+                "paddleocrVlAuthToken",
+                paddleocr_vl_auth_token,
+                clear_paddleocr_vl_auth_token,
+            ),
+        ):
+            if clear:
+                secrets.pop(key, None)
+            elif token is not None:
+                secrets[key] = token
+        path = self.job_secrets_path(code, job_id)
+        if secrets:
+            write_json_atomic(path, secrets, mode=0o600)
+        else:
+            path.unlink(missing_ok=True)
 
     def log_path(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / "run.log"
@@ -1854,9 +1815,6 @@ class JobManager:
     def editor_meta_dir(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / EDITOR_META_DIRNAME
 
-    def editor_meta_path(self, code: str, job_id: str) -> Path:
-        return self.editor_meta_dir(code, job_id) / EDITOR_META_FILENAME
-
     def translation_notes_path(self, code: str, job_id: str) -> Path:
         return self.editor_meta_dir(code, job_id) / TRANSLATION_NOTES_FILENAME
 
@@ -1868,10 +1826,6 @@ class JobManager:
         if not path.is_file():
             return ""
         return path.read_text(encoding="utf-8", errors="replace").strip()
-
-    def data_page_path(self, code: str, job_id: str, stage: str, page: int) -> Path:
-        stage = validate_stage(stage)
-        return self.output_dir(code, job_id) / "data" / stage / f"page_{page:04d}.json"
 
     def original_pages_dir(self, code: str, job_id: str) -> Path:
         return self.output_dir(code, job_id) / "pages" / "original"
@@ -1952,634 +1906,6 @@ class JobManager:
 
     def final_page_infos(self, code: str, job_id: str) -> list[dict[str, Any]]:
         return self.page_infos(self.final_page_files(code, job_id))
-
-    def load_editor_meta(self, code: str, job_id: str) -> dict[str, Any]:
-        path = self.editor_meta_path(code, job_id)
-        if not path.exists():
-            return default_editor_meta()
-        try:
-            return normalize_editor_meta(json.loads(path.read_text(encoding="utf-8")))
-        except json.JSONDecodeError:
-            return default_editor_meta()
-
-    def save_editor_meta(self, code: str, job_id: str, meta: dict[str, Any]) -> None:
-        with self._lock:
-            normalized = normalize_editor_meta(meta)
-            path = self.editor_meta_path(code, job_id)
-            write_json_atomic(path, normalized)
-            self.write_translation_notes(code, job_id, normalized)
-
-    def write_translation_notes(self, code: str, job_id: str, meta: dict[str, Any] | None = None) -> None:
-        meta = normalize_editor_meta(meta if meta is not None else self.load_editor_meta(code, job_id))
-        notes = meta.get("translationNotes", {})
-        path = self.translation_notes_path(code, job_id)
-        write_json_atomic(path, notes)
-
-    def set_initial_translation_notes(self, code: str, job_id: str, notes: str) -> None:
-        notes = notes.strip()
-        if not notes:
-            return
-        with self._lock:
-            meta = self.load_editor_meta(code, job_id)
-            translation_notes = meta.setdefault("translationNotes", {"job": "", "pages": {}})
-            if isinstance(translation_notes, dict):
-                translation_notes["job"] = notes
-            self.save_editor_meta(code, job_id, meta)
-
-    def require_editable_job(self, code: str, job_id: str) -> dict[str, Any]:
-        code = self.validate_category(code)
-        job_id = self.validate_job_id(job_id)
-        status = self.load_status(code, job_id)
-        if status is None:
-            raise HTTPException(status_code=404, detail="Unknown job.")
-        if status.get("status") != "complete":
-            raise HTTPException(status_code=400, detail="Only complete jobs can be edited.")
-        if not self.output_dir(code, job_id).is_dir():
-            raise HTTPException(status_code=400, detail="Job output directory is missing.")
-        return status
-
-    def is_stage_locked(self, code: str, job_id: str, page: int, stage: str) -> bool:
-        stages = lock_stages_for_editor_stage(stage)
-        meta = self.load_editor_meta(code, job_id)
-        locks = meta.get("locks", {})
-        if not isinstance(locks, dict):
-            return False
-        page_locks = locks.get(page_key(page), {})
-        return isinstance(page_locks, dict) and all(bool(page_locks.get(stage_name)) for stage_name in stages)
-
-    def set_stage_lock(self, code: str, job_id: str, page: int, stage: str, locked: bool) -> dict[str, Any]:
-        stages = lock_stages_for_editor_stage(stage)
-        self.require_editable_job(code, job_id)
-        self.original_page_path(code, job_id, page)
-        with self._lock:
-            meta = self.load_editor_meta(code, job_id)
-            locks = meta.setdefault("locks", {})
-            if not isinstance(locks, dict):
-                locks = {}
-                meta["locks"] = locks
-            key = page_key(page)
-            page_locks = locks.setdefault(key, {})
-            if not isinstance(page_locks, dict):
-                page_locks = {}
-                locks[key] = page_locks
-            for stage_name in stages:
-                page_locks[stage_name] = bool(locked)
-            self.save_editor_meta(code, job_id, meta)
-            return meta
-
-    def editor_stage_key(self, stage: str) -> str:
-        stage = validate_stage(stage, EDITOR_UI_STAGES)
-        if stage in {"ocr_raw", "ocr_merged", OCR_MERGE_EDITOR_STAGE}:
-            return OCR_MERGE_EDITOR_STAGE
-        if stage in EDITOR_UI_STAGES:
-            return stage
-        raise HTTPException(status_code=400, detail="Unsupported editor change stage.")
-
-    def mark_editor_stage_changed(self, code: str, job_id: str, page: int, stage: str) -> dict[str, Any]:
-        self.require_editable_job(code, job_id)
-        self.original_page_path(code, job_id, page)
-        stage_key = self.editor_stage_key(stage)
-        with self._lock:
-            meta = self.load_editor_meta(code, job_id)
-            changed = meta.setdefault("changedStages", {})
-            if not isinstance(changed, dict):
-                changed = {}
-                meta["changedStages"] = changed
-            page_changes = changed.setdefault(page_key(page), {})
-            if not isinstance(page_changes, dict):
-                page_changes = {}
-                changed[page_key(page)] = page_changes
-            page_changes[stage_key] = now_utc()
-            self.save_editor_meta(code, job_id, meta)
-            return meta
-
-    def editor_changed_pages(self, meta: dict[str, Any]) -> dict[int, set[str]]:
-        changed = meta.get("changedStages", {})
-        result: dict[int, set[str]] = {}
-        if not isinstance(changed, dict):
-            return result
-        for raw_page, raw_stages in changed.items():
-            try:
-                page = int(raw_page)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(raw_stages, dict):
-                continue
-            stages = {
-                stage
-                for stage in EDITOR_STAGE_ORDER
-                if raw_stages.get(stage) is not None
-            }
-            if stages:
-                result[page] = stages
-        return result
-
-    def earliest_editor_rerun_stage(self, stages: set[str]) -> str | None:
-        order = ["ocr_structured", "translations", "placements", "render"]
-        candidates = [
-            EDITOR_STAGE_RERUN_FROM[stage]
-            for stage in EDITOR_STAGE_ORDER
-            if stage in stages and stage in EDITOR_STAGE_RERUN_FROM
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda stage: order.index(stage))
-
-    def editor_change_info(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        stage: str,
-    ) -> dict[str, Any]:
-        stage_key = self.editor_stage_key(stage)
-        meta = self.load_editor_meta(code, job_id)
-        changed_by_page = self.editor_changed_pages(meta)
-        current_stages = changed_by_page.get(page, set())
-        upstream = [
-            stage_name
-            for stage_name in EDITOR_STAGE_UPSTREAM.get(stage_key, ())
-            if stage_name in current_stages
-        ]
-        all_pages = sorted(changed_by_page)
-        all_stages = set().union(*changed_by_page.values()) if changed_by_page else set()
-        return {
-            "page": page,
-            "stage": stage_key,
-            "changedStages": sorted(current_stages, key=EDITOR_STAGE_ORDER.index),
-            "changedStageLabels": [
-                EDITOR_STAGE_LABELS[stage_name]
-                for stage_name in sorted(current_stages, key=EDITOR_STAGE_ORDER.index)
-            ],
-            "outdatedBecause": upstream,
-            "outdatedBecauseLabels": [EDITOR_STAGE_LABELS[stage_name] for stage_name in upstream],
-            "currentStageChanged": stage_key in current_stages,
-            "allChangedPages": all_pages,
-            "allChangedCount": len(all_pages),
-            "allChangedResumeFrom": self.earliest_editor_rerun_stage(all_stages),
-        }
-
-    def clear_editor_changes_for_pages(self, code: str, job_id: str, pages: list[int]) -> None:
-        with self._lock:
-            meta = self.load_editor_meta(code, job_id)
-            changed = meta.get("changedStages", {})
-            if not isinstance(changed, dict):
-                return
-            for page in pages:
-                changed.pop(page_key(page), None)
-            self.save_editor_meta(code, job_id, meta)
-
-    def locked_stage_paths_for_page(self, code: str, job_id: str, page: int) -> dict[str, Path]:
-        meta = self.load_editor_meta(code, job_id)
-        locks = meta.get("locks", {})
-        page_locks = locks.get(page_key(page), {}) if isinstance(locks, dict) else {}
-        result: dict[str, Path] = {}
-        if not isinstance(page_locks, dict):
-            return result
-        for stage in EDITABLE_STAGES:
-            if page_locks.get(stage):
-                path = self.data_page_path(code, job_id, stage, page)
-                if path.exists():
-                    result[stage] = path
-        return result
-
-    def load_stage_records(self, code: str, job_id: str, stage: str, page: int) -> list[Any]:
-        path = self.data_page_path(code, job_id, stage, page)
-        if not path.exists():
-            return []
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=500, detail=f"Invalid JSON in {stage} page {page}: {exc.msg}") from exc
-        if not isinstance(data, list):
-            raise HTTPException(status_code=500, detail=f"{stage} page {page} is not a JSON array.")
-        return data
-
-    def save_stage_records(self, code: str, job_id: str, stage: str, page: int, records: list[Any]) -> None:
-        stage = validate_stage(stage)
-        self.require_editable_job(code, job_id)
-        self.original_page_path(code, job_id, page)
-        if stage == "placements":
-            records = self.normalize_saved_placements(code, job_id, page, records)
-        path = self.data_page_path(code, job_id, stage, page)
-        write_json_atomic(path, records)
-        if stage in {"translations", "placements"}:
-            self.apply_classification_from_stage_records(code, job_id, page, records)
-
-    def clamp_editor_region(
-        self,
-        region: Any,
-        width: int,
-        height: int,
-        label: str,
-    ) -> list[int]:
-        left, top, right, bottom = parse_region(region, label)
-        left = max(0, min(width, left))
-        right = max(0, min(width, right))
-        top = max(0, min(height, top))
-        bottom = max(0, min(height, bottom))
-        if right <= left or bottom <= top:
-            raise HTTPException(status_code=400, detail=f"{label} does not overlap the page.")
-        return [left, top, right, bottom]
-
-    def normalize_ocr_merge_records(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        raw_records: list[Any],
-        merged_records: list[Any],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        image_path = self.original_page_path(code, job_id, page)
-        with Image.open(image_path) as image:
-            width, height = image.size
-
-        normalized_raw: list[dict[str, Any]] = []
-        used_raw_boxnos: set[int] = set()
-        next_raw_boxno = 0
-        for index, item in enumerate(raw_records):
-            if not isinstance(item, dict):
-                raise HTTPException(status_code=400, detail=f"rawRecords[{index}] must be an object.")
-            record = dict(item)
-            raw_boxno = record.get("boxno")
-            if not isinstance(raw_boxno, int) or raw_boxno in used_raw_boxnos:
-                while next_raw_boxno in used_raw_boxnos:
-                    next_raw_boxno += 1
-                raw_boxno = next_raw_boxno
-            used_raw_boxnos.add(raw_boxno)
-            next_raw_boxno = max(next_raw_boxno, raw_boxno + 1)
-            record["page"] = page
-            record["boxno"] = raw_boxno
-            record["region"] = self.clamp_editor_region(record.get("region"), width, height, f"rawRecords[{index}].region")
-            record["text"] = str(record.get("text", ""))
-            normalized_raw.append(record)
-
-        raw_by_boxno = {
-            int(record["boxno"]): record
-            for record in normalized_raw
-            if isinstance(record.get("boxno"), int)
-        }
-
-        normalized_merged: list[dict[str, Any]] = []
-        for index, item in enumerate(merged_records):
-            if not isinstance(item, dict):
-                raise HTTPException(status_code=400, detail=f"mergedRecords[{index}] must be an object.")
-            record = dict(item)
-            seen_sources: set[int] = set()
-            source_boxnos: list[int] = []
-            for raw_source in record.get("sourceBoxnos", []):
-                if not isinstance(raw_source, int) or raw_source in seen_sources or raw_source not in raw_by_boxno:
-                    continue
-                seen_sources.add(raw_source)
-                source_boxnos.append(raw_source)
-            if not source_boxnos:
-                continue
-
-            source_regions = [raw_by_boxno[boxno]["region"] for boxno in source_boxnos]
-            source_texts = [str(raw_by_boxno[boxno].get("text", "")) for boxno in source_boxnos]
-            region = record.get("region")
-            if isinstance(region, list) and len(region) == 4:
-                region = self.clamp_editor_region(region, width, height, f"mergedRecords[{index}].region")
-            else:
-                region = [
-                    min(item[0] for item in source_regions),
-                    min(item[1] for item in source_regions),
-                    max(item[2] for item in source_regions),
-                    max(item[3] for item in source_regions),
-                ]
-            record["page"] = page
-            record["boxno"] = len(normalized_merged)
-            record["sourceBoxnos"] = source_boxnos
-            record["sourceTexts"] = source_texts
-            record["text"] = "".join(source_texts)
-            record["region"] = region
-            normalized_merged.append(record)
-
-        return normalized_raw, normalized_merged
-
-    def save_ocr_merge_records(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        raw_records: list[Any],
-        merged_records: list[Any],
-    ) -> None:
-        raw_records, merged_records = self.normalize_ocr_merge_records(
-            code,
-            job_id,
-            page,
-            raw_records,
-            merged_records,
-        )
-        self.save_stage_records(code, job_id, "ocr_raw", page, raw_records)
-        self.save_stage_records(code, job_id, "ocr_merged", page, merged_records)
-        self.set_stage_lock(code, job_id, page, OCR_MERGE_EDITOR_STAGE, True)
-
-    def normalize_saved_placements(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        records: list[Any],
-    ) -> list[Any]:
-        image_path = self.original_page_path(code, job_id, page)
-        with Image.open(image_path) as image:
-            width, height = image.size
-        normalized: list[Any] = []
-        for item in records:
-            if not isinstance(item, dict):
-                normalized.append(item)
-                continue
-            record = dict(item)
-            region = record.get("placementRegion", record.get("region"))
-            if isinstance(region, list) and len(region) == 4:
-                try:
-                    left, top, right, bottom = [round(float(value)) for value in region]
-                except (TypeError, ValueError):
-                    normalized.append(record)
-                    continue
-                left = max(0, min(width, left))
-                right = max(0, min(width, right))
-                top = max(0, min(height, top))
-                bottom = max(0, min(height, bottom))
-                if right > left and bottom > top:
-                    record["placementRegion"] = [left, top, right, bottom]
-                    record["box_2d"] = [
-                        round(top / height * 1000),
-                        round(left / width * 1000),
-                        round(bottom / height * 1000),
-                        round(right / width * 1000),
-                    ]
-            normalized.append(record)
-        return normalized
-
-    def apply_classification_from_stage_records(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        stage_records: list[Any],
-    ) -> None:
-        structured_path = self.data_page_path(code, job_id, "ocr_structured", page)
-        if not structured_path.exists():
-            return
-        try:
-            structured = json.loads(structured_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return
-        if not isinstance(structured, list):
-            return
-        stage_by_boxno = {
-            item.get("boxno"): item
-            for item in stage_records
-            if isinstance(item, dict) and isinstance(item.get("boxno"), int)
-        }
-        changed = False
-        for record in structured:
-            if not isinstance(record, dict) or not isinstance(record.get("boxno"), int):
-                continue
-            stage_record = stage_by_boxno.get(record["boxno"])
-            if not isinstance(stage_record, dict):
-                continue
-            for field in ("sfx", "openLettering"):
-                if isinstance(stage_record.get(field), bool) and record.get(field) != stage_record[field]:
-                    record[field] = stage_record[field]
-                    changed = True
-        if changed:
-            write_json_atomic(structured_path, structured)
-
-    def snapshot_locked_stage_files(self, code: str, job_id: str, page: int) -> dict[str, bytes]:
-        snapshot: dict[str, bytes] = {}
-        for stage, path in self.locked_stage_paths_for_page(code, job_id, page).items():
-            try:
-                snapshot[stage] = path.read_bytes()
-            except OSError:
-                continue
-        return snapshot
-
-    def restore_locked_stage_files(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        snapshot: dict[str, bytes],
-    ) -> bool:
-        restored = False
-        for stage, content in snapshot.items():
-            path = self.data_page_path(code, job_id, stage, page)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
-            restored = True
-        return restored
-
-    def post_restore_rerun_sequence(self, resume_from: str, restored_stages: set[str]) -> list[str]:
-        overwritten_by_resume = {
-            "ocr_raw": {"ocr_raw", "ocr_merged", "ocr_structured", "translations", "placements"},
-            "ocr_structured": {"ocr_structured", "translations", "placements"},
-            "translations": {"translations", "placements"},
-            "placements": {"placements"},
-            "render": set(),
-        }
-        overwritten = overwritten_by_resume.get(resume_from, set())
-        restored_overwritten = restored_stages & overwritten
-        followup_for_stage = {
-            "ocr_raw": "ocr_structured",
-            "ocr_merged": "ocr_structured",
-            "ocr_structured": "translations",
-            "translations": "placements",
-            "placements": "render",
-        }
-        phase_order = ["ocr_structured", "translations", "placements", "render"]
-        needed = {
-            followup_for_stage[stage]
-            for stage in restored_overwritten
-            if stage in followup_for_stage
-        }
-        return [phase for phase in phase_order if phase in needed]
-
-    def editor_payload(self, code: str, job_id: str, stage: str, page: int) -> dict[str, Any]:
-        stage = validate_stage(stage, EDITOR_UI_STAGES)
-        self.require_editable_job(code, job_id)
-        page_path = self.original_page_path(code, job_id, page)
-        records: list[Any] = []
-        raw_records: list[Any] = []
-        merged_records: list[Any] = []
-        reference_records: list[Any] = []
-        if stage == OCR_MERGE_EDITOR_STAGE:
-            raw_records = self.load_stage_records(code, job_id, "ocr_raw", page)
-            merged_records = self.load_stage_records(code, job_id, "ocr_merged", page)
-            records = merged_records
-            reference_records = raw_records
-        else:
-            records = self.load_stage_records(code, job_id, stage, page)
-        if stage in {"translations", "placements"}:
-            reference_records = self.load_stage_records(code, job_id, "ocr_structured", page)
-        elif stage == "ocr_merged":
-            reference_records = self.load_stage_records(code, job_id, "ocr_raw", page)
-        meta = self.load_editor_meta(code, job_id)
-        locks = meta.get("locks", {})
-        page_locks = locks.get(page_key(page), {}) if isinstance(locks, dict) else {}
-        notes = meta.get("translationNotes", {})
-        page_notes = notes.get("pages", {}) if isinstance(notes, dict) else {}
-        return {
-            "category": code,
-            "jobId": job_id,
-            "stage": stage,
-            "page": page,
-            "pageCount": len(self.original_page_files(code, job_id)),
-            "imageUrl": f"/job/{code}/{job_id}/image/{page}",
-            "imageName": page_path.name,
-            "records": records,
-            "rawRecords": raw_records,
-            "mergedRecords": merged_records,
-            "referenceRecords": reference_records,
-            "locked": self.is_stage_locked(code, job_id, page, stage),
-            "locks": page_locks if isinstance(page_locks, dict) else {},
-            "translationNotes": {
-                "job": notes.get("job", "") if isinstance(notes, dict) else "",
-                "page": page_notes.get(page_key(page), "") if isinstance(page_notes, dict) else "",
-            },
-            "stages": list(EDITOR_UI_STAGES),
-            "changeInfo": self.editor_change_info(code, job_id, page, stage),
-        }
-
-    def save_translation_notes(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        job_note: str | None,
-        page_note: str | None,
-    ) -> dict[str, Any]:
-        self.require_editable_job(code, job_id)
-        self.original_page_path(code, job_id, page)
-        with self._lock:
-            meta = self.load_editor_meta(code, job_id)
-            notes = meta.setdefault("translationNotes", {"job": "", "pages": {}})
-            if not isinstance(notes, dict):
-                notes = {"job": "", "pages": {}}
-                meta["translationNotes"] = notes
-            pages = notes.setdefault("pages", {})
-            if not isinstance(pages, dict):
-                pages = {}
-                notes["pages"] = pages
-            if job_note is not None:
-                notes["job"] = job_note
-            if page_note is not None:
-                if page_note:
-                    pages[page_key(page)] = page_note
-                else:
-                    pages.pop(page_key(page), None)
-            self.save_editor_meta(code, job_id, meta)
-            return meta
-
-    def run_crop_ocr(
-        self,
-        code: str,
-        job_id: str,
-        page: int,
-        region: list[int],
-        raw_boxno_start: int | None = None,
-    ) -> dict[str, list[dict[str, Any]]]:
-        self.require_editable_job(code, job_id)
-        image_path = self.original_page_path(code, job_id, page)
-        with Image.open(image_path) as image:
-            width, height = image.size
-            left, top, right, bottom = region
-            left = max(0, min(width, left))
-            right = max(0, min(width, right))
-            top = max(0, min(height, top))
-            bottom = max(0, min(height, bottom))
-            if right <= left or bottom <= top:
-                raise HTTPException(status_code=400, detail="OCR crop does not overlap the page.")
-            crop = image.convert("RGB").crop((left, top, right, bottom))
-
-        config = translate_cbz.load_config(self.config.pipeline_config, None)
-        status = self.load_status(code, job_id) or {}
-        ocr_config = self.ocr_config_for_status(config.ocr, status)
-        if ocr_config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
-            ocr = paddle_ocr_image.create_paddleocr_vl(
-                ocr_config.device,
-                ocr_config.paddleocr_vl_server_url,
-                ocr_config.paddleocr_vl_model,
-                api_key=ocr_config.paddleocr_vl_api_key,
-                max_concurrency=ocr_config.paddleocr_vl_max_concurrency,
-                service_url=ocr_config.service_url,
-                service_timeout=ocr_config.service_timeout,
-            )
-        else:
-            ocr = paddle_ocr_image.create_paddle_ocr(
-                ocr_config.lang,
-                ocr_config.device,
-                ocr_config.text_det_limit_side_len,
-                ocr_config.text_det_limit_type,
-                ocr_config.use_doc_preprocessor,
-                ocr_config.use_textline_orientation,
-                ocr_version=ocr_config.ocr_version,
-                text_detection_model_name=ocr_config.text_detection_model_name,
-                text_recognition_model_name=ocr_config.text_recognition_model_name,
-                text_detection_model_dir=ocr_config.text_detection_model_dir,
-                text_recognition_model_dir=ocr_config.text_recognition_model_dir,
-                text_det_thresh=ocr_config.text_det_thresh,
-                text_det_box_thresh=ocr_config.text_det_box_thresh,
-                text_det_unclip_ratio=ocr_config.text_det_unclip_ratio,
-                text_rec_score_thresh=ocr_config.text_rec_score_thresh,
-                service_url=ocr_config.service_url,
-                service_timeout=ocr_config.service_timeout,
-            )
-
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="tetolate_crop_ocr_"
-            ) as temp_dir_name:
-                crop_path = Path(temp_dir_name) / "crop.png"
-                crop.save(crop_path, format="PNG")
-                if ocr_config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
-                    crop_records = paddle_ocr_image.extract_paddleocr_vl_image_records(
-                        ocr,
-                        crop_path,
-                        page,
-                        ocr_config.min_score,
-                    )
-                else:
-                    crop_records = paddle_ocr_image.extract_image_records(
-                        ocr,
-                        crop_path,
-                        page,
-                        ocr_config.min_score,
-                        tile_enabled=False,
-                    )
-        finally:
-            paddle_ocr_image.close_ocr_engine(ocr)
-
-        next_boxno = raw_boxno_start
-        if next_boxno is None:
-            existing = self.load_stage_records(code, job_id, "ocr_raw", page)
-            next_boxno = 0
-            for record in existing:
-                if isinstance(record, dict) and isinstance(record.get("boxno"), int):
-                    next_boxno = max(next_boxno, record["boxno"] + 1)
-
-        shifted_records: list[dict[str, Any]] = []
-        for record in crop_records:
-            shifted = offset_record_region(record, left, top, width, height)
-            if shifted is None:
-                continue
-            shifted["boxno"] = next_boxno + len(shifted_records)
-            shifted_records.append(shifted)
-        page_ref = translate_cbz.Page(index=page, image_path=image_path)
-        status = self.load_status(code, job_id) or {}
-        merged_records = translate_cbz.merge_ocr_records_for_page(
-            page_ref,
-            shifted_records,
-            right_to_left=self.status_source_language(status) != "kr",
-        )
-        return {
-            "rawRecords": shifted_records,
-            "mergedRecords": merged_records,
-            "records": shifted_records,
-        }
 
     def download_info(self, code: str, job_id: str) -> dict[str, dict[str, Any]]:
         downloads: dict[str, dict[str, Any]] = {}
@@ -2719,6 +2045,12 @@ class JobManager:
     def status_pause_after_ocr(self, status: dict[str, Any]) -> bool:
         return bool(status.get("pauseAfterOcr"))
 
+    def status_is_ocr_review_checkpoint(self, status: dict[str, Any]) -> bool:
+        return (
+            status.get("status") == "paused"
+            and status.get("reviewCheckpoint") == OCR_REVIEW_CHECKPOINT
+        )
+
     def status_proofread_translations(self, status: dict[str, Any]) -> bool:
         value = status.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
         return bool(value)
@@ -2772,6 +2104,12 @@ class JobManager:
             or self.config.default_paddleocr_vl_model
         )
 
+    def status_page_workers(self, status: dict[str, Any], key: str, label: str) -> int:
+        try:
+            return translate_cbz.normalize_page_workers(status.get(key, 1), label)
+        except translate_cbz.PipelineError:
+            return 1
+
     def ocr_config_for_status(
         self,
         ocr_config: translate_cbz.OCRConfig,
@@ -2804,6 +2142,9 @@ class JobManager:
         with self._lock:
             is_active = (code, job_id) in self._active_processes
         logical_pause = status_value == "paused" and not is_active
+        ocr_review_checkpoint = (
+            self.status_is_ocr_review_checkpoint(status) and not is_active
+        )
         can_restart = (
             status_value in {"failed", "cancelled"} or logical_pause
         ) and self.input_path(code, job_id).is_file()
@@ -2838,6 +2179,12 @@ class JobManager:
         ocr_engine = self.status_ocr_engine(status)
         paddleocr_vl_server_url = self.status_paddleocr_vl_server_url(status)
         paddleocr_vl_model = self.status_paddleocr_vl_model(status)
+        ocr_page_workers = self.status_page_workers(status, "ocrPageWorkers", "OCR workers")
+        lama_workers = self.status_page_workers(status, "lamaWorkers", "LaMa workers")
+        imagemagick_workers = self.status_page_workers(
+            status, "imagemagickWorkers", "ImageMagick workers"
+        )
+        job_secrets = self.load_job_secrets(code, job_id)
         generated_translation_notes = self.read_generated_translation_notes(code, job_id)
 
         payload = {
@@ -2876,7 +2223,8 @@ class JobManager:
             "canTerminate": can_terminate,
             "canRerunPages": status.get("status") == "complete",
             "canRegenerateDownloads": status.get("status") == "complete",
-            "canEdit": status.get("status") == "complete",
+            "canEdit": status.get("status") == "complete" or ocr_review_checkpoint,
+            "ocrReviewCheckpoint": ocr_review_checkpoint,
             "webpQuality": webp_quality,
             "jxlQuality": jxl_quality,
             "defaultWebpQuality": self.config.default_webp_quality,
@@ -2894,11 +2242,21 @@ class JobManager:
             "ocrEngine": ocr_engine,
             "paddleocrVlServerUrl": paddleocr_vl_server_url,
             "paddleocrVlModel": paddleocr_vl_model,
+            "ocrPageWorkers": ocr_page_workers,
+            "lamaWorkers": lama_workers,
+            "imagemagickWorkers": imagemagick_workers,
+            "hasVlmAuthToken": bool(job_secrets.get("vlmAuthToken")),
+            "hasPaddleocrVlAuthToken": bool(
+                job_secrets.get("paddleocrVlAuthToken")
+            ),
             "defaultAltPlacementEnabled": self.config.default_alt_placement_enabled,
             "defaultSourceLanguage": self.config.default_source_language,
             "defaultOcrEngine": self.config.default_ocr_engine,
             "defaultPaddleocrVlServerUrl": self.config.default_paddleocr_vl_server_url,
             "defaultPaddleocrVlModel": self.config.default_paddleocr_vl_model,
+            "defaultOcrPageWorkers": translate_cbz.DEFAULT_OCR_PAGE_WORKERS,
+            "defaultLamaWorkers": translate_cbz.DEFAULT_LAMA_WORKERS,
+            "defaultImagemagickWorkers": translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
             "generatedTranslationNotes": generated_translation_notes,
             "hasGeneratedTranslationNotes": bool(generated_translation_notes),
             "canUpdateAdvancedOptions": status_value in {"failed", "cancelled"} or logical_pause,
@@ -2934,6 +2292,9 @@ class JobManager:
             "defaultOcrEngine": options["ocrEngine"],
             "defaultPaddleocrVlServerUrl": options["paddleocrVlServerUrl"],
             "defaultPaddleocrVlModel": options["paddleocrVlModel"],
+            "defaultOcrPageWorkers": options["ocrPageWorkers"],
+            "defaultLamaWorkers": options["lamaWorkers"],
+            "defaultImagemagickWorkers": options["imagemagickWorkers"],
         }
 
     def requeue_interrupted_jobs(self) -> None:
@@ -2948,6 +2309,11 @@ class JobManager:
                     continue
                 if previous_status == "terminating":
                     self.stop_recorded_pipeline_process(status)
+                    stopped_at = (
+                        parse_timestamp(status.get("updatedAt"))
+                        or datetime.now(timezone.utc)
+                    )
+                    stop_active_runtime(status, stopped_at)
                     status.update(
                         {
                             "status": "cancelled",
@@ -2968,7 +2334,7 @@ class JobManager:
                     self.save_status(code, job_id, status)
                     continue
                 if previous_status == "paused":
-                    if status.get("pauseAfterOcr") and status.get("pendingResumeFrom"):
+                    if self.status_is_ocr_review_checkpoint(status):
                         continue
                     saw_paused_job = True
                 resume_target = self.pending_resume_target_for_status(status)
@@ -2976,6 +2342,12 @@ class JobManager:
                     resume_target = self.restart_target_for_status(code, job_id, status)
                 if previous_status != "queued":
                     self.stop_recorded_pipeline_process(status)
+                    stopped_at = (
+                        parse_timestamp(status.get("pausedAt"))
+                        or parse_timestamp(status.get("updatedAt"))
+                        or datetime.now(timezone.utc)
+                    )
+                    stop_active_runtime(status, stopped_at)
                 status["status"] = "queued"
                 status["phase"] = "Queued"
                 status["page"] = None
@@ -3022,6 +2394,11 @@ class JobManager:
         ocr_engine: str | None = None,
         paddleocr_vl_server_url: str | None = None,
         paddleocr_vl_model: str | None = None,
+        ocr_page_workers: int = translate_cbz.DEFAULT_OCR_PAGE_WORKERS,
+        lama_workers: int = translate_cbz.DEFAULT_LAMA_WORKERS,
+        imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
+        vlm_auth_token: str | None = None,
+        paddleocr_vl_auth_token: str | None = None,
     ) -> None:
         created_at = now_utc()
         if thinking_budget_tokens is None:
@@ -3041,6 +2418,11 @@ class JobManager:
             paddleocr_vl_server_url or self.config.default_paddleocr_vl_server_url
         )
         paddleocr_vl_model = paddleocr_vl_model or self.config.default_paddleocr_vl_model
+        ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")
+        lama_workers = translate_cbz.normalize_page_workers(lama_workers, "LaMa workers")
+        imagemagick_workers = translate_cbz.normalize_page_workers(
+            imagemagick_workers, "ImageMagick workers"
+        )
         status = {
             "category": code,
             "jobId": job_id,
@@ -3049,6 +2431,7 @@ class JobManager:
             "page": None,
             "message": "Waiting for the worker.",
             "createdAt": created_at,
+            "elapsedSeconds": 0.0,
             "inputFilename": original_filename,
             "thinkingBudgetTokens": thinking_budget_tokens,
             "vlmBaseUrl": vlm_base_url,
@@ -3060,8 +2443,18 @@ class JobManager:
             "ocrEngine": ocr_engine,
             "paddleocrVlServerUrl": paddleocr_vl_server_url,
             "paddleocrVlModel": paddleocr_vl_model,
+            "ocrPageWorkers": ocr_page_workers,
+            "lamaWorkers": lama_workers,
+            "imagemagickWorkers": imagemagick_workers,
         }
         self.save_status(code, job_id, status)
+        self.update_job_auth_tokens(
+            code,
+            job_id,
+            vlm_auth_token=vlm_auth_token,
+            paddleocr_vl_auth_token=paddleocr_vl_auth_token,
+            preserve_existing=False,
+        )
         self.set_initial_translation_notes(code, job_id, translation_notes)
         self.remember_category_advanced_options(
             code,
@@ -3076,6 +2469,9 @@ class JobManager:
             ocr_engine=ocr_engine,
             paddleocr_vl_server_url=paddleocr_vl_server_url,
             paddleocr_vl_model=paddleocr_vl_model,
+            ocr_page_workers=ocr_page_workers,
+            lama_workers=lama_workers,
+            imagemagick_workers=imagemagick_workers,
         )
         self.enqueue(code, job_id)
 
@@ -3093,6 +2489,13 @@ class JobManager:
         ocr_engine: str,
         paddleocr_vl_server_url: str,
         paddleocr_vl_model: str,
+        ocr_page_workers: int,
+        lama_workers: int,
+        imagemagick_workers: int,
+        vlm_auth_token: str | None,
+        paddleocr_vl_auth_token: str | None,
+        clear_vlm_auth_token: bool,
+        clear_paddleocr_vl_auth_token: bool,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -3103,6 +2506,11 @@ class JobManager:
         )
         source_language = translate_cbz.normalize_source_language(source_language)
         ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
+        ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")
+        lama_workers = translate_cbz.normalize_page_workers(lama_workers, "LaMa workers")
+        imagemagick_workers = translate_cbz.normalize_page_workers(
+            imagemagick_workers, "ImageMagick workers"
+        )
         with self._lock:
             status = self.load_status(code, job_id)
             if status is None:
@@ -3122,8 +2530,19 @@ class JobManager:
             status["ocrEngine"] = ocr_engine
             status["paddleocrVlServerUrl"] = paddleocr_vl_server_url
             status["paddleocrVlModel"] = paddleocr_vl_model
+            status["ocrPageWorkers"] = ocr_page_workers
+            status["lamaWorkers"] = lama_workers
+            status["imagemagickWorkers"] = imagemagick_workers
             status["message"] = "Advanced options updated."
             self.save_status(code, job_id, status)
+            self.update_job_auth_tokens(
+                code,
+                job_id,
+                vlm_auth_token=vlm_auth_token,
+                paddleocr_vl_auth_token=paddleocr_vl_auth_token,
+                clear_vlm_auth_token=clear_vlm_auth_token,
+                clear_paddleocr_vl_auth_token=clear_paddleocr_vl_auth_token,
+            )
             self.remember_category_advanced_options(
                 code,
                 thinking_budget_tokens=thinking_budget_tokens,
@@ -3136,6 +2555,9 @@ class JobManager:
                 ocr_engine=ocr_engine,
                 paddleocr_vl_server_url=paddleocr_vl_server_url,
                 paddleocr_vl_model=paddleocr_vl_model,
+                ocr_page_workers=ocr_page_workers,
+                lama_workers=lama_workers,
+                imagemagick_workers=imagemagick_workers,
             )
 
     def restart_failed_job(self, code: str, job_id: str) -> None:
@@ -3157,7 +2579,36 @@ class JobManager:
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
 
-            restart_target = self.restart_target_for_status(code, job_id, status)
+            pending_reruns = status.get("pendingPageReruns")
+            first_pending = (
+                pending_reruns[0]
+                if isinstance(pending_reruns, list)
+                and pending_reruns
+                and isinstance(pending_reruns[0], dict)
+                else None
+            )
+            pending_phase = (
+                RERUN_STAGE_MAP.get(
+                    str(first_pending.get("resumeFrom") or ""),
+                    str(first_pending.get("resumeFrom") or ""),
+                )
+                if first_pending is not None
+                else ""
+            )
+            pending_target = (
+                stored_resume_target(pending_phase, first_pending.get("page"))
+                if first_pending is not None
+                else None
+            )
+            if self.status_is_ocr_review_checkpoint(status):
+                restart_target = ("ocr_structured", 0)
+            elif (
+                pending_target is not None
+                and pending_phase in RERUN_STAGE_MAP.values()
+            ):
+                restart_target = pending_target
+            else:
+                restart_target = self.restart_target_for_status(code, job_id, status)
             try:
                 restart_count = int(status.get("restartCount", 0)) + 1
             except (TypeError, ValueError):
@@ -3179,6 +2630,7 @@ class JobManager:
                 }
             )
             status.pop("pid", None)
+            status.pop("reviewCheckpoint", None)
             if restart_target is not None:
                 status["pendingResumeFrom"] = restart_target[0]
                 status["pendingResumePage"] = restart_target[1]
@@ -3213,6 +2665,8 @@ class JobManager:
         resume_from: str = "ocr_raw",
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
+        translation_boxno: int | None = None,
+        page_resume_from: dict[int, str] | None = None,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -3225,6 +2679,18 @@ class JobManager:
             jxl_quality = validate_output_quality(jxl_quality, "JXL quality")
         if (webp_quality is None) != (jxl_quality is None):
             raise HTTPException(status_code=400, detail="Both WebP and JXL quality must be provided together.")
+        if translation_boxno is not None:
+            if resume_from != "translations" or len(pages) != 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A selected-record translation requires one page from translations.",
+                )
+            if (
+                not isinstance(translation_boxno, int)
+                or isinstance(translation_boxno, bool)
+                or translation_boxno < 0
+            ):
+                raise HTTPException(status_code=400, detail="Invalid translation box number.")
         with self._lock:
             status = self.load_status(code, job_id)
             if status is None:
@@ -3254,6 +2720,34 @@ class JobManager:
                 pages = list(range(page_count))
                 page_message = f"all pages (0-{page_count - 1})"
 
+            page_reruns: list[dict[str, Any]] = []
+            for page in pages:
+                page_stage = (
+                    page_resume_from.get(page, resume_from)
+                    if page_resume_from is not None
+                    else resume_from
+                )
+                page_stage = RERUN_STAGE_MAP.get(page_stage, page_stage)
+                if page_stage not in {
+                    "ocr_raw",
+                    "ocr_structured",
+                    "alt_placement",
+                    "translations",
+                    "placements",
+                    "render",
+                }:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Unsupported rerun stage for page {page}: {page_stage}.",
+                    )
+                page_reruns.append({"page": page, "resumeFrom": page_stage})
+            first_rerun = page_reruns[0]
+
+            if self.has_editor_v2(code, job_id):
+                manifest = self.load_editor_v2_manifest(code, job_id)
+                for page in pages:
+                    self.materialize_editor_v2_page(code, job_id, manifest, page)
+
             try:
                 rerun_count = int(status.get("rerunCount", 0)) + 1
             except (TypeError, ValueError):
@@ -3264,17 +2758,18 @@ class JobManager:
                     "phase": "Queued",
                     "page": None,
                     "message": (
-                        f"Queued to rerun {page_message} from {resume_from}."
+                        f"Queued to rerun {page_message} from each page's required stage."
+                        if page_resume_from is not None
+                        else f"Queued to rerun {page_message} from {resume_from}."
                     ),
                     "finishedAt": None,
                     "returnCode": None,
                     "rerunCount": rerun_count,
-                    "pendingSinglePages": pages,
-                    "pendingSinglePageResumeFrom": resume_from,
-                    "pendingResumeFrom": resume_from,
-                    "pendingResumePage": pages[0],
-                    "lastResumeFrom": resume_from,
-                    "lastResumePage": pages[0],
+                    "pendingPageReruns": page_reruns,
+                    "pendingResumeFrom": first_rerun["resumeFrom"],
+                    "pendingResumePage": first_rerun["page"],
+                    "lastResumeFrom": first_rerun["resumeFrom"],
+                    "lastResumePage": first_rerun["page"],
                 }
             )
             if webp_quality is not None and jxl_quality is not None:
@@ -3284,64 +2779,13 @@ class JobManager:
                 status.pop("pendingWebpQuality", None)
                 status.pop("pendingJxlQuality", None)
             status.pop("pid", None)
+            status.pop("pendingPackageOnly", None)
+            if translation_boxno is None:
+                status.pop("pendingTranslationBoxno", None)
+            else:
+                status["pendingTranslationBoxno"] = translation_boxno
             self.save_status(code, job_id, status)
             self.enqueue(code, job_id)
-
-    def rerun_changed_editor_pages(self, code: str, job_id: str) -> tuple[list[int], str]:
-        code = self.validate_category(code)
-        job_id = self.validate_job_id(job_id)
-        meta = self.load_editor_meta(code, job_id)
-        changed_by_page = self.editor_changed_pages(meta)
-        if not changed_by_page:
-            raise HTTPException(status_code=400, detail="No saved editor changes need regeneration.")
-        pages = sorted(changed_by_page)
-        all_stages = set().union(*changed_by_page.values())
-        resume_from = self.earliest_editor_rerun_stage(all_stages)
-        if resume_from is None:
-            raise HTTPException(status_code=400, detail="No supported editor changes need regeneration.")
-        with self._lock:
-            status = self.load_status(code, job_id)
-            if status is None:
-                raise HTTPException(status_code=404, detail="Unknown job.")
-            if status.get("status") in {"queued", "running"}:
-                raise HTTPException(status_code=409, detail="Job is already queued or running.")
-            if status.get("status") != "complete":
-                raise HTTPException(status_code=400, detail="Only complete jobs can rerun pages.")
-            if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
-            if not self.output_dir(code, job_id).is_dir():
-                raise HTTPException(status_code=400, detail="Existing output directory is missing.")
-
-            try:
-                rerun_count = int(status.get("rerunCount", 0)) + 1
-            except (TypeError, ValueError):
-                rerun_count = 1
-            status.update(
-                {
-                    "status": "queued",
-                    "phase": "Queued",
-                    "page": None,
-                    "message": (
-                        "Queued to regenerate changed editor pages "
-                        + ", ".join(str(page) for page in pages)
-                        + f" from {resume_from}."
-                    ),
-                    "finishedAt": None,
-                    "returnCode": None,
-                    "rerunCount": rerun_count,
-                    "pendingSinglePages": pages,
-                    "pendingSinglePageResumeFrom": resume_from,
-                    "pendingEditorChangedPages": pages,
-                    "pendingResumeFrom": resume_from,
-                    "pendingResumePage": pages[0],
-                    "lastResumeFrom": resume_from,
-                    "lastResumePage": pages[0],
-                }
-            )
-            status.pop("pid", None)
-            self.save_status(code, job_id, status)
-            self.enqueue(code, job_id)
-        return pages, resume_from
 
     def terminate_active_job(self, code: str, job_id: str) -> None:
         code = self.validate_category(code)
@@ -3450,7 +2894,7 @@ class JobManager:
                 }
             )
             status.pop("pid", None)
-            status.pop("pendingSinglePages", None)
+            status.pop("pendingPageReruns", None)
             self.save_status(code, job_id, status)
             self.enqueue(code, job_id)
 
@@ -3488,12 +2932,14 @@ class JobManager:
                 )
                 try:
                     status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+                    finished_at = datetime.now(timezone.utc)
+                    stop_active_runtime(status, finished_at)
                     status.update(
                         {
                             "status": "failed",
                             "phase": "Failed",
                             "message": f"Unexpected worker failure: {exc}",
-                            "finishedAt": now_utc(),
+                            "finishedAt": finished_at.isoformat(),
                         }
                     )
                     status.pop("pid", None)
@@ -3519,10 +2965,10 @@ class JobManager:
             status["page"] = page
             status["lastPhase"] = phase
             status["lastPage"] = page
-            pending_single_pages = status.get("pendingSinglePages")
+            pending_page_reruns = status.get("pendingPageReruns")
             if (
-                isinstance(pending_single_pages, list)
-                and pending_single_pages
+                isinstance(pending_page_reruns, list)
+                and pending_page_reruns
                 and isinstance(page, int)
             ):
                 status["pendingResumePage"] = page
@@ -3543,6 +2989,7 @@ class JobManager:
         skip_package: bool = False,
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
+        translation_boxno: int | None = None,
     ) -> list[str]:
         command = [
             sys.executable,
@@ -3552,6 +2999,15 @@ class JobManager:
             "--config",
             str(self.config.pipeline_config),
         ]
+        if resume_from is not None and self.has_editor_v2(code, job_id):
+            command.extend(
+                [
+                    "--editor-manifest",
+                    str(self.editor_v2_manifest_path(code, job_id)),
+                    "--editor-baseline-dir",
+                    str(self.editor_meta_dir(code, job_id) / "generated_v2"),
+                ]
+            )
         translation_notes_path = self.translation_notes_path(code, job_id)
         if translation_notes_path.is_file():
             command.extend(["--translation-notes-json", str(translation_notes_path)])
@@ -3562,6 +3018,16 @@ class JobManager:
                 str(self.status_thinking_budget_tokens(status)),
                 "--vlm-base-url",
                 self.status_vlm_base_url(status),
+                "--ocr-workers",
+                str(self.status_page_workers(status, "ocrPageWorkers", "OCR workers")),
+                "--lama-workers",
+                str(self.status_page_workers(status, "lamaWorkers", "LaMa workers")),
+                "--imagemagick-workers",
+                str(
+                    self.status_page_workers(
+                        status, "imagemagickWorkers", "ImageMagick workers"
+                    )
+                ),
             ]
         )
         ocr_engine = self.status_ocr_engine(status)
@@ -3597,7 +3063,7 @@ class JobManager:
             command.extend(["--jxl-quality", str(jxl_quality)])
         if resume_from is None:
             if self.status_pause_after_ocr(status):
-                command.extend(["--stop-after", "ocr_raw"])
+                command.extend(["--stop-after", "ocr_merged"])
             command.append("--overwrite")
             return command
 
@@ -3606,6 +3072,8 @@ class JobManager:
             command.extend(["--resume-page", str(resume_page or 0)])
         if single_page and resume_from in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             command.append("--single-page")
+        if translation_boxno is not None:
+            command.extend(["--translation-boxno", str(translation_boxno)])
         if skip_package:
             command.append("--skip-package")
         return command
@@ -3616,13 +3084,19 @@ class JobManager:
         job_id: str,
         command: list[str],
         label: str,
-    ) -> tuple[int, float]:
+    ) -> int:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        secrets = self.load_job_secrets(code, job_id)
+        if secrets.get("vlmAuthToken"):
+            env["TETOLATE_VLM_API_KEY"] = secrets["vlmAuthToken"]
+        if secrets.get("paddleocrVlAuthToken"):
+            env["TETOLATE_PADDLEOCR_VL_API_KEY"] = secrets[
+                "paddleocrVlAuthToken"
+            ]
         log_path = self.log_path(code, job_id)
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        started_monotonic = time.monotonic()
         with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
             log_file.write(f"$ {' '.join(command)}\n")
             popen_args: dict[str, Any] = {
@@ -3639,17 +3113,18 @@ class JobManager:
                 process = subprocess.Popen(command, **popen_args)
             except OSError as exc:
                 status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+                finished_at = datetime.now(timezone.utc)
+                stop_active_runtime(status, finished_at)
                 status.update(
                     {
                         "status": "failed",
                         "phase": "Failed",
                         "message": f"Could not start translation pipeline for {label}: {exc}",
-                        "finishedAt": now_utc(),
-                        "elapsedSeconds": round(time.monotonic() - started_monotonic, 3),
+                        "finishedAt": finished_at.isoformat(),
                     }
                 )
                 self.save_status(code, job_id, status)
-                return 1, round(time.monotonic() - started_monotonic, 3)
+                return 1
 
             with self._lock:
                 self._active_processes[(code, job_id)] = process
@@ -3681,7 +3156,7 @@ class JobManager:
                 with self._lock:
                     self._active_processes.pop((code, job_id), None)
 
-        return return_code, round(time.monotonic() - started_monotonic, 3)
+        return return_code
 
     def run_package_regeneration_job(
         self,
@@ -3697,6 +3172,7 @@ class JobManager:
             status.get("pendingJxlQuality"),
             self.config.default_jxl_quality,
         )
+        start_active_runtime(status)
         status.update(
             {
                 "status": "running",
@@ -3706,7 +3182,6 @@ class JobManager:
                     "Regenerating downloads "
                     f"(WebP quality {webp_quality}, JXL quality {jxl_quality})."
                 ),
-                "startedAt": now_utc(),
                 "finishedAt": None,
                 "pendingResumeFrom": "package",
                 "pendingResumePage": 0,
@@ -3716,7 +3191,7 @@ class JobManager:
         )
         self.save_status(code, job_id, status)
 
-        return_code, elapsed = self.run_pipeline_process(
+        return_code = self.run_pipeline_process(
             code,
             job_id,
             self.build_command(
@@ -3731,9 +3206,10 @@ class JobManager:
         )
 
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+        finished_at = datetime.now(timezone.utc)
+        stop_active_runtime(status, finished_at)
         status["returnCode"] = return_code
-        status["finishedAt"] = now_utc()
-        status["elapsedSeconds"] = elapsed
+        status["finishedAt"] = finished_at.isoformat()
         status["webpQuality"] = webp_quality
         status["jxlQuality"] = jxl_quality
         status.pop("pid", None)
@@ -3742,6 +3218,7 @@ class JobManager:
         status.pop("pendingJxlQuality", None)
         status.pop("pendingResumeFrom", None)
         status.pop("pendingResumePage", None)
+        status.pop("pendingTranslationBoxno", None)
         was_terminated = bool(status.pop("pendingTermination", None))
         status.pop("terminatingAt", None)
         status.pop("isPaused", None)
@@ -3775,23 +3252,36 @@ class JobManager:
             )
         self.save_status(code, job_id, status)
 
-    def run_single_page_batch_job(
+    def run_page_rerun_batch_job(
         self,
         code: str,
         job_id: str,
         status: dict[str, Any],
-        pending_single_pages: list[Any],
+        pending_page_reruns: list[Any],
     ) -> None:
-        pages: list[int] = []
-        for item in pending_single_pages:
+        page_reruns: list[dict[str, Any]] = []
+        for item in pending_page_reruns:
+            if not isinstance(item, dict):
+                continue
             try:
-                page = int(item)
+                page = int(item.get("page"))
             except (TypeError, ValueError):
                 continue
-            if page >= 0:
-                pages.append(page)
-        pages = sorted(set(pages))
-        if not pages:
+            resume_from = RERUN_STAGE_MAP.get(
+                str(item.get("resumeFrom") or ""),
+                str(item.get("resumeFrom") or ""),
+            )
+            if page < 0 or resume_from not in {
+                "ocr_raw",
+                "ocr_structured",
+                "alt_placement",
+                "translations",
+                "placements",
+                "render",
+            }:
+                continue
+            page_reruns.append({"page": page, "resumeFrom": resume_from})
+        if not page_reruns:
             status.update(
                 {
                     "status": "failed",
@@ -3800,16 +3290,12 @@ class JobManager:
                     "finishedAt": now_utc(),
                 }
             )
-            status.pop("pendingSinglePages", None)
+            status.pop("pendingPageReruns", None)
             self.save_status(code, job_id, status)
             return
 
-        total_started_at = time.monotonic()
         final_return_code = 0
-        resume_from = str(status.get("pendingSinglePageResumeFrom") or "ocr_raw")
-        resume_from = RERUN_STAGE_MAP.get(resume_from, resume_from)
-        if resume_from not in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
-            resume_from = "ocr_raw"
+        pages = [item["page"] for item in page_reruns]
         package_webp_quality = quality_for_display(
             status.get("pendingWebpQuality"),
             quality_for_display(status.get("webpQuality"), self.config.default_webp_quality),
@@ -3818,8 +3304,19 @@ class JobManager:
             status.get("pendingJxlQuality"),
             quality_for_display(status.get("jxlQuality"), self.config.default_jxl_quality),
         )
-        for index, page in enumerate(pages, start=1):
-            locked_snapshot = self.snapshot_locked_stage_files(code, job_id, page)
+        translation_boxno_value = status.get("pendingTranslationBoxno")
+        try:
+            translation_boxno = (
+                int(translation_boxno_value)
+                if translation_boxno_value is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            translation_boxno = None
+        start_active_runtime(status)
+        for index, page_rerun in enumerate(page_reruns, start=1):
+            page = page_rerun["page"]
+            resume_from = page_rerun["resumeFrom"]
             status = self.load_status(code, job_id) or status
             status.update(
                 {
@@ -3827,16 +3324,17 @@ class JobManager:
                     "phase": "Starting",
                     "page": page,
                     "message": f"Rerunning page {page} from {resume_from} ({index}/{len(pages)}).",
-                    "startedAt": now_utc(),
                     "finishedAt": None,
                     "pendingResumeFrom": resume_from,
                     "pendingResumePage": page,
                     "lastResumeFrom": resume_from,
                     "lastResumePage": page,
+                    "pendingPageReruns": page_reruns[index - 1 :],
                 }
             )
+            status.pop("pendingPackageOnly", None)
             self.save_status(code, job_id, status)
-            final_return_code, _elapsed = self.run_pipeline_process(
+            final_return_code = self.run_pipeline_process(
                 code,
                 job_id,
                 self.build_command(
@@ -3846,36 +3344,15 @@ class JobManager:
                     page,
                     single_page=True,
                     skip_package=True,
+                    translation_boxno=translation_boxno,
                 ),
                 f"rerun page {page}",
             )
-            if final_return_code == 0 and locked_snapshot:
-                self.restore_locked_stage_files(code, job_id, page, locked_snapshot)
-                for followup_stage in self.post_restore_rerun_sequence(
-                    resume_from,
-                    set(locked_snapshot),
-                ):
-                    self.restore_locked_stage_files(code, job_id, page, locked_snapshot)
-                    final_return_code, _elapsed = self.run_pipeline_process(
-                        code,
-                        job_id,
-                        self.build_command(
-                            code,
-                            job_id,
-                            followup_stage,
-                            page,
-                            single_page=True,
-                            skip_package=True,
-                        ),
-                        f"rerun page {page} from {followup_stage} after restoring locked edits",
-                    )
-                    self.restore_locked_stage_files(code, job_id, page, locked_snapshot)
-                    if final_return_code != 0:
-                        break
             if final_return_code != 0:
                 break
 
-        if final_return_code == 0:
+        selected_translation_only = translation_boxno is not None
+        if final_return_code == 0 and not selected_translation_only:
             status = self.load_status(code, job_id) or status
             status.update(
                 {
@@ -3887,10 +3364,12 @@ class JobManager:
                     "pendingResumePage": 0,
                     "lastResumeFrom": "package",
                     "lastResumePage": 0,
+                    "pendingPackageOnly": True,
                 }
             )
+            status.pop("pendingPageReruns", None)
             self.save_status(code, job_id, status)
-            final_return_code, _elapsed = self.run_pipeline_process(
+            final_return_code = self.run_pipeline_process(
                 code,
                 job_id,
                 self.build_command(
@@ -3904,24 +3383,21 @@ class JobManager:
                 "package rerun output",
             )
 
-        elapsed = round(time.monotonic() - total_started_at, 3)
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+        finished_at = datetime.now(timezone.utc)
+        stop_active_runtime(status, finished_at)
         status["returnCode"] = final_return_code
-        status["finishedAt"] = now_utc()
-        status["elapsedSeconds"] = elapsed
+        status["finishedAt"] = finished_at.isoformat()
         status.pop("pid", None)
-        status.pop("pendingResumeFrom", None)
-        status.pop("pendingResumePage", None)
-        status.pop("pendingSinglePages", None)
-        status.pop("pendingSinglePageResumeFrom", None)
-        status.pop("pendingWebpQuality", None)
-        status.pop("pendingJxlQuality", None)
-        pending_editor_changed_pages = status.pop("pendingEditorChangedPages", None)
         was_terminated = bool(status.pop("pendingTermination", None))
         status.pop("terminatingAt", None)
         status.pop("isPaused", None)
         status.pop("pausedAt", None)
 
+        completed = final_return_code == 0 and (
+            selected_translation_only
+            or self.translated_cbz_path(code, job_id).is_file()
+        )
         if was_terminated:
             status.update(
                 {
@@ -3931,15 +3407,19 @@ class JobManager:
                     "message": "Page rerun terminated.",
                 }
             )
-        elif final_return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
-            if isinstance(pending_editor_changed_pages, list):
-                pages_to_clear: list[int] = []
-                for item in pending_editor_changed_pages:
-                    try:
-                        pages_to_clear.append(int(item))
-                    except (TypeError, ValueError):
-                        continue
-                self.clear_editor_changes_for_pages(code, job_id, pages_to_clear)
+        elif completed:
+            if selected_translation_only:
+                self.mark_editor_v2_translation_ready_for_typesetting(
+                    code, job_id, pages[0]
+                )
+            else:
+                for page_rerun in page_reruns:
+                    self.clear_editor_changes_for_pages(
+                        code,
+                        job_id,
+                        [page_rerun["page"]],
+                        resume_from=page_rerun["resumeFrom"],
+                    )
             status["webpQuality"] = package_webp_quality
             status["jxlQuality"] = package_jxl_quality
             status.update(
@@ -3947,7 +3427,12 @@ class JobManager:
                     "status": "complete",
                     "phase": "Complete",
                     "page": None,
-                    "message": "Page rerun complete.",
+                    "message": (
+                        f"Translation page {pages[0]} boxno {translation_boxno} complete. "
+                        "Typesetting is out of date."
+                        if selected_translation_only
+                        else "Page rerun complete."
+                    ),
                 }
             )
         else:
@@ -3958,6 +3443,29 @@ class JobManager:
                     "message": f"Page rerun failed with exit code {final_return_code}.",
                 }
             )
+
+        if completed:
+            status.pop("pendingResumeFrom", None)
+            status.pop("pendingResumePage", None)
+            status.pop("pendingPageReruns", None)
+            status.pop("pendingPackageOnly", None)
+            status.pop("pendingWebpQuality", None)
+            status.pop("pendingJxlQuality", None)
+            status.pop("pendingEditorChangedPages", None)
+            status.pop("pendingTranslationBoxno", None)
+        elif not status.get("pendingPackageOnly"):
+            remaining_reruns = status.get("pendingPageReruns")
+            if (
+                isinstance(remaining_reruns, list)
+                and remaining_reruns
+                and isinstance(remaining_reruns[0], dict)
+            ):
+                retry_page = int(remaining_reruns[0]["page"])
+                retry_phase = str(remaining_reruns[0]["resumeFrom"])
+                status["pendingResumeFrom"] = retry_phase
+                status["pendingResumePage"] = retry_page
+                status["lastResumeFrom"] = retry_phase
+                status["lastResumePage"] = retry_page
         self.save_status(code, job_id, status)
 
     def run_job(self, code: str, job_id: str) -> None:
@@ -3970,9 +3478,9 @@ class JobManager:
             self.run_package_regeneration_job(code, job_id, status)
             return
 
-        pending_single_pages = status.get("pendingSinglePages")
-        if isinstance(pending_single_pages, list) and pending_single_pages:
-            self.run_single_page_batch_job(code, job_id, status, pending_single_pages)
+        pending_page_reruns = status.get("pendingPageReruns")
+        if isinstance(pending_page_reruns, list) and pending_page_reruns:
+            self.run_page_rerun_batch_job(code, job_id, status, pending_page_reruns)
             return
 
         resume_from = status.get("pendingResumeFrom")
@@ -3985,6 +3493,7 @@ class JobManager:
                 resume_page = int(resume_page or 0)
             except (TypeError, ValueError):
                 resume_page = 0
+        start_active_runtime(status)
         status.update(
             {
                 "status": "running",
@@ -3995,7 +3504,6 @@ class JobManager:
                     if resume_from is not None
                     else "Starting translation pipeline."
                 ),
-                "startedAt": now_utc(),
                 "finishedAt": None,
             }
         )
@@ -4005,20 +3513,21 @@ class JobManager:
         self.save_status(code, job_id, status)
 
         command = self.build_command(code, job_id, resume_from, resume_page)
-        return_code, elapsed = self.run_pipeline_process(
+        return_code = self.run_pipeline_process(
             code,
             job_id,
             command,
             "translation pipeline",
         )
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+        finished_at = datetime.now(timezone.utc)
+        stop_active_runtime(status, finished_at)
         status["returnCode"] = return_code
-        status["finishedAt"] = now_utc()
-        status["elapsedSeconds"] = elapsed
+        status["finishedAt"] = finished_at.isoformat()
         status.pop("pid", None)
         status.pop("pendingResumeFrom", None)
         status.pop("pendingResumePage", None)
-        status.pop("pendingSinglePages", None)
+        status.pop("pendingPageReruns", None)
         was_terminated = bool(status.pop("pendingTermination", None))
         status.pop("terminatingAt", None)
         status.pop("isPaused", None)
@@ -4034,14 +3543,16 @@ class JobManager:
                 }
             )
         elif return_code == 0 and self.status_pause_after_ocr(status) and not self.translated_cbz_path(code, job_id).is_file():
+            self.initialize_editor_v2(code, job_id)
             status.update(
                 {
                     "status": "paused",
-                    "phase": "Paused",
+                    "phase": "OCR review",
                     "page": None,
-                    "message": "Paused after OCR pass. Restart run to continue from structure.",
+                    "message": "OCR is ready for review. Edit OCR & Merge, then continue processing.",
                     "isPaused": True,
                     "pausedAt": now_utc(),
+                    "reviewCheckpoint": OCR_REVIEW_CHECKPOINT,
                     "pendingResumeFrom": "ocr_structured",
                     "pendingResumePage": 0,
                     "lastResumeFrom": "ocr_structured",
@@ -4049,6 +3560,16 @@ class JobManager:
                 }
             )
         elif return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
+            had_editor = self.has_editor_v2(code, job_id)
+            self.initialize_editor_v2(code, job_id)
+            if had_editor and status.get("lastResumeFrom") == "ocr_structured":
+                self.clear_editor_changes_for_pages(
+                    code,
+                    job_id,
+                    list(range(len(self.original_page_files(code, job_id)))),
+                    "ocr_structured",
+                )
+            status.pop("reviewCheckpoint", None)
             status["webpQuality"] = self.config.default_webp_quality
             status["jxlQuality"] = self.config.default_jxl_quality
             status.update(
@@ -4120,914 +3641,6 @@ def mutation_request_is_same_origin(request: Request) -> bool:
     return secrets.compare_digest(supplied, expected)
 
 
-def base_page(title: str, body: str) -> HTMLResponse:
-    return HTMLResponse(
-        f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(title)}</title>
-  <style>
-    body {{ font-family: system-ui, sans-serif; margin: 2rem; max-width: 56rem; line-height: 1.45; }}
-    label {{ display: block; margin: 0 0 0.75rem; }}
-    input, button, select, textarea {{ font: inherit; padding: 0.45rem; }}
-    input[type="text"] {{ width: min(24rem, 100%); }}
-    textarea {{ width: min(40rem, 100%); }}
-    button {{ cursor: pointer; }}
-    .row {{ margin: 1rem 0; }}
-    .muted {{ color: #555; }}
-    .status {{ font-weight: 700; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
-    th, td {{ border-bottom: 1px solid #ddd; padding: 0.45rem; text-align: left; vertical-align: top; }}
-    pre {{ background: #f5f5f5; padding: 1rem; overflow: auto; max-height: 24rem; }}
-    a.button {{ display: inline-block; padding: 0.5rem 0.7rem; border: 1px solid #222; text-decoration: none; color: #111; }}
-  </style>
-</head>
-<body>
-{body}
-</body>
-</html>"""
-    )
-
-
-def admin_login_page(message: str = "") -> HTMLResponse:
-    message_html = f"<p>{escape(message)}</p>" if message else ""
-    return base_page(
-        "Admin Login",
-        f"""
-<h1>Admin</h1>
-{message_html}
-<form action="/admin/login" method="post">
-  <label>Password<br><input name="password" type="password" required autocomplete="current-password"></label>
-  <button type="submit">Log in</button>
-</form>
-""",
-    )
-
-
-def admin_state_label(status: dict[str, Any]) -> str:
-    if status.get("paused"):
-        return "Paused"
-    if status.get("active"):
-        return "Processing"
-    if not status.get("workerRunning"):
-        return "Stopped"
-    if status.get("queuedCount"):
-        return "Queued"
-    return "Idle"
-
-
-def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse:
-    status = manager.admin_status()
-    state = admin_state_label(status)
-    message_html = f'<p class="status">{escape(message)}</p>' if message else ""
-    signal_note = (
-        ""
-        if status.get("posixSignals")
-        else '<p class="muted">This platform can pause the queue, but may not suspend a running process.</p>'
-    )
-    active_rows: list[str] = []
-    for item in status.get("active", []):
-        page = "" if item.get("page") is None else str(item.get("page"))
-        active_rows.append(
-            "<tr>"
-            f'<td><a href="{escape(item.get("url"))}">{escape(item.get("inputFilename") or item.get("jobId"))}</a></td>'
-            f'<td>{escape(item.get("category"))}</td>'
-            f'<td>{escape(item.get("status"))}</td>'
-            f'<td>{escape(item.get("phase"))}</td>'
-            f"<td>{escape(page)}</td>"
-            "</tr>"
-        )
-    active_html = (
-        """
-<table>
-  <thead><tr><th>Job</th><th>Category</th><th>Status</th><th>Phase</th><th>Page</th></tr></thead>
-  <tbody>
-"""
-        + "\n".join(active_rows)
-        + """
-  </tbody>
-</table>
-"""
-        if active_rows
-        else '<p class="muted">No active process.</p>'
-    )
-    category_rows: list[str] = []
-    for item in status.get("categories", []):
-        category = str(item.get("category") or "")
-        url = str(item.get("url") or f"/category/{category}")
-        category_rows.append(
-            "<tr>"
-            f'<td><a href="{escape(url)}">{escape(category)}</a></td>'
-            f'<td>{escape(item.get("jobCount", 0))}</td>'
-            f'<td><a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
-            "</tr>"
-        )
-    categories_html = (
-        """
-<table>
-  <thead><tr><th>Category</th><th>Jobs</th><th>Actions</th></tr></thead>
-  <tbody>
-"""
-        + "\n".join(category_rows)
-        + """
-  </tbody>
-</table>
-"""
-        if category_rows
-        else '<p class="muted">No job categories. Create one to submit a job.</p>'
-    )
-    return base_page(
-        "Admin",
-        f"""
-<h1>Admin</h1>
-{message_html}
-<dl>
-  <dt>Worker State</dt><dd class="status">{escape(state)}</dd>
-  <dt>Queued Jobs</dt><dd>{escape(status.get("queuedCount"))}</dd>
-</dl>
-<form action="/admin/pause" method="post">
-  <button type="submit">Pause all jobs</button>
-</form>
-<form action="/admin/resume" method="post">
-  <button type="submit">Resume all jobs</button>
-</form>
-<form action="/admin/logout" method="post">
-  <button type="submit">Log out</button>
-</form>
-{signal_note}
-<h2>Job Categories</h2>
-<form action="/admin/categories" method="post">
-  <label>New category<br><input name="category" type="text" required pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" autocomplete="off"></label>
-  <button type="submit">Create category</button>
-</form>
-{categories_html}
-<h2>Active Job</h2>
-{active_html}
-<h2>Change Admin Password</h2>
-<form action="/admin/password" method="post">
-  <label>Current password<br><input name="current_password" type="password" required autocomplete="current-password"></label>
-  <label>New password<br><input name="new_password" type="password" required autocomplete="new-password"></label>
-  <label>Confirm new password<br><input name="confirm_password" type="password" required autocomplete="new-password"></label>
-  <button type="submit">Change password</button>
-</form>
-""",
-    )
-
-
-def category_delete_page(category: str, counts: dict[str, int], message: str = "") -> HTMLResponse:
-    total = sum(counts.values())
-    count_rows = "".join(
-        f"<li>{escape(status)}: {escape(count)}</li>"
-        for status, count in sorted(counts.items())
-    )
-    message_html = f'<p class="status">{escape(message)}</p>' if message else ""
-    return base_page(
-        f"Delete {category}",
-        f"""
-<h1>Delete Category: {escape(category)}</h1>
-{message_html}
-<p><strong>{escape(CATEGORY_DELETE_CONFIRM)}</strong></p>
-<p>This permanently removes {total} job(s), including every original upload, translated image, log, editor change, and download.</p>
-<ul>{count_rows}</ul>
-<form action="/admin/categories/{escape(category)}/delete" method="post">
-  <label>Type <code>{escape(category)}</code> to confirm<br><input name="confirmation" type="text" required autocomplete="off"></label>
-  <button type="submit">Delete category and all jobs</button>
-</form>
-<p><a href="/admin">Cancel</a></p>
-""",
-    )
-
-
-def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
-    downloads = status.get("downloads")
-    if not isinstance(downloads, dict):
-        downloads = {"png": status.get("hasDownload")}
-    labels = {
-        "png": "Download PNG CBZ",
-        "webp": "Download WebP CBZ",
-        "jxl": "Download JXL CBZ",
-    }
-    summary_parts: list[str] = []
-    input_size = str(status.get("inputSize") or "")
-    if input_size:
-        summary_parts.append(f"Original: {input_size}")
-    links: list[str] = []
-    original_links: list[str] = []
-    if status.get("canViewOriginal"):
-        view_url = str(
-            status.get("originalViewUrl") or f"/job/{code}/{job_id}/view-original"
-        )
-        page_count = status.get("originalPageCount")
-        page_text = f" ({page_count} pages)" if page_count else ""
-        original_links.append(
-            f'<a class="button" href="{escape(view_url)}">View original{escape(page_text)}</a>'
-        )
-    if status.get("hasOriginalDownload"):
-        href = str(
-            status.get("originalDownloadUrl") or f"/job/{code}/{job_id}/download-original"
-        )
-        token = str(status.get("inputDownloadToken") or "")
-        if token:
-            href += f"?v={escape(token)}"
-        suffix = f" ({input_size})" if input_size else ""
-        original_links.append(
-            f'<a class="button" href="{escape(href)}">Download original CBZ{escape(suffix)}</a>'
-        )
-    for variant, label in labels.items():
-        item = downloads.get(variant)
-        if isinstance(item, dict):
-            available = bool(item.get("available"))
-            size = str(item.get("size") or "")
-            token = str(item.get("downloadToken") or "")
-        else:
-            available = bool(item)
-            size = ""
-            token = ""
-        if not available:
-            continue
-        summary_label = label.removeprefix("Download ")
-        summary_parts.append(f"{summary_label}: {size}" if size else summary_label)
-        href = f"/job/{escape(code)}/{escape(job_id)}/download/{escape(variant)}"
-        if token:
-            href += f"?v={escape(token)}"
-        suffix = f" ({size})" if size else ""
-        links.append(f'<a class="button" href="{href}">{escape(label + suffix)}</a>')
-    if status.get("canView"):
-        view_url = str(status.get("viewUrl") or f"/job/{code}/{job_id}/view")
-        page_count = status.get("finalPageCount")
-        page_text = f" ({page_count} pages)" if page_count else ""
-        links.insert(
-            0,
-            f'<a class="button" href="{escape(view_url)}">View in browser{escape(page_text)}</a>',
-        )
-    links = original_links + links
-    summary_html = (
-        f'<p class="muted">{escape("; ".join(summary_parts))}</p>'
-        if summary_parts
-        else ""
-    )
-    if not links:
-        return summary_html
-    return summary_html + "<p>" + " ".join(links) + "</p>"
-
-
-def input_display_html(status: dict[str, Any]) -> str:
-    filename = escape(status.get("inputFilename"))
-    size = str(status.get("inputSize") or "")
-    if not size:
-        return filename
-    return f"{filename} <span class=\"muted\">({escape(size)})</span>"
-
-
-def generated_translation_notes_html(status: dict[str, Any]) -> str:
-    notes = str(status.get("generatedTranslationNotes") or "")
-    if not notes:
-        return ""
-    return f"""
-<details>
-  <summary>Translation notes</summary>
-  <pre>{escape(notes)}</pre>
-</details>
-"""
-
-
-def job_viewer_page(
-    code: str,
-    job_id: str,
-    status: dict[str, Any],
-    pages: list[dict[str, Any]],
-    *,
-    original: bool = False,
-) -> HTMLResponse:
-    view_route = "view-original" if original else "view"
-    page_kind = "Original" if original else "Translated"
-    page_items: list[str] = []
-    for page in pages:
-        index = int(page["index"])
-        token = str(page.get("token") or "")
-        src = f"/job/{escape(code)}/{escape(job_id)}/{view_route}/image/{index}"
-        if token:
-            src += f"?v={escape(token)}"
-        page_items.append(
-            f"""
-<figure id="page-{index}">
-  <figcaption>Page {index}</figcaption>
-  <img src="{src}" alt="{page_kind} page {index}" loading="lazy" decoding="async">
-</figure>
-"""
-        )
-    return HTMLResponse(
-        f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(status.get("inputFilename") or job_id)} - {page_kind} Browser View</title>
-  <style>
-    body {{ margin: 0; background: #222; color: #eee; font-family: system-ui, sans-serif; }}
-    header {{ position: sticky; top: 0; z-index: 1; background: #111; border-bottom: 1px solid #444; padding: 0.7rem 1rem; }}
-    header a {{ color: #fff; }}
-    .meta {{ color: #bbb; margin-left: 0.75rem; }}
-    main {{ max-width: 1200px; margin: 0 auto; padding: 1rem; }}
-    figure {{ margin: 0 0 1rem; }}
-    figcaption {{ color: #bbb; font-size: 0.9rem; margin: 0 0 0.35rem; }}
-    img {{ display: block; max-width: 100%; height: auto; margin: 0 auto; background: #fff; }}
-  </style>
-</head>
-<body>
-  <header>
-    <a href="/job/{escape(code)}/{escape(job_id)}">Back to job</a>
-    <span class="meta">{page_kind} - {escape(status.get("inputFilename") or job_id)} - {len(pages)} pages</span>
-  </header>
-  <main>
-    {"".join(page_items)}
-  </main>
-</body>
-</html>""",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
-
-
-def source_language_options(selected: str) -> str:
-    try:
-        selected = translate_cbz.normalize_source_language(selected)
-    except translate_cbz.PipelineError:
-        selected = DEFAULT_SOURCE_LANGUAGE
-    options: list[str] = []
-    for code in ("jp", "kr", "cn"):
-        profile = translate_cbz.SOURCE_LANGUAGE_PROFILES[code]
-        selected_attr = " selected" if code == selected else ""
-        options.append(
-            f'<option value="{escape(code)}"{selected_attr}>{escape(profile.name)}</option>'
-        )
-    return "\n".join(options)
-
-
-def advanced_options_fields(
-    thinking_budget_tokens: Any,
-    vlm_base_url: str,
-    summary: str = "Advanced options",
-    open_details: bool = False,
-    include_translation_notes: bool = False,
-    translation_notes: str = "",
-    pause_after_ocr: bool = False,
-    proofread_translations: bool = DEFAULT_PROOFREAD_TRANSLATIONS,
-    write_translation_notes: bool = DEFAULT_WRITE_TRANSLATION_NOTES,
-    alt_placement_enabled: bool = DEFAULT_ALT_PLACEMENT_ENABLED,
-    source_language: str = DEFAULT_SOURCE_LANGUAGE,
-    ocr_engine: str = DEFAULT_OCR_ENGINE,
-    paddleocr_vl_server_url: str = DEFAULT_PADDLEOCR_VL_SERVER_URL,
-    paddleocr_vl_model: str = DEFAULT_PADDLEOCR_VL_MODEL,
-) -> str:
-    try:
-        budget = validate_thinking_budget_tokens(thinking_budget_tokens)
-    except ValueError:
-        budget = DEFAULT_THINKING_BUDGET_TOKENS
-    try:
-        selected_ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
-    except paddle_ocr_image.InputError:
-        selected_ocr_engine = DEFAULT_OCR_ENGINE
-    paddle_selected = " selected" if selected_ocr_engine == paddle_ocr_image.OCR_ENGINE_PADDLE else ""
-    vl_selected = " selected" if selected_ocr_engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL else ""
-    open_attr = " open" if open_details else ""
-    pause_checked = " checked" if pause_after_ocr else ""
-    proofread_checked = " checked" if proofread_translations else ""
-    write_notes_checked = " checked" if write_translation_notes else ""
-    alt_placement_checked = " checked" if alt_placement_enabled else ""
-    translation_notes_html = (
-        '<label>Translation notes<br><textarea name="translation_notes" rows="4" '
-        f'placeholder="Names, terms, tone, style guidance">{escape(translation_notes)}</textarea></label>'
-        if include_translation_notes
-        else ""
-    )
-    return f"""
-<details{open_attr}>
-  <summary>{escape(summary)}</summary>
-  {translation_notes_html}
-  <label><input name="pause_after_ocr" type="checkbox" value="1"{pause_checked}> Pause after OCR pass</label>
-  <label><input name="enable_alt_placement" type="checkbox" value="1"{alt_placement_checked}> Enable alt-placement</label>
-  <label><input name="enable_proofreading" type="checkbox" value="1"{proofread_checked}> Enable proofreading</label>
-  <label><input name="enable_translation_notes" type="checkbox" value="1"{write_notes_checked}> Enable translation notes</label>
-  <label>Source language<br><select name="source_language">
-    {source_language_options(source_language)}
-  </select></label>
-  <label>OCR engine<br><select name="ocr_engine">
-    <option value="{paddle_ocr_image.OCR_ENGINE_PADDLE}"{paddle_selected}>PaddleOCR</option>
-    <option value="{paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL}"{vl_selected}>PaddleOCR-VL 1.6</option>
-  </select></label>
-  <label>PaddleOCR-VL server URL<br><input name="paddleocr_vl_server_url" type="text" value="{escape(paddleocr_vl_server_url)}"></label>
-  <label>PaddleOCR-VL model<br><input name="paddleocr_vl_model" type="text" value="{escape(paddleocr_vl_model)}"></label>
-  <label>Translation VLM endpoint<br><input name="vlm_base_url" type="url" value="{escape(vlm_base_url)}" required></label>
-  <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="{escape(budget)}"></label>
-  <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
-</details>
-"""
-
-
-def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
-    jobs = data.get("jobs", [])
-    translation_notes = str(data.get("translationNotes") or "")
-    default_thinking_budget_tokens = data.get(
-        "defaultThinkingBudgetTokens",
-        DEFAULT_THINKING_BUDGET_TOKENS,
-    )
-    default_vlm_base_url = str(data.get("defaultVlmBaseUrl") or "")
-    pause_after_ocr = bool(data.get("pauseAfterOcr", False))
-    proofread_translations = bool(
-        data.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
-    )
-    write_translation_notes = bool(
-        data.get("writeTranslationNotes", DEFAULT_WRITE_TRANSLATION_NOTES)
-    )
-    default_alt_placement_enabled = bool(
-        data.get("defaultAltPlacementEnabled", DEFAULT_ALT_PLACEMENT_ENABLED)
-    )
-    default_source_language = str(data.get("defaultSourceLanguage") or DEFAULT_SOURCE_LANGUAGE)
-    default_ocr_engine = str(data.get("defaultOcrEngine") or DEFAULT_OCR_ENGINE)
-    default_paddleocr_vl_server_url = str(
-        data.get("defaultPaddleocrVlServerUrl") or DEFAULT_PADDLEOCR_VL_SERVER_URL
-    )
-    default_paddleocr_vl_model = str(
-        data.get("defaultPaddleocrVlModel") or DEFAULT_PADDLEOCR_VL_MODEL
-    )
-    rows: list[str] = []
-    for job in jobs:
-        job_id = str(job.get("jobId", ""))
-        filename = str(job.get("inputFilename") or job_id)
-        page = "" if job.get("page") is None else str(job.get("page"))
-        view_html = (
-            f'<a class="button" href="/job/{escape(code)}/{escape(job_id)}/view">View</a>'
-            if job.get("canView")
-            else ""
-        )
-        delete_html = (
-            f'<form action="/job/{escape(code)}/{escape(job_id)}/delete" method="post" '
-            f"onsubmit=\"return confirm({escape(json.dumps(DELETE_JOB_CONFIRM))});\">"
-            '<button type="submit">Delete</button></form>'
-            if job.get("canDelete")
-            else ""
-        )
-        actions_html = " ".join(item for item in (view_html, delete_html) if item)
-        rows.append(
-            "<tr>"
-            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(filename)}</a><br>'
-            f'<span class="muted">{escape(job_id)}</span></td>'
-            f'<td>{escape(job.get("status"))}</td>'
-            f'<td>{escape(job.get("phase"))}</td>'
-            f"<td>{escape(page)}</td>"
-            f'<td>{escape(job.get("age"))}</td>'
-            f'<td>{escape(job.get("elapsed"))}</td>'
-            f"<td>{actions_html}</td>"
-            "</tr>"
-        )
-    jobs_html = (
-        """
-<table>
-  <thead><tr><th>Job</th><th>Status</th><th>Phase</th><th>Page</th><th>Age</th><th>Elapsed</th><th>Actions</th></tr></thead>
-  <tbody>
-"""
-        + "\n".join(rows)
-        + """
-  </tbody>
-</table>
-"""
-        if rows
-        else '<p class="muted">No jobs have been submitted in this category.</p>'
-    )
-    return base_page(
-        f"Category {code}",
-        f"""
-<h1>Category: {escape(code)}</h1>
-<p><a href="/admin">Admin</a></p>
-<form action="/upload" method="post" enctype="multipart/form-data">
-  <input name="category" type="hidden" value="{escape(code)}">
-  <label>CBZ file<br><input name="cbz" type="file" accept=".cbz,application/zip"></label>
-  <label>Page image files<br><input name="page_images" type="file" accept="{UPLOAD_PAGE_IMAGE_ACCEPT}" multiple></label>
-  <p class="muted">Upload either one CBZ or multiple image pages. Images use the picker/upload order and are converted to PNG internally.</p>
-  {advanced_options_fields(
-      default_thinking_budget_tokens,
-      default_vlm_base_url,
-      include_translation_notes=True,
-      translation_notes=translation_notes,
-      pause_after_ocr=pause_after_ocr,
-      proofread_translations=proofread_translations,
-      write_translation_notes=write_translation_notes,
-      alt_placement_enabled=default_alt_placement_enabled,
-      source_language=default_source_language,
-      ocr_engine=default_ocr_engine,
-      paddleocr_vl_server_url=default_paddleocr_vl_server_url,
-      paddleocr_vl_model=default_paddleocr_vl_model,
-  )}
-  <button type="submit">Queue new job</button>
-</form>
-<h2>Jobs</h2>
-{jobs_html}
-""",
-    )
-
-
-def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
-    log_text = "\n".join(status.get("recentLog", []))
-    page_value = status.get("page")
-    page_text = "" if page_value is None else str(page_value)
-    restart_from = status.get("restartResumeFrom")
-    restart_page = status.get("restartResumePage")
-    if restart_from is None:
-        restart_target_text = "from the beginning"
-    elif restart_from == "package":
-        restart_target_text = "from package"
-    else:
-        restart_target_text = f"from {restart_from} page {restart_page}"
-    download_html = download_links_html(code, job_id, status)
-    webp_quality = status.get("webpQuality") or status.get("defaultWebpQuality") or DEFAULT_WEBP_QUALITY
-    jxl_quality = status.get("jxlQuality") or status.get("defaultJxlQuality") or DEFAULT_JXL_QUALITY
-    thinking_budget = status.get("thinkingBudgetTokens")
-    if thinking_budget is None:
-        thinking_budget = status.get(
-            "defaultThinkingBudgetTokens",
-            DEFAULT_THINKING_BUDGET_TOKENS,
-        )
-    vlm_base_url = str(
-        status.get("vlmBaseUrl")
-        or status.get("defaultVlmBaseUrl")
-        or ""
-    )
-    pause_after_ocr = bool(status.get("pauseAfterOcr"))
-    proofread_translations = bool(
-        status.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
-    )
-    write_translation_notes = bool(
-        status.get("writeTranslationNotes", DEFAULT_WRITE_TRANSLATION_NOTES)
-    )
-    alt_placement_enabled = bool(
-        status.get("altPlacementEnabled", status.get("defaultAltPlacementEnabled", DEFAULT_ALT_PLACEMENT_ENABLED))
-    )
-    source_language = str(
-        status.get("sourceLanguage")
-        or status.get("defaultSourceLanguage")
-        or DEFAULT_SOURCE_LANGUAGE
-    )
-    ocr_engine = str(status.get("ocrEngine") or status.get("defaultOcrEngine") or DEFAULT_OCR_ENGINE)
-    paddleocr_vl_server_url = str(
-        status.get("paddleocrVlServerUrl")
-        or status.get("defaultPaddleocrVlServerUrl")
-        or DEFAULT_PADDLEOCR_VL_SERVER_URL
-    )
-    paddleocr_vl_model = str(
-        status.get("paddleocrVlModel")
-        or status.get("defaultPaddleocrVlModel")
-        or DEFAULT_PADDLEOCR_VL_MODEL
-    )
-    advanced_options_html = (
-        f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/advanced-options" method="post">
-  {advanced_options_fields(
-      thinking_budget,
-      vlm_base_url,
-      open_details=True,
-      pause_after_ocr=pause_after_ocr,
-      proofread_translations=proofread_translations,
-      write_translation_notes=write_translation_notes,
-      alt_placement_enabled=alt_placement_enabled,
-      source_language=source_language,
-      ocr_engine=ocr_engine,
-      paddleocr_vl_server_url=paddleocr_vl_server_url,
-      paddleocr_vl_model=paddleocr_vl_model,
-  )}
-  <button type="submit">Save advanced options</button>
-</form>
-"""
-        if status.get("canUpdateAdvancedOptions")
-        else ""
-    )
-    restart_html = (
-        f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/restart" method="post">
-  <button type="submit">Restart run</button>
-  <span class="muted">Resume {escape(restart_target_text)}</span>
-</form>
-"""
-        if status.get("canRestart")
-        else ""
-    )
-    terminate_html = (
-        f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/terminate" method="post" onsubmit="return confirm({escape(json.dumps(TERMINATE_JOB_CONFIRM))});">
-  <button type="submit">Terminate job</button>
-</form>
-"""
-        if status.get("canTerminate")
-        else ""
-    )
-    delete_html = (
-        f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/delete" method="post" onsubmit="return confirm({escape(json.dumps(DELETE_JOB_CONFIRM))});">
-  <button type="submit">Delete job</button>
-</form>
-"""
-        if status.get("canDelete")
-        else ""
-    )
-    rerun_job_html = (
-        f"""
-<details>
-  <summary>Rerun job</summary>
-  <form action="/job/{escape(code)}/{escape(job_id)}/rerun-job" method="post">
-    <fieldset>
-      <legend>Passes</legend>
-      <label><input name="rerun_stage" type="checkbox" value="{OCR_MERGE_EDITOR_STAGE}"> OCR merge</label>
-      <label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structured</label>
-      <label><input name="rerun_stage" type="checkbox" value="alt_placement"> Alt-placement</label>
-      <label><input name="rerun_stage" type="checkbox" value="translations"> Translations</label>
-      <label><input name="rerun_stage" type="checkbox" value="placements"> Placements</label>
-      <label><input name="rerun_stage" type="checkbox" value="render"> Rendering</label>
-      <label><input name="rerun_stage" type="checkbox" value="{RERUN_JOB_PACKAGE_STAGE}"> Regeneration</label>
-    </fieldset>
-    <label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label>
-    <p class="muted">Leave pages empty to rerun every page. Regeneration alone rebuilds download archives.</p>
-    <label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="{escape(webp_quality)}"></label>
-    <label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="{escape(jxl_quality)}"></label>
-    <button type="submit">Queue rerun</button>
-  </form>
-</details>
-"""
-        if status.get("canRerunPages") or status.get("canRegenerateDownloads")
-        else ""
-    )
-    edit_html = (
-        f'<p><a class="button" href="/job/{escape(code)}/{escape(job_id)}/edit">Edit job</a></p>'
-        if status.get("canEdit")
-        else ""
-    )
-    generated_notes_html = generated_translation_notes_html(status)
-    return base_page(
-        f"Job {code} {job_id}",
-        f"""
-<h1>Job {escape(job_id)}</h1>
-<p><a href="/category/{escape(code)}">Back to category {escape(code)}</a></p>
-<dl>
-  <dt>Category</dt><dd>{escape(code)}</dd>
-  <dt>Input</dt><dd>{input_display_html(status)}</dd>
-  <dt>Status</dt><dd id="status" class="status">{escape(status.get("status"))}</dd>
-  <dt>Age</dt><dd id="age">{escape(status.get("age"))}</dd>
-  <dt>Phase</dt><dd id="phase">{escape(status.get("phase"))}</dd>
-  <dt>Page</dt><dd id="page">{escape(page_text)}</dd>
-  <dt>Elapsed</dt><dd id="elapsed">{escape(status.get("elapsed"))}</dd>
-  <dt>Thinking Tokens</dt><dd id="thinking-budget">{escape(status.get("thinkingBudget"))}</dd>
-  <dt>Message</dt><dd id="message">{escape(status.get("message"))}</dd>
-</dl>
-<div id="advanced-options">{advanced_options_html}</div>
-<div id="restart">{restart_html}</div>
-<div id="terminate">{terminate_html}</div>
-<div id="edit">{edit_html}</div>
-<div id="download">{download_html}</div>
-<div id="generated-translation-notes">{generated_notes_html}</div>
-<div id="rerun-job">{rerun_job_html}</div>
-<div id="delete">{delete_html}</div>
-<h2>Recent Log</h2>
-<pre id="log">{escape(log_text)}</pre>
-<script>
-const code = {json.dumps(code)};
-const jobId = {json.dumps(job_id)};
-const deleteJobConfirm = {json.dumps(DELETE_JOB_CONFIRM)};
-const terminateJobConfirm = {json.dumps(TERMINATE_JOB_CONFIRM)};
-function htmlEscape(value) {{
-  return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  }}[char]));
-}}
-function restartMarkup(data) {{
-  if (!data.canRestart) return "";
-  let target = "from the beginning";
-  if (data.restartResumeFrom === "package") {{
-    target = "from package";
-  }} else if (data.restartResumeFrom) {{
-    target = `from ${{data.restartResumeFrom}} page ${{data.restartResumePage ?? 0}}`;
-  }}
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/restart" method="post"><button type="submit">Restart run</button> <span class="muted">Resume ${{target}}</span></form>`;
-}}
-function downloadMarkup(data) {{
-  const labels = {{png: "Download PNG CBZ", webp: "Download WebP CBZ", jxl: "Download JXL CBZ"}};
-  const downloads = data.downloads || {{}};
-  const summary = [];
-  if (data.inputSize) {{
-    summary.push(`Original: ${{data.inputSize}}`);
-  }}
-  const links = Object.keys(labels)
-    .filter((variant) => {{
-      const item = downloads[variant];
-      return item && (typeof item !== "object" || item.available);
-    }})
-    .map((variant) => {{
-      const item = downloads[variant];
-      const size = item && typeof item === "object" && item.size ? ` (${{item.size}})` : "";
-      const summaryLabel = labels[variant].replace("Download ", "");
-      summary.push(size ? `${{summaryLabel}}: ${{item.size}}` : summaryLabel);
-      const token = item && typeof item === "object" && item.downloadToken ? `?v=${{encodeURIComponent(item.downloadToken)}}` : "";
-      const href = `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/download/${{variant}}${{token}}`;
-      return `<a class="button" href="${{href}}">${{labels[variant]}}${{size}}</a>`;
-    }});
-  if (data.canView) {{
-    const viewUrl = data.viewUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/view`;
-    const pageCount = data.finalPageCount ? ` (${{data.finalPageCount}} pages)` : "";
-    links.unshift(`<a class="button" href="${{viewUrl}}">View in browser${{pageCount}}</a>`);
-  }}
-  if (data.hasOriginalDownload) {{
-    const inputSize = data.inputSize ? ` (${{data.inputSize}})` : "";
-    const token = data.inputDownloadToken ? `?v=${{encodeURIComponent(data.inputDownloadToken)}}` : "";
-    const url = data.originalDownloadUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/download-original`;
-    links.unshift(`<a class="button" href="${{url}}${{token}}">Download original CBZ${{inputSize}}</a>`);
-  }}
-  if (data.canViewOriginal) {{
-    const viewUrl = data.originalViewUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/view-original`;
-    const pageCount = data.originalPageCount ? ` (${{data.originalPageCount}} pages)` : "";
-    links.unshift(`<a class="button" href="${{viewUrl}}">View original${{pageCount}}</a>`);
-  }}
-  const summaryHtml = summary.length ? `<p class="muted">${{summary.join("; ")}}</p>` : "";
-  const linksHtml = links.length ? `<p>${{links.join(" ")}}</p>` : "";
-  return summaryHtml + linksHtml;
-}}
-function deleteMarkup(data) {{
-  if (!data.canDelete) return "";
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/delete" method="post" onsubmit="return confirm(${{JSON.stringify(deleteJobConfirm)}});"><button type="submit">Delete job</button></form>`;
-}}
-function terminateMarkup(data) {{
-  if (!data.canTerminate) return "";
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/terminate" method="post" onsubmit="return confirm(${{JSON.stringify(terminateJobConfirm)}});"><button type="submit">Terminate job</button></form>`;
-}}
-function advancedOptionsMarkup(data) {{
-  if (!data.canUpdateAdvancedOptions) return "";
-  const thinkingBudget = data.thinkingBudgetTokens ?? data.defaultThinkingBudgetTokens ?? 2048;
-  const vlmBaseUrl = htmlEscape(data.vlmBaseUrl || data.defaultVlmBaseUrl || "");
-  const pauseChecked = data.pauseAfterOcr ? " checked" : "";
-  const proofreadChecked = data.proofreadTranslations ? " checked" : "";
-  const notesChecked = data.writeTranslationNotes ? " checked" : "";
-  const altPlacementChecked = (data.altPlacementEnabled ?? data.defaultAltPlacementEnabled ?? true) ? " checked" : "";
-  const sourceLanguage = data.sourceLanguage || data.defaultSourceLanguage || "jp";
-  const jpSelected = sourceLanguage === "jp" ? " selected" : "";
-  const krSelected = sourceLanguage === "kr" ? " selected" : "";
-  const cnSelected = sourceLanguage === "cn" ? " selected" : "";
-  const ocrEngine = data.ocrEngine || data.defaultOcrEngine || "paddle";
-  const paddleSelected = ocrEngine === "paddle" ? " selected" : "";
-  const vlSelected = ocrEngine === "paddleocr_vl" ? " selected" : "";
-  const vlServerUrl = htmlEscape(data.paddleocrVlServerUrl || data.defaultPaddleocrVlServerUrl || "http://127.0.0.1:8081/v1");
-  const vlModel = htmlEscape(data.paddleocrVlModel || data.defaultPaddleocrVlModel || "PaddlePaddle/PaddleOCR-VL-1.6");
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post"><details open><summary>Advanced options</summary><label><input name="pause_after_ocr" type="checkbox" value="1"${{pauseChecked}}> Pause after OCR pass</label><label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label><label><input name="enable_proofreading" type="checkbox" value="1"${{proofreadChecked}}> Enable proofreading</label><label><input name="enable_translation_notes" type="checkbox" value="1"${{notesChecked}}> Enable translation notes</label><label>Source language<br><select name="source_language"><option value="jp"${{jpSelected}}>Japanese</option><option value="kr"${{krSelected}}>Korean</option><option value="cn"${{cnSelected}}>Chinese</option></select></label><label>OCR engine<br><select name="ocr_engine"><option value="paddle"${{paddleSelected}}>PaddleOCR</option><option value="paddleocr_vl"${{vlSelected}}>PaddleOCR-VL 1.6</option></select></label><label>PaddleOCR-VL server URL<br><input name="paddleocr_vl_server_url" type="text" value="${{vlServerUrl}}"></label><label>PaddleOCR-VL model<br><input name="paddleocr_vl_model" type="text" value="${{vlModel}}"></label><label>Translation VLM endpoint<br><input name="vlm_base_url" type="url" value="${{vlmBaseUrl}}" required></label><label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label><p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p></details><button type="submit">Save advanced options</button></form>`;
-}}
-function rerunJobMarkup(data) {{
-  if (!data.canRerunPages && !data.canRegenerateDownloads) return "";
-  const webpQuality = data.webpQuality ?? data.defaultWebpQuality ?? 90;
-  const jxlQuality = data.jxlQuality ?? data.defaultJxlQuality ?? 90;
-  return `<details><summary>Rerun job</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/rerun-job" method="post"><fieldset><legend>Passes</legend><label><input name="rerun_stage" type="checkbox" value="ocr_merge"> OCR merge</label><label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structured</label><label><input name="rerun_stage" type="checkbox" value="alt_placement"> Alt-placement</label><label><input name="rerun_stage" type="checkbox" value="translations"> Translations</label><label><input name="rerun_stage" type="checkbox" value="placements"> Placements</label><label><input name="rerun_stage" type="checkbox" value="render"> Rendering</label><label><input name="rerun_stage" type="checkbox" value="package"> Regeneration</label></fieldset><label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label><p class="muted">Leave pages empty to rerun every page. Regeneration alone rebuilds download archives.</p><label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="${{webpQuality}}"></label><label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="${{jxlQuality}}"></label><button type="submit">Queue rerun</button></form></details>`;
-}}
-function editMarkup(data) {{
-  if (!data.canEdit) return "";
-  return `<p><a class="button" href="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/edit">Edit job</a></p>`;
-}}
-function generatedTranslationNotesMarkup(data) {{
-  if (!data.generatedTranslationNotes) return "";
-  return `<details><summary>Translation notes</summary><pre>${{htmlEscape(data.generatedTranslationNotes)}}</pre></details>`;
-}}
-async function refreshStatus() {{
-  const response = await fetch(`/api/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}`, {{cache: "no-store"}});
-  if (!response.ok) return;
-  const data = await response.json();
-  const previousStatus = document.getElementById("status").textContent;
-  document.getElementById("status").textContent = data.status || "";
-  document.getElementById("age").textContent = data.age || "";
-  document.getElementById("phase").textContent = data.phase || "";
-  document.getElementById("page").textContent = data.page ?? "";
-  document.getElementById("elapsed").textContent = data.elapsed || "";
-  document.getElementById("thinking-budget").textContent = data.thinkingBudget || "";
-  document.getElementById("message").textContent = data.message || "";
-  document.getElementById("log").textContent = (data.recentLog || []).join("\\n");
-  document.getElementById("download").innerHTML = downloadMarkup(data);
-  document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
-  if (!(previousStatus === "complete" && data.status === "complete")) {{
-    document.getElementById("advanced-options").innerHTML = advancedOptionsMarkup(data);
-    document.getElementById("restart").innerHTML = restartMarkup(data);
-    document.getElementById("terminate").innerHTML = terminateMarkup(data);
-    document.getElementById("edit").innerHTML = editMarkup(data);
-    document.getElementById("rerun-job").innerHTML = rerunJobMarkup(data);
-    document.getElementById("delete").innerHTML = deleteMarkup(data);
-  }}
-  if (data.status === "complete" || data.status === "failed" || data.status === "cancelled" || (data.status === "paused" && data.canRestart)) {{
-    window.clearInterval(statusTimer);
-  }}
-}}
-const statusTimer = window.setInterval(refreshStatus, 5000);
-</script>
-""",
-    )
-
-
-def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
-    status = manager.require_editable_job(code, job_id)
-    page_count = len(manager.original_page_files(code, job_id))
-    page_options = "\n".join(
-        f'<option value="{index}">Page {index}</option>' for index in range(page_count)
-    )
-    stage_options = "\n".join(
-        f'<option value="{stage}">{label}</option>'
-        for stage, label in (
-            (OCR_MERGE_EDITOR_STAGE, "OCR merge"),
-            ("ocr_structured", "Structured"),
-            ("translations", "Translations"),
-            ("placements", "Placements"),
-        )
-    )
-    return base_page(
-        f"Edit {code} {job_id}",
-        f"""
-<style>
-  body {{ max-width: none; }}
-  .editor {{ display: grid; grid-template-columns: minmax(0, 1fr) 22rem; gap: 1rem; align-items: start; }}
-  .toolbar {{ display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end; margin: 1rem 0; }}
-  .canvas-wrap {{ border: 1px solid #ccc; overflow: auto; max-height: 82vh; background: #eee; display: flex; justify-content: center; align-items: flex-start; }}
-  canvas {{ display: block; max-width: 100%; max-height: 78vh; width: auto; height: auto; background: white; }}
-  .panel {{ border-left: 1px solid #ddd; padding-left: 1rem; }}
-  .panel input[type="number"], .panel input[type="text"] {{ width: 100%; box-sizing: border-box; }}
-  .grid2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; }}
-  .selected-list {{ max-height: 8rem; overflow: auto; font-size: 0.9rem; }}
-  #record-json {{ width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; }}
-  .ocr-merge-only {{ display: none; }}
-  body.ocr-merge-stage .ocr-merge-only {{ display: inline-block; }}
-  .warn {{ color: #8a4b00; }}
-</style>
-<h1>Edit Job {escape(job_id)}</h1>
-<p><a href="/job/{escape(code)}/{escape(job_id)}">Back to job</a></p>
-<p class="muted">Input: {input_display_html(status)}</p>
-<div class="toolbar">
-  <label>Page ([ / ])<br><select id="page-select">{page_options}</select></label>
-  <button id="prev-page-btn" type="button">Previous page ([)</button>
-  <button id="next-page-btn" type="button">Next page (])</button>
-  <label>Stage (, / .)<br><select id="stage-select">{stage_options}</select></label>
-  <label><input id="lock-stage" type="checkbox"> Lock Stage &amp; Page (K)</label>
-  <button id="load-btn" type="button">Load (L)</button>
-  <button id="save-btn" type="button">Save (Ctrl+S)</button>
-  <button id="draw-btn" type="button">Draw box (D)</button>
-  <button id="delete-btn" type="button">Delete selected (Del)</button>
-  <button id="merge-btn" type="button">Merge selected (M)</button>
-  <button id="unmerge-btn" class="ocr-merge-only" type="button">Unmerge selected group (U)</button>
-  <label class="ocr-merge-only"><input id="show-raw" type="checkbox" checked> Show raw (1)</label>
-  <label class="ocr-merge-only"><input id="show-merged" type="checkbox" checked> Show merged (2)</label>
-  <button id="ocr-crop-btn" type="button">OCR new area (O)</button>
-  <button id="regen-btn" type="button">Regenerate this page (G)</button>
-  <button id="regen-changed-btn" type="button">Regenerate changed pages (R)</button>
-</div>
-<div class="editor">
-  <div>
-    <p id="outdated-notice" class="muted"></p>
-    <div class="canvas-wrap"><canvas id="page-canvas"></canvas></div>
-    <p id="editor-status" class="muted"></p>
-  </div>
-  <aside class="panel">
-    <h2>Selected Record</h2>
-    <p class="muted">Click a box to select. Repeated clicks in the same spot cycle through stacked merged and raw OCR boxes. Shift-click selects multiple boxes. Drag the selected box to move it; drag its lower-right handle to resize.</p>
-    <div class="selected-list" id="selected-list"></div>
-    <div class="grid2">
-      <label>Left<input id="field-left" type="number"></label>
-      <label>Top<input id="field-top" type="number"></label>
-      <label>Right<input id="field-right" type="number"></label>
-      <label>Bottom<input id="field-bottom" type="number"></label>
-    </div>
-    <label>Source/OCR text<input id="field-text" type="text"></label>
-    <label>Translated text<input id="field-english" type="text"></label>
-    <label><input id="field-sfx" type="checkbox"> SFX</label>
-    <label><input id="field-open" type="checkbox"> Open lettering</label>
-    <div class="grid2">
-      <label>Fill<input id="field-fill" type="text" placeholder="black or white"></label>
-      <label>Font<input id="field-font" type="text" placeholder="font filename"></label>
-    </div>
-    <label>Raw record JSON<textarea id="record-json" rows="12"></textarea></label>
-    <button id="apply-record-btn" type="button">Apply selected form (A)</button>
-    <h2>Translation Notes</h2>
-    <label>Job notes<textarea id="job-notes" rows="5"></textarea></label>
-    <label>Page notes<textarea id="page-notes" rows="5"></textarea></label>
-  </aside>
-</div>
-<script>
-window.TETOLATE_EDITOR = {{
-  category: {json.dumps(code)},
-  jobId: {json.dumps(job_id)},
-  pageCount: {page_count},
-}};
-</script>
-<script src="/assets/editor.js?v=ocr-merge-6"></script>
-""",
-    )
-
-
 def create_app(config_path: Path | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -5085,9 +3698,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def index() -> RedirectResponse:
         return RedirectResponse("/admin", status_code=303)
 
-    @app.get("/assets/editor.js")
-    async def editor_asset() -> FileResponse:
-        return FileResponse(REPO_DIR / "web_editor.js", media_type="application/javascript")
+    @app.get("/assets/editor-v2/{asset_name}")
+    async def editor_v2_asset(asset_name: str) -> FileResponse:
+        allowed = {
+            "app.js",
+            "api.js",
+            "store.js",
+            "canvas.js",
+            "screens.js",
+            "editor.css",
+        }
+        if asset_name not in allowed:
+            raise HTTPException(status_code=404, detail="Unknown editor asset.")
+        media_type = "text/css" if asset_name.endswith(".css") else "application/javascript"
+        return FileResponse(REPO_DIR / "web_editor" / asset_name, media_type=media_type)
 
     @app.get("/admin", response_class=HTMLResponse)
     async def admin(request: Request, message: str = "") -> HTMLResponse:
@@ -5196,6 +3820,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         ocr_engine: str = Form(""),
         paddleocr_vl_server_url: str = Form(""),
         paddleocr_vl_model: str = Form(""),
+        ocr_page_workers: str = Form("1"),
+        lama_workers: str = Form("1"),
+        imagemagick_workers: str = Form("1"),
+        vlm_auth_token: str = Form(""),
+        paddleocr_vl_auth_token: str = Form(""),
     ) -> Any:
         manager = manager_from_request(request)
         code = manager.validate_category(category)
@@ -5277,6 +3906,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             parsed_ocr_engine,
             parsed_paddleocr_vl_server_url,
             parsed_paddleocr_vl_model,
+            parse_page_workers_form(ocr_page_workers, "OCR workers"),
+            parse_page_workers_form(lama_workers, "LaMa workers"),
+            parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
+            parse_auth_token_form(vlm_auth_token),
+            parse_auth_token_form(paddleocr_vl_auth_token),
         )
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
@@ -5364,80 +3998,183 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         manager = manager_from_request(request)
         return JSONResponse(manager.public_status(code, job_id))
 
-    @app.get("/api/job/{code}/{job_id}/edit/{stage}/{page}")
-    async def edit_stage_data(
-        request: Request,
-        code: str,
-        job_id: str,
-        stage: str,
-        page: int,
+    @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
+    async def editor_v2_data(
+        request: Request, code: str, job_id: str, stage: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
-        return JSONResponse(manager.editor_payload(code, job_id, stage, page))
+        return JSONResponse(manager.editor_v2_payload(code, job_id, stage, page))
 
-    @app.post("/api/job/{code}/{job_id}/edit/{stage}/{page}")
-    async def save_edit_stage_data(
-        request: Request,
-        code: str,
-        job_id: str,
-        stage: str,
-        page: int,
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
+    async def save_editor_v2_data(
+        request: Request, code: str, job_id: str, stage: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
         data = await request.json()
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-        stage = validate_stage(stage, EDITOR_UI_STAGES)
-        if stage == OCR_MERGE_EDITOR_STAGE:
-            raw_records = data.get("rawRecords")
-            merged_records = data.get("mergedRecords")
-            if not isinstance(raw_records, list):
-                raise HTTPException(status_code=400, detail="rawRecords must be a JSON array.")
-            if not isinstance(merged_records, list):
-                raise HTTPException(status_code=400, detail="mergedRecords must be a JSON array.")
-            manager.save_ocr_merge_records(code, job_id, page, raw_records, merged_records)
-        else:
-            records = data.get("records")
-            if not isinstance(records, list):
-                raise HTTPException(status_code=400, detail="records must be a JSON array.")
-            manager.save_stage_records(code, job_id, stage, page, records)
-        notes = data.get("translationNotes")
-        if isinstance(notes, dict):
-            job_note = notes.get("job")
-            page_note = notes.get("page")
-            manager.save_translation_notes(
-                code,
-                job_id,
-                page,
-                job_note if isinstance(job_note, str) else None,
-                page_note if isinstance(page_note, str) else None,
-            )
-        manager.mark_editor_stage_changed(code, job_id, page, stage)
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        return JSONResponse(
+            manager.save_editor_v2_update(code, job_id, page, stage, data)
+        )
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/protection")
+    async def editor_v2_protection(
+        request: Request, code: str, job_id: str, stage: str, page: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        return JSONResponse(
+            manager.set_editor_v2_protection(code, job_id, page, stage, data)
+        )
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/regenerate")
+    async def regenerate_editor_v2_page(
+        request: Request, code: str, job_id: str, stage: str, page: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            resume_from = editor_v2.RERUN_FROM[editor_v2.validate_stage(stage)]
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        manager.rerun_completed_job_pages(code, job_id, [page], resume_from)
+        return JSONResponse(
+            {"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": resume_from}
+        )
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/regenerate-changes")
+    async def regenerate_editor_v2_changes(
+        request: Request, code: str, job_id: str
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        pages, resume_by_page = manager.rerun_editor_v2_changes(code, job_id)
         return JSONResponse(
             {
                 "ok": True,
-                "changeInfo": manager.editor_change_info(code, job_id, page, stage),
+                "url": f"/job/{code}/{job_id}",
+                "pages": pages,
+                "resumeByPage": resume_by_page,
             }
         )
 
-    @app.post("/api/job/{code}/{job_id}/edit/{stage}/{page}/lock")
-    async def lock_edit_stage(
-        request: Request,
-        code: str,
-        job_id: str,
-        stage: str,
-        page: int,
+    @app.post("/api/job/{code}/{job_id}/editor/v2/continue")
+    async def continue_from_ocr_review(
+        request: Request, code: str, job_id: str
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        status = manager.require_editable_job(code, job_id, "ocr")
+        if not manager.status_is_ocr_review_checkpoint(status):
+            raise HTTPException(
+                status_code=409,
+                detail="This job is not waiting for OCR review.",
+            )
+        manager.restart_failed_job(code, job_id)
+        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}"})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/retranslate")
+    async def retranslate_editor_v2_page(
+        request: Request, code: str, job_id: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
         data = await request.json()
         if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-        meta = manager.set_stage_lock(code, job_id, page, stage, bool(data.get("locked")))
-        locks = meta.get("locks", {})
-        page_locks = locks.get(page_key(page), {}) if isinstance(locks, dict) else {}
-        return JSONResponse({"ok": True, "locks": page_locks})
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        record_id_value = data.get("recordId")
+        boxno = data.get("boxno")
+        if record_id_value is not None and not isinstance(record_id_value, str):
+            raise HTTPException(status_code=400, detail="recordId must be a string.")
+        manager.retranslate_editor_v2_page(
+            code,
+            job_id,
+            page,
+            record_id_value,
+            boxno,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "url": f"/job/{code}/{job_id}",
+                "boxno": boxno if record_id_value is not None else None,
+            }
+        )
 
-    @app.post("/api/job/{code}/{job_id}/edit/ocr-crop")
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/preview")
+    async def render_editor_v2_preview(
+        request: Request, code: str, job_id: str, stage: str, page: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        if stage != "placement":
+            raise HTTPException(status_code=400, detail="Preview is only available for placement.")
+        manager.require_editable_job(code, job_id, stage)
+        data = await request.json()
+        records = data.get("records") if isinstance(data, dict) else None
+        clean_records = data.get("cleanRecords") if isinstance(data, dict) else None
+        if not isinstance(records, list):
+            raise HTTPException(status_code=400, detail="records must be an array.")
+        if not isinstance(clean_records, list):
+            raise HTTPException(status_code=400, detail="cleanRecords must be an array.")
+        _path, cached, cleaned_with_lama = await run_in_threadpool(
+            manager.render_editor_v2_preview,
+            code,
+            job_id,
+            page,
+            records,
+            clean_records,
+        )
+        return JSONResponse(
+            {
+                "ok": True,
+                "cached": cached,
+                "cleanedWithLama": cleaned_with_lama,
+                "url": f"/api/job/{code}/{job_id}/editor/v2/preview-image/{page}?v={int(time.time())}",
+            }
+        )
+
+    @app.get("/api/job/{code}/{job_id}/editor/v2/preview-image/{page}")
+    async def editor_v2_preview_image(
+        request: Request, code: str, job_id: str, page: int
+    ) -> FileResponse:
+        manager = manager_from_request(request)
+        path = manager.editor_v2_preview_path(code, job_id, page)
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="No exact preview has been rendered.")
+        return FileResponse(path, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/job/{code}/{job_id}/editor/v2/image/{kind}/{page}")
+    async def editor_v2_stage_image(
+        request: Request, code: str, job_id: str, kind: str, page: int
+    ) -> FileResponse:
+        manager = manager_from_request(request)
+        manager.require_editable_job(code, job_id)
+        original = manager.original_page_path(code, job_id, page)
+        if kind == "original":
+            path = original
+        elif kind == "cleaned":
+            path = manager.output_dir(code, job_id) / "pages" / "cleaned" / f"{original.stem}.png"
+        elif kind == "final":
+            path = manager.output_dir(code, job_id) / "pages" / "final" / f"{original.stem}.png"
+        else:
+            raise HTTPException(status_code=404, detail="Unknown editor image.")
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"The {kind} page image is missing.")
+        return FileResponse(path, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/job/{code}/{job_id}/editor/v2/revisions")
+    async def editor_v2_revisions(
+        request: Request, code: str, job_id: str
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        return JSONResponse({"revisions": manager.editor_v2_revisions(code, job_id)})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/revisions/{revision}/restore")
+    async def restore_editor_v2_revision(
+        request: Request, code: str, job_id: str, revision: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        return JSONResponse(manager.restore_editor_v2_revision(code, job_id, revision))
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/ocr-crop")
     async def edit_ocr_crop(request: Request, code: str, job_id: str) -> JSONResponse:
         manager = manager_from_request(request)
         data = await request.json()
@@ -5462,33 +4199,6 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return JSONResponse(result)
 
-    @app.post("/api/job/{code}/{job_id}/edit/regenerate")
-    async def regenerate_edit_page(request: Request, code: str, job_id: str) -> JSONResponse:
-        manager = manager_from_request(request)
-        data = await request.json()
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
-        try:
-            page = int(data.get("page", 0))
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="page must be an integer.") from exc
-        stage = validate_stage(str(data.get("stage", OCR_MERGE_EDITOR_STAGE)), EDITOR_RERUN_STAGES)
-        manager.rerun_completed_job_pages(code, job_id, [page], stage)
-        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}"})
-
-    @app.post("/api/job/{code}/{job_id}/edit/regenerate-changes")
-    async def regenerate_changed_edit_pages(request: Request, code: str, job_id: str) -> JSONResponse:
-        manager = manager_from_request(request)
-        pages, resume_from = manager.rerun_changed_editor_pages(code, job_id)
-        return JSONResponse(
-            {
-                "ok": True,
-                "url": f"/job/{code}/{job_id}",
-                "pages": pages,
-                "resumeFrom": resume_from,
-            }
-        )
-
     @app.post("/job/{code}/{job_id}/restart")
     async def restart_job(request: Request, code: str, job_id: str) -> RedirectResponse:
         manager = manager_from_request(request)
@@ -5510,6 +4220,13 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         ocr_engine: str = Form(""),
         paddleocr_vl_server_url: str = Form(""),
         paddleocr_vl_model: str = Form(""),
+        ocr_page_workers: str = Form("1"),
+        lama_workers: str = Form("1"),
+        imagemagick_workers: str = Form("1"),
+        vlm_auth_token: str = Form(""),
+        paddleocr_vl_auth_token: str = Form(""),
+        clear_vlm_auth_token: str | None = Form(None),
+        clear_paddleocr_vl_auth_token: str | None = Form(None),
     ) -> RedirectResponse:
         manager = manager_from_request(request)
         manager.update_job_advanced_options(
@@ -5537,6 +4254,13 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 paddleocr_vl_model,
                 manager.config.default_paddleocr_vl_model,
             ),
+            parse_page_workers_form(ocr_page_workers, "OCR workers"),
+            parse_page_workers_form(lama_workers, "LaMa workers"),
+            parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
+            parse_auth_token_form(vlm_auth_token),
+            parse_auth_token_form(paddleocr_vl_auth_token),
+            parse_checkbox(clear_vlm_auth_token),
+            parse_checkbox(clear_paddleocr_vl_auth_token),
         )
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 

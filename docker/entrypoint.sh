@@ -8,6 +8,11 @@ is_rootless_user_namespace() {
 
 mkdir -p /data/config /data/jobs /data/cache /data/fonts /data/models
 
+if [ ! -d /data/prompts ]; then
+    cp -R /app/data/prompts /data/prompts
+    echo "Created /data/prompts with the default VLM prompt templates." >&2
+fi
+
 if [ ! -e /data/config/vlm_config.json ]; then
     install -m 0600 /app/data/config/vlm_config.example.json /data/config/vlm_config.json
     echo "Created /data/config/vlm_config.json; review the endpoint and model settings." >&2
@@ -25,11 +30,13 @@ if [ "$(id -u)" = "0" ]; then
             /data/config/vlm_config.json \
             /data/config/web_config.json \
             /data/jobs \
-            /data/cache
-        chmod 0750 /data/config /data/jobs /data/cache
+            /data/cache \
+            /data/prompts
+        chmod 0750 /data/config /data/jobs /data/cache /data/prompts
         chmod 0600 /data/config/vlm_config.json /data/config/web_config.json
         exec "$@"
     fi
+    chown -R tetolate:tetolate /data/prompts
     chown tetolate:tetolate /data /data/config /data/jobs /data/cache
     chown tetolate:tetolate /data/config/vlm_config.json /data/config/web_config.json
     exec gosu tetolate:tetolate "$@"

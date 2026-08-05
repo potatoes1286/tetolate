@@ -84,7 +84,7 @@ def ensure_model(model_path: Path | None = None) -> Path:
                     temp_path = Path(destination.name)
                     request = urllib.request.Request(
                         DEFAULT_MODEL_URL,
-                        headers={"User-Agent": "tetolate/0.1 LaMa model downloader"},
+                        headers={"User-Agent": "tetolate/0.2 LaMa model downloader"},
                     )
                     with urllib.request.urlopen(request, timeout=120) as response:
                         while chunk := response.read(DOWNLOAD_CHUNK_SIZE):
@@ -115,7 +115,6 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-@lru_cache(maxsize=3)
 def load_model(model_path: str, device_name: str) -> torch.jit.ScriptModule:
     device = resolve_device(device_name)
     try:
@@ -124,6 +123,52 @@ def load_model(model_path: str, device_name: str) -> torch.jit.ScriptModule:
         raise LaMaError(f"Could not load LaMa model {model_path}: {exc}") from exc
     model.eval()
     return model
+
+
+class LaMaSession:
+    """Own one loaded LaMa model and reuse it for multiple images."""
+
+    def __init__(
+        self,
+        device_name: str = "cpu",
+        model_path: Path | None = None,
+    ) -> None:
+        self.device_name = device_name
+        self.model_path = ensure_model(model_path)
+        self.device = resolve_device(device_name)
+        self.model: torch.jit.ScriptModule | None = load_model(
+            str(self.model_path),
+            device_name,
+        )
+
+    def inpaint_image(
+        self,
+        input_image: Path,
+        mask_path: Path,
+        output_image: Path,
+        *,
+        crop_boxes: Sequence[Box] = (),
+        crop_trigger_size: int = DEFAULT_CROP_TRIGGER_SIZE,
+        crop_margin: int = DEFAULT_CROP_MARGIN,
+    ) -> None:
+        model = self.model
+        if model is None:
+            raise LaMaError("LaMa session is closed.")
+        inpaint_image_with_model(
+            model,
+            self.device,
+            input_image,
+            mask_path,
+            output_image,
+            crop_boxes=crop_boxes,
+            crop_trigger_size=crop_trigger_size,
+            crop_margin=crop_margin,
+        )
+
+    def close(self) -> None:
+        self.model = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
 
 def ceil_modulo(value: int, modulo: int = PAD_MODULO) -> int:
@@ -237,13 +282,13 @@ def infer_crop(
     return np.where(keep, image, result)
 
 
-def inpaint_image(
+def inpaint_image_with_model(
+    model: torch.jit.ScriptModule,
+    device: torch.device,
     input_image: Path,
     mask_path: Path,
     output_image: Path,
     *,
-    device_name: str = "cpu",
-    model_path: Path | None = None,
     crop_boxes: Sequence[Box] = (),
     crop_trigger_size: int = DEFAULT_CROP_TRIGGER_SIZE,
     crop_margin: int = DEFAULT_CROP_MARGIN,
@@ -265,10 +310,6 @@ def inpaint_image(
         mask = np.asarray(mask_image).copy()
     mask = np.where(mask >= 127, 255, 0).astype("uint8")
 
-    verified_model_path = ensure_model(model_path)
-    device = resolve_device(device_name)
-    model = load_model(str(verified_model_path), device_name)
-
     height, width = image.shape[:2]
     result = image.copy()
     if max(height, width) > crop_trigger_size and crop_boxes:
@@ -287,3 +328,28 @@ def inpaint_image(
 
     output_image.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(result).save(output_image, format="PNG")
+
+
+def inpaint_image(
+    input_image: Path,
+    mask_path: Path,
+    output_image: Path,
+    *,
+    device_name: str = "cpu",
+    model_path: Path | None = None,
+    crop_boxes: Sequence[Box] = (),
+    crop_trigger_size: int = DEFAULT_CROP_TRIGGER_SIZE,
+    crop_margin: int = DEFAULT_CROP_MARGIN,
+) -> None:
+    session = LaMaSession(device_name, model_path)
+    try:
+        session.inpaint_image(
+            input_image,
+            mask_path,
+            output_image,
+            crop_boxes=crop_boxes,
+            crop_trigger_size=crop_trigger_size,
+            crop_margin=crop_margin,
+        )
+    finally:
+        session.close()

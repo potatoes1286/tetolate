@@ -93,7 +93,7 @@ Basic repository checks used during development are:
 
 ```bash
 .venv/bin/python -m py_compile *.py
-node --check web_editor.js
+for file in web_editor/*.js; do node --check "$file"; done
 bash -n run.sh run_server.sh docker/entrypoint.sh
 docker compose config
 docker compose --profile paddleocr-vl config

@@ -1,0 +1,27 @@
+For open-lettering translations only, choose unobtrusive margin/nearby placement boxes
+where the ${target_name} text can be readable. Open-lettering text was marked this way because
+cleaning the original ${source_name} would likely damage important page art, so do not place
+the translation over faces, bodies, detailed artwork, action lines, panel borders, or
+other important visual content. Do not place text in a tiny sliver directly below or
+beside the original if that would force very small ${target_name} text.
+
+Coordinates must use Gemma-style normalized box_2d: [y_min, x_min, y_max, x_max],
+where each value is an integer from 0 to 1000.
+All four box_2d values must be inside 0..1000 inclusive. Never return negative
+coordinates and never return coordinates greater than 1000. If a placement would go
+outside the page, move or shrink it so y_min, x_min, y_max, and x_max all remain in 0..1000.
+Ensure y_min < y_max and x_min < x_max after applying the 0..1000 limit.
+
+Return only a compact JSON array of rows. Row format:
+[label,box_2d]
+Labels and coordinates must be JSON integers without quotes. Return `[0,[...]]`, not `["0",[...]]`.
+Return one row for every input record below and no others.
+Use each label exactly as supplied. Labels are temporary consecutive identifiers for this request.
+
+Reading order guidance: use ${reading_order}.
+
+Current page index:
+${page_index}
+
+Open-lettering records compact table. The first column is label:
+${records_table}

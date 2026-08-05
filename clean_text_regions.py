@@ -270,18 +270,29 @@ def run_lama(
     crop_boxes: list[lama_inpaint.Box],
     crop_trigger_size: int,
     crop_margin: int,
+    session: lama_inpaint.LaMaSession | None = None,
 ) -> None:
     try:
-        lama_inpaint.inpaint_image(
-            input_image,
-            mask_path,
-            output_image,
-            device_name=device,
-            model_path=model_path,
-            crop_boxes=crop_boxes,
-            crop_trigger_size=crop_trigger_size,
-            crop_margin=crop_margin,
-        )
+        if session is None:
+            lama_inpaint.inpaint_image(
+                input_image,
+                mask_path,
+                output_image,
+                device_name=device,
+                model_path=model_path,
+                crop_boxes=crop_boxes,
+                crop_trigger_size=crop_trigger_size,
+                crop_margin=crop_margin,
+            )
+        else:
+            session.inpaint_image(
+                input_image,
+                mask_path,
+                output_image,
+                crop_boxes=crop_boxes,
+                crop_trigger_size=crop_trigger_size,
+                crop_margin=crop_margin,
+            )
     except lama_inpaint.LaMaError as exc:
         raise InputError(f"LaMa failed while cleaning text regions: {exc}") from exc
 
@@ -296,6 +307,7 @@ def clean_text_regions(
     crop_trigger_size: int,
     crop_margin: int,
     keep_mask: Path | None,
+    lama_session: lama_inpaint.LaMaSession | None = None,
 ) -> None:
     output_image.parent.mkdir(parents=True, exist_ok=True)
 
@@ -331,6 +343,7 @@ def clean_text_regions(
             crop_boxes,
             crop_trigger_size,
             crop_margin,
+            lama_session,
         )
 
         if not lama_output.exists():
