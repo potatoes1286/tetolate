@@ -769,6 +769,27 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--lama-workers") + 1], "3")
         self.assertEqual(command[command.index("--imagemagick-workers") + 1], "4")
 
+    def test_web_pipeline_skips_archives_and_package_generation_selects_one_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "failed"})
+
+            normal_command = manager.build_command("default", job_id)
+            package_command = manager.build_command(
+                "default", job_id, "package", 0, package_variant="webp"
+            )
+
+        self.assertIn("--skip-package", normal_command)
+        self.assertNotIn("--package-variant", normal_command)
+        self.assertNotIn("--skip-package", package_command)
+        self.assertEqual(
+            package_command[package_command.index("--package-variant") + 1],
+            "webp",
+        )
+
     def test_case_colliding_saved_categories_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1472,6 +1493,97 @@ class AtomicPackagingTests(unittest.TestCase):
                             else ["page-0.png", "page-1.png", "page-2.png", "page-3.png"]
                         ),
                     )
+
+    def test_package_variant_generates_only_requested_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+
+            config = translate_cbz.load_config(None, root / "fixtures")
+
+            def convert(source: Path, destination: Path, _quality: int) -> None:
+                destination.write_bytes(source.read_bytes())
+
+            with mock.patch.object(
+                translate_cbz,
+                "convert_final_page_with_magick",
+                side_effect=convert,
+            ), mock.patch("sys.stderr"):
+                translate_cbz.print_packaged_cbz(
+                    [page],
+                    output_dir,
+                    input_cbz,
+                    config,
+                    package_variant="webp",
+                )
+
+            self.assertFalse(translate_cbz.translated_cbz_path(output_dir).exists())
+            self.assertTrue(translate_cbz.translated_webp_cbz_path(output_dir).exists())
+            self.assertFalse(translate_cbz.translated_jxl_cbz_path(output_dir).exists())
+
+    def test_package_variant_png_does_not_generate_alternate_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+
+            config = translate_cbz.load_config(None, root / "fixtures")
+            with mock.patch.object(
+                translate_cbz,
+                "package_converted_cbz",
+            ) as alternate_package, mock.patch("sys.stderr"):
+                translate_cbz.print_packaged_cbz(
+                    [page],
+                    output_dir,
+                    input_cbz,
+                    config,
+                    package_variant="png",
+                )
+
+            alternate_package.assert_not_called()
+            self.assertTrue(translate_cbz.translated_cbz_path(output_dir).exists())
+
+    def test_requested_variant_failure_preserves_existing_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+            destination = translate_cbz.translated_webp_cbz_path(output_dir)
+            destination.write_bytes(b"previous archive")
+            config = translate_cbz.load_config(None, root / "fixtures")
+
+            with mock.patch.object(
+                translate_cbz,
+                "convert_final_page_with_magick",
+                side_effect=translate_cbz.PipelineError("conversion failed"),
+            ), mock.patch("sys.stderr"):
+                with self.assertRaises(translate_cbz.PipelineError):
+                    translate_cbz.print_packaged_cbz(
+                        [page],
+                        output_dir,
+                        input_cbz,
+                        config,
+                        package_variant="webp",
+                    )
+
+            self.assertEqual(destination.read_bytes(), b"previous archive")
+            self.assertEqual(list(output_dir.glob(f".{destination.name}.*.tmp")), [])
 
 
 class ArchiveSafetyTests(unittest.TestCase):
@@ -2388,6 +2500,44 @@ class StrictInputTests(unittest.TestCase):
 
 
 class OriginalInputUiTests(unittest.TestCase):
+    def test_complete_job_generates_missing_translated_archives(self) -> None:
+        markup = web_pages.download_links_html(
+            "manga",
+            "abc12345",
+            {
+                "status": "complete",
+                "downloads": {
+                    "png": {"available": True, "size": "1 MB", "downloadToken": "png-1"},
+                    "webp": {"available": False},
+                    "jxl": {"available": False},
+                },
+                "canView": True,
+            },
+        )
+
+        self.assertIn("Download PNG CBZ (1 MB)", markup)
+        self.assertIn("/download/png?v=png-1", markup)
+        self.assertIn("Generate WebP CBZ", markup)
+        self.assertIn("Generate JXL CBZ", markup)
+        self.assertIn(
+            'action="/job/manga/abc12345/generate-download/webp" method="post"',
+            markup,
+        )
+        self.assertIn(
+            'action="/job/manga/abc12345/generate-download/jxl" method="post"',
+            markup,
+        )
+
+    def test_incomplete_job_does_not_show_translated_archive_controls(self) -> None:
+        markup = web_pages.download_links_html(
+            "manga",
+            "abc12345",
+            {"status": "running", "downloads": {}},
+        )
+
+        self.assertNotIn("Generate PNG CBZ", markup)
+        self.assertNotIn("Download PNG CBZ", markup)
+
     def test_job_download_links_include_original_view_and_cbz(self) -> None:
         markup = web_pages.download_links_html(
             "manga",
@@ -2470,6 +2620,25 @@ class EditorV2Tests(unittest.TestCase):
         original_dir.mkdir(parents=True)
         Image.new("RGB", (100, 120), "white").save(original_dir / "0000.png")
         return manager, code, job_id
+
+    def test_page_rerun_invalidates_all_translated_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager, code, job_id = self.create_job(Path(temp_dir))
+            manager.input_path(code, job_id).write_bytes(b"input")
+            output_dir = manager.output_dir(code, job_id)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for variant in web_app.TRANSLATED_CBZ_FILENAMES:
+                manager.translated_cbz_variant_path(code, job_id, variant).write_bytes(
+                    b"stale archive"
+                )
+
+            with mock.patch.object(manager, "enqueue"):
+                manager.rerun_completed_job_pages(code, job_id, [0], "render")
+
+            for variant in web_app.TRANSLATED_CBZ_FILENAMES:
+                self.assertFalse(
+                    manager.translated_cbz_variant_path(code, job_id, variant).exists()
+                )
 
     def test_changed_fields_are_protected_and_unprotected_fields_are_rebased(self) -> None:
         manifest = editor_v2.default_manifest()
@@ -2803,45 +2972,6 @@ class EditorV2Tests(unittest.TestCase):
             with mock.patch.object(manager, "run_page_rerun_batch_job") as rerun:
                 manager.run_job(code, job_id)
             self.assertEqual(rerun.call_args.args[3], failed["pendingPageReruns"])
-
-    def test_failed_batch_packaging_restarts_without_rerendering_pages(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            manager, code, job_id = self.create_job(Path(temp_dir))
-            manager.input_path(code, job_id).write_bytes(b"input")
-            status = manager.load_status(code, job_id)
-            self.assertIsNotNone(status)
-            status.update(
-                {
-                    "status": "running",
-                    "pendingPageReruns": [{"page": 2, "resumeFrom": "render"}],
-                    "pendingResumeFrom": "render",
-                    "pendingResumePage": 2,
-                    "lastResumeFrom": "render",
-                    "lastResumePage": 2,
-                }
-            )
-            manager.save_status(code, job_id, status)
-
-            with mock.patch.object(
-                manager,
-                "run_pipeline_process",
-                side_effect=[0, 1],
-            ):
-                manager.run_page_rerun_batch_job(
-                    code, job_id, status, status["pendingPageReruns"]
-                )
-
-            failed = manager.load_status(code, job_id)
-            self.assertEqual(failed["status"], "failed")
-            self.assertTrue(failed["pendingPackageOnly"])
-            self.assertEqual(failed["pendingResumeFrom"], "package")
-            self.assertNotIn("pendingPageReruns", failed)
-
-            with mock.patch.object(manager, "enqueue"):
-                manager.restart_failed_job(code, job_id)
-            with mock.patch.object(manager, "run_package_regeneration_job") as package:
-                manager.run_job(code, job_id)
-            package.assert_called_once()
 
     def test_caption_layout_keeps_trailing_punctuation_with_its_word(self) -> None:
         normalized = overlay_text.normalize_caption_text("A generic sample .")

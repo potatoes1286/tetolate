@@ -102,6 +102,9 @@ TRANSLATED_WEBP_CBZ_NAME = "translated_webp.cbz"
 # Alternate translated archive using lossy JPEG XL pages for smaller output size.
 TRANSLATED_JXL_CBZ_NAME = "translated_jxl.cbz"
 
+# Output archive variants accepted by the package phase.
+PACKAGE_VARIANTS = ("png", "webp", "jxl")
+
 # Cover image suffix used inside WebP/JXL CBZ variants for readers that cannot
 # use WebP/JXL files as archive thumbnails.
 TRANSLATED_ALT_COVER_SUFFIX = ".jpg"
@@ -369,7 +372,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "With --resume-from ocr_raw, ocr_structured, alt_placement, translations, placements, or render, "
-            "regenerate only --resume-page through render and then rebuild translated.cbz."
+            "regenerate only --resume-page through render."
         ),
     )
     parser.add_argument(
@@ -381,8 +384,15 @@ def parse_args() -> argparse.Namespace:
         "--skip-package",
         action="store_true",
         help=(
-            "Run the requested work without rebuilding translated CBZ archives. "
-            "Intended for batched web reruns that package once at the end."
+            "Run the requested work without rebuilding translated CBZ archives."
+        ),
+    )
+    parser.add_argument(
+        "--package-variant",
+        choices=PACKAGE_VARIANTS,
+        help=(
+            "Generate only this translated CBZ variant. Without this option, "
+            "the package phase generates all variants."
         ),
     )
     parser.add_argument(
@@ -4432,42 +4442,89 @@ def print_packaged_cbz(
     output_dir: Path,
     input_cbz: Path,
     config: PipelineConfig,
+    package_variant: str | None = None,
 ) -> None:
+    if package_variant is not None and package_variant not in PACKAGE_VARIANTS:
+        raise PipelineError(f"Unsupported package variant: {package_variant}")
+
     try:
         with zipfile.ZipFile(input_cbz) as source_archive:
             source_members = validate_cbz_members(source_archive)
-            cbz_path = package_cbz(
-                pages,
-                output_dir,
-                input_cbz,
-                source_archive=source_archive,
-                source_members=source_members,
+            variants = {
+                "png": (
+                    translated_cbz_path(output_dir),
+                    None,
+                    None,
+                    "PNG",
+                ),
+                "webp": (
+                    translated_webp_cbz_path(output_dir),
+                    ".webp",
+                    config.webp_quality,
+                    "WebP",
+                ),
+                "jxl": (
+                    translated_jxl_cbz_path(output_dir),
+                    ".jxl",
+                    config.jxl_quality,
+                    "JXL",
+                ),
+            }
+            variant_names = (
+                (package_variant,)
+                if package_variant is not None
+                else PACKAGE_VARIANTS
             )
-            print(f"Wrote {cbz_path}", file=sys.stderr)
-            for variant_path, suffix, quality, label in (
-                (translated_webp_cbz_path(output_dir), ".webp", config.webp_quality, "WebP"),
-                (translated_jxl_cbz_path(output_dir), ".jxl", config.jxl_quality, "JXL"),
-            ):
+            for variant_name in variant_names:
+                variant_path, suffix, quality, label = variants[variant_name]
                 try:
-                    written_path = package_converted_cbz(
-                        pages,
-                        output_dir,
-                        input_cbz,
-                        variant_path,
-                        suffix,
-                        quality,
-                        config.imagemagick_workers,
-                        source_archive=source_archive,
-                        source_members=source_members,
-                    )
+                    if variant_name == "png":
+                        written_path = package_cbz(
+                            pages,
+                            output_dir,
+                            input_cbz,
+                            source_archive=source_archive,
+                            source_members=source_members,
+                        )
+                    else:
+                        assert suffix is not None
+                        assert quality is not None
+                        written_path = package_converted_cbz(
+                            pages,
+                            output_dir,
+                            input_cbz,
+                            variant_path,
+                            suffix,
+                            quality,
+                            config.imagemagick_workers,
+                            source_archive=source_archive,
+                            source_members=source_members,
+                        )
                 except PipelineError as exc:
-                    if variant_path.exists():
-                        variant_path.unlink()
+                    if package_variant is not None or variant_name == "png":
+                        raise
                     print(f"warning: skipped {label} CBZ output: {exc}", file=sys.stderr)
                     continue
                 print(f"Wrote {written_path}", file=sys.stderr)
     except zipfile.BadZipFile as exc:
         raise PipelineError(f"Input file is not a valid CBZ/zip: {input_cbz}") from exc
+
+
+def maybe_print_packaged_cbz(
+    args: argparse.Namespace,
+    pages: list[Page],
+    config: PipelineConfig,
+) -> None:
+    """Package output unless the caller explicitly requested rendered pages only."""
+    if getattr(args, "skip_package", False):
+        return
+    print_packaged_cbz(
+        pages,
+        args.output_dir,
+        args.input_cbz,
+        config,
+        package_variant=getattr(args, "package_variant", None),
+    )
 
 
 
@@ -4561,7 +4618,7 @@ def run_full_pipeline(
     )
     run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
     render_pages(pages, structured_by_page, args.output_dir, config)
-    print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+    maybe_print_packaged_cbz(args, pages, config)
 
 
 def run_single_page_resume_pipeline(
@@ -4679,8 +4736,7 @@ def run_single_page_resume_pipeline(
         start_page=target_page,
         end_page=target_page,
     )
-    if not args.skip_package:
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+    maybe_print_packaged_cbz(args, pages, config)
 
 
 def run_resume_pipeline(
@@ -4732,7 +4788,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     verify_resume_input(args.input_cbz, args.output_dir)
@@ -4785,7 +4841,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "ocr_structured":
@@ -4846,7 +4902,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "alt_placement":
@@ -4890,7 +4946,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "translations":
@@ -4920,7 +4976,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "proofreading":
@@ -4937,7 +4993,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "translation_notes":
@@ -4954,7 +5010,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "placements":
@@ -4975,7 +5031,7 @@ def run_resume_pipeline(
             existing_by_page=placement_prior,
         )
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "render":
@@ -4989,11 +5045,17 @@ def run_resume_pipeline(
             config,
             start_page=start_page,
         )
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "package":
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        print_packaged_cbz(
+            pages,
+            args.output_dir,
+            args.input_cbz,
+            config,
+            package_variant=getattr(args, "package_variant", None),
+        )
         return
 
     raise PipelineError(f"Unsupported resume phase: {phase}")
@@ -5024,8 +5086,6 @@ def main() -> int:
             raise PipelineError("--resume-page requires --resume-from.")
         if args.resume_from is None and args.single_page:
             raise PipelineError("--single-page requires --resume-from.")
-        if args.skip_package and not args.single_page:
-            raise PipelineError("--skip-package requires --single-page.")
         if args.translation_boxno is not None:
             if args.translation_boxno < 0:
                 raise PipelineError("--translation-boxno must be zero or greater.")

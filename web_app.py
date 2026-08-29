@@ -232,7 +232,6 @@ RERUN_JOB_STAGE_RESUME = {
     "placements": "placements",
     "render": "render",
 }
-RERUN_JOB_PACKAGE_STAGE = "package"
 EDITOR_META_DIRNAME = "web_meta"
 TRANSLATION_NOTES_FILENAME = "translation_notes.json"
 JOB_SECRETS_FILENAME = ".job-secrets.json"
@@ -1077,9 +1076,9 @@ def parse_page_selection(value: str, allow_empty: bool = False) -> list[int]:
     return sorted(pages)
 
 
-def parse_rerun_job_stages(values: list[str]) -> tuple[str | None, bool]:
+def parse_rerun_job_stages(values: list[str]) -> str:
     selected = {str(value).strip() for value in values if str(value).strip()}
-    allowed = set(RERUN_JOB_STAGE_ORDER) | {RERUN_JOB_PACKAGE_STAGE}
+    allowed = set(RERUN_JOB_STAGE_ORDER)
     unsupported = sorted(selected - allowed)
     if unsupported:
         raise HTTPException(
@@ -1089,12 +1088,10 @@ def parse_rerun_job_stages(values: list[str]) -> tuple[str | None, bool]:
     if not selected:
         raise HTTPException(status_code=400, detail="Select at least one pass to rerun.")
 
-    resume_from = None
     for stage in RERUN_JOB_STAGE_ORDER:
         if stage in selected:
-            resume_from = RERUN_JOB_STAGE_RESUME[stage]
-            break
-    return resume_from, RERUN_JOB_PACKAGE_STAGE in selected
+            return RERUN_JOB_STAGE_RESUME[stage]
+    raise HTTPException(status_code=400, detail="Select at least one processing pass to rerun.")
 
 
 def optional_non_negative_int(value: Any, label: str) -> int | None:
@@ -2038,10 +2035,18 @@ class JobManager(EditorManagerMixin):
     def download_info(self, code: str, job_id: str) -> dict[str, dict[str, Any]]:
         downloads: dict[str, dict[str, Any]] = {}
         for variant in TRANSLATED_CBZ_FILENAMES:
-            downloads[variant] = file_info(
+            info = file_info(
                 self.translated_cbz_variant_path(code, job_id, variant)
             )
+            info["variant"] = variant
+            info["generateUrl"] = f"/job/{code}/{job_id}/generate-download/{variant}"
+            downloads[variant] = info
         return downloads
+
+    def invalidate_translated_cbz_archives(self, code: str, job_id: str) -> None:
+        """Remove archives whose rendered page inputs are no longer current."""
+        for variant in TRANSLATED_CBZ_FILENAMES:
+            self.translated_cbz_variant_path(code, job_id, variant).unlink(missing_ok=True)
 
     def iter_job_ids(self, code: str) -> list[str]:
         jobs_path = self.jobs_dir(code)
@@ -2108,6 +2113,7 @@ class JobManager(EditorManagerMixin):
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
             return
@@ -2129,6 +2135,7 @@ class JobManager(EditorManagerMixin):
             )
         else:
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
 
@@ -2335,9 +2342,16 @@ class JobManager(EditorManagerMixin):
             "age": age_text(timing.age_seconds),
             "elapsedSeconds": timing.elapsed_seconds,
             "elapsed": duration_text(timing.elapsed_seconds),
-            "hasDownload": self.translated_cbz_path(code, job_id).is_file()
-            and status.get("status") == "complete",
+            "hasDownload": any(
+                item.get("available") for item in downloads.values()
+            ) and status.get("status") == "complete",
             "downloads": downloads if status.get("status") == "complete" else {},
+            "downloadGenerationUrls": {
+                variant: f"/job/{code}/{job_id}/generate-download/{variant}"
+                for variant in TRANSLATED_CBZ_FILENAMES
+            }
+            if status.get("status") == "complete"
+            else {},
             "hasOriginalDownload": bool(input_info["available"]),
             "originalDownloadUrl": f"/job/{code}/{job_id}/download-original",
             "canViewOriginal": original_page_count > 0,
@@ -2350,7 +2364,7 @@ class JobManager(EditorManagerMixin):
             "canRestart": can_restart,
             "canTerminate": can_terminate,
             "canRerunPages": status.get("status") == "complete",
-            "canRegenerateDownloads": status.get("status") == "complete",
+            "canGenerateDownloads": status.get("status") == "complete",
             "canEdit": status.get("status") == "complete" or ocr_review_checkpoint,
             "ocrReviewCheckpoint": ocr_review_checkpoint,
             "webpQuality": webp_quality,
@@ -2764,6 +2778,8 @@ class JobManager(EditorManagerMixin):
                 status["pendingResumePage"] = restart_target[1]
                 if restart_target[0] == "package":
                     status["pendingPackageOnly"] = True
+                    if status.get("pendingPackageVariant") not in TRANSLATED_CBZ_FILENAMES:
+                        status["pendingPackageVariant"] = "png"
                     status["pendingWebpQuality"] = quality_for_display(
                         status.get("webpQuality"),
                         self.config.default_webp_quality,
@@ -2774,12 +2790,14 @@ class JobManager(EditorManagerMixin):
                     )
                 else:
                     status.pop("pendingPackageOnly", None)
+                    status.pop("pendingPackageVariant", None)
                     status.pop("pendingWebpQuality", None)
                     status.pop("pendingJxlQuality", None)
             else:
                 status.pop("pendingResumeFrom", None)
                 status.pop("pendingResumePage", None)
                 status.pop("pendingPackageOnly", None)
+                status.pop("pendingPackageVariant", None)
                 status.pop("pendingWebpQuality", None)
                 status.pop("pendingJxlQuality", None)
             self.save_status(code, job_id, status)
@@ -2791,8 +2809,6 @@ class JobManager(EditorManagerMixin):
         job_id: str,
         pages: list[int],
         resume_from: str = "ocr_raw",
-        webp_quality: int | None = None,
-        jxl_quality: int | None = None,
         translation_boxno: int | None = None,
         page_resume_from: dict[int, str] | None = None,
     ) -> None:
@@ -2801,12 +2817,6 @@ class JobManager(EditorManagerMixin):
         resume_from = RERUN_STAGE_MAP.get(resume_from, resume_from)
         if resume_from not in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             raise HTTPException(status_code=400, detail="Unsupported rerun stage.")
-        if webp_quality is not None:
-            webp_quality = validate_output_quality(webp_quality, "WebP quality")
-        if jxl_quality is not None:
-            jxl_quality = validate_output_quality(jxl_quality, "JXL quality")
-        if (webp_quality is None) != (jxl_quality is None):
-            raise HTTPException(status_code=400, detail="Both WebP and JXL quality must be provided together.")
         if translation_boxno is not None:
             if resume_from != "translations" or len(pages) != 1:
                 raise HTTPException(
@@ -2876,6 +2886,10 @@ class JobManager(EditorManagerMixin):
                 for page in pages:
                     self.materialize_editor_v2_page(code, job_id, manifest, page)
 
+            # Any page rerun changes the rendered source for every archive
+            # variant. Keep no stale translated archive available.
+            self.invalidate_translated_cbz_archives(code, job_id)
+
             try:
                 rerun_count = int(status.get("rerunCount", 0)) + 1
             except (TypeError, ValueError):
@@ -2900,14 +2914,11 @@ class JobManager(EditorManagerMixin):
                     "lastResumePage": first_rerun["page"],
                 }
             )
-            if webp_quality is not None and jxl_quality is not None:
-                status["pendingWebpQuality"] = webp_quality
-                status["pendingJxlQuality"] = jxl_quality
-            else:
-                status.pop("pendingWebpQuality", None)
-                status.pop("pendingJxlQuality", None)
+            status.pop("pendingWebpQuality", None)
+            status.pop("pendingJxlQuality", None)
             status.pop("pid", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             if translation_boxno is None:
                 status.pop("pendingTranslationBoxno", None)
             else:
@@ -2969,17 +2980,11 @@ class JobManager(EditorManagerMixin):
             daemon=True,
         ).start()
 
-    def regenerate_completed_job_downloads(
-        self,
-        code: str,
-        job_id: str,
-        webp_quality: int,
-        jxl_quality: int,
-    ) -> None:
+    def generate_download(self, code: str, job_id: str, variant: str) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
-        webp_quality = validate_output_quality(webp_quality, "WebP quality")
-        jxl_quality = validate_output_quality(jxl_quality, "JXL quality")
+        if variant not in TRANSLATED_CBZ_FILENAMES:
+            raise HTTPException(status_code=404, detail="Unknown translated CBZ variant.")
         with self._lock:
             status = self.load_status(code, job_id)
             if status is None:
@@ -2989,7 +2994,7 @@ class JobManager(EditorManagerMixin):
             if status.get("status") != "complete":
                 raise HTTPException(
                     status_code=400,
-                    detail="Only complete jobs can regenerate downloads.",
+                    detail="Only complete jobs can generate downloads.",
                 )
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
@@ -2997,7 +3002,7 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
 
             try:
-                package_count = int(status.get("packageRegenerationCount", 0)) + 1
+                package_count = int(status.get("packageGenerationCount", 0)) + 1
             except (TypeError, ValueError):
                 package_count = 1
             status.update(
@@ -3006,15 +3011,19 @@ class JobManager(EditorManagerMixin):
                     "phase": "Queued",
                     "page": None,
                     "message": (
-                        "Queued to regenerate downloads "
-                        f"(WebP quality {webp_quality}, JXL quality {jxl_quality})."
+                        f"Queued to generate {variant.upper()} CBZ download."
                     ),
                     "finishedAt": None,
                     "returnCode": None,
-                    "packageRegenerationCount": package_count,
+                    "packageGenerationCount": package_count,
                     "pendingPackageOnly": True,
-                    "pendingWebpQuality": webp_quality,
-                    "pendingJxlQuality": jxl_quality,
+                    "pendingPackageVariant": variant,
+                    "pendingWebpQuality": quality_for_display(
+                        status.get("webpQuality"), self.config.default_webp_quality
+                    ),
+                    "pendingJxlQuality": quality_for_display(
+                        status.get("jxlQuality"), self.config.default_jxl_quality
+                    ),
                     "pendingResumeFrom": "package",
                     "pendingResumePage": 0,
                     "lastResumeFrom": "package",
@@ -3126,6 +3135,7 @@ class JobManager(EditorManagerMixin):
         resume_page: int | None = None,
         single_page: bool = False,
         skip_package: bool = False,
+        package_variant: str | None = None,
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
         translation_boxno: int | None = None,
@@ -3200,10 +3210,17 @@ class JobManager(EditorManagerMixin):
             command.extend(["--webp-quality", str(webp_quality)])
         if jxl_quality is not None:
             command.extend(["--jxl-quality", str(jxl_quality)])
+        if package_variant is not None:
+            if package_variant not in TRANSLATED_CBZ_FILENAMES:
+                raise HTTPException(status_code=400, detail="Unknown translated CBZ variant.")
+            command.extend(["--package-variant", package_variant])
         if resume_from is None:
             if self.status_pause_after_ocr(status):
                 command.extend(["--stop-after", "ocr_merged"])
             command.append("--overwrite")
+            # Web jobs keep rendered pages as the canonical result. Archives are
+            # generated only when a user requests a specific download.
+            command.append("--skip-package")
             return command
 
         command.extend(["--resume-from", resume_from])
@@ -3213,7 +3230,7 @@ class JobManager(EditorManagerMixin):
             command.append("--single-page")
         if translation_boxno is not None:
             command.extend(["--translation-boxno", str(translation_boxno)])
-        if skip_package:
+        if skip_package or resume_from != "package":
             command.append("--skip-package")
         return command
 
@@ -3297,12 +3314,24 @@ class JobManager(EditorManagerMixin):
 
         return return_code
 
-    def run_package_regeneration_job(
+    def run_package_generation_job(
         self,
         code: str,
         job_id: str,
         status: dict[str, Any],
     ) -> None:
+        variant = str(status.get("pendingPackageVariant") or "")
+        if variant not in TRANSLATED_CBZ_FILENAMES:
+            status.update(
+                {
+                    "status": "failed",
+                    "phase": "Failed",
+                    "message": "No valid CBZ variant was selected for generation.",
+                    "finishedAt": now_utc(),
+                }
+            )
+            self.save_status(code, job_id, status)
+            return
         webp_quality = quality_for_display(
             status.get("pendingWebpQuality"),
             self.config.default_webp_quality,
@@ -3317,10 +3346,7 @@ class JobManager(EditorManagerMixin):
                 "status": "running",
                 "phase": "Starting",
                 "page": None,
-                "message": (
-                    "Regenerating downloads "
-                    f"(WebP quality {webp_quality}, JXL quality {jxl_quality})."
-                ),
+                "message": f"Generating {variant.upper()} CBZ download.",
                 "finishedAt": None,
                 "pendingResumeFrom": "package",
                 "pendingResumePage": 0,
@@ -3340,8 +3366,9 @@ class JobManager(EditorManagerMixin):
                 0,
                 webp_quality=webp_quality,
                 jxl_quality=jxl_quality,
+                package_variant=variant,
             ),
-            "regenerate downloads",
+            f"generate {variant} download",
         )
 
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
@@ -3352,11 +3379,6 @@ class JobManager(EditorManagerMixin):
         status["webpQuality"] = webp_quality
         status["jxlQuality"] = jxl_quality
         status.pop("pid", None)
-        status.pop("pendingPackageOnly", None)
-        status.pop("pendingWebpQuality", None)
-        status.pop("pendingJxlQuality", None)
-        status.pop("pendingResumeFrom", None)
-        status.pop("pendingResumePage", None)
         status.pop("pendingTranslationBoxno", None)
         was_terminated = bool(status.pop("pendingTermination", None))
         status.pop("terminatingAt", None)
@@ -3369,26 +3391,36 @@ class JobManager(EditorManagerMixin):
                     "status": "cancelled",
                     "phase": "Cancelled",
                     "page": None,
-                    "message": "Download regeneration terminated.",
+                    "message": "Download generation terminated.",
                 }
             )
-        elif return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.translated_cbz_variant_path(code, job_id, variant).is_file():
             status.update(
                 {
                     "status": "complete",
                     "phase": "Complete",
                     "page": None,
-                    "message": "Download regeneration complete.",
+                    "message": f"{variant.upper()} CBZ download generation complete.",
                 }
             )
+            status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
+            status.pop("pendingWebpQuality", None)
+            status.pop("pendingJxlQuality", None)
+            status.pop("pendingResumeFrom", None)
+            status.pop("pendingResumePage", None)
         else:
             status.update(
                 {
                     "status": "failed",
                     "phase": "Failed",
-                    "message": f"Download regeneration failed with exit code {return_code}.",
+                    "message": f"Download generation failed with exit code {return_code}.",
                 }
             )
+            status["pendingPackageOnly"] = True
+            status["pendingPackageVariant"] = variant
+            status["pendingResumeFrom"] = "package"
+            status["pendingResumePage"] = 0
         self.save_status(code, job_id, status)
 
     def run_page_rerun_batch_job(
@@ -3433,16 +3465,12 @@ class JobManager(EditorManagerMixin):
             self.save_status(code, job_id, status)
             return
 
+        # Also enforce this invariant for callers that invoke the worker
+        # directly (for example, a recovered queued job).
+        self.invalidate_translated_cbz_archives(code, job_id)
+
         final_return_code = 0
         pages = [item["page"] for item in page_reruns]
-        package_webp_quality = quality_for_display(
-            status.get("pendingWebpQuality"),
-            quality_for_display(status.get("webpQuality"), self.config.default_webp_quality),
-        )
-        package_jxl_quality = quality_for_display(
-            status.get("pendingJxlQuality"),
-            quality_for_display(status.get("jxlQuality"), self.config.default_jxl_quality),
-        )
         translation_boxno_value = status.get("pendingTranslationBoxno")
         try:
             translation_boxno = (
@@ -3491,36 +3519,6 @@ class JobManager(EditorManagerMixin):
                 break
 
         selected_translation_only = translation_boxno is not None
-        if final_return_code == 0 and not selected_translation_only:
-            status = self.load_status(code, job_id) or status
-            status.update(
-                {
-                    "status": "running",
-                    "phase": "Package",
-                    "page": None,
-                    "message": "Packaging rerun output.",
-                    "pendingResumeFrom": "package",
-                    "pendingResumePage": 0,
-                    "lastResumeFrom": "package",
-                    "lastResumePage": 0,
-                    "pendingPackageOnly": True,
-                }
-            )
-            status.pop("pendingPageReruns", None)
-            self.save_status(code, job_id, status)
-            final_return_code = self.run_pipeline_process(
-                code,
-                job_id,
-                self.build_command(
-                    code,
-                    job_id,
-                    "package",
-                    0,
-                    webp_quality=package_webp_quality,
-                    jxl_quality=package_jxl_quality,
-                ),
-                "package rerun output",
-            )
 
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
         finished_at = datetime.now(timezone.utc)
@@ -3533,9 +3531,10 @@ class JobManager(EditorManagerMixin):
         status.pop("isPaused", None)
         status.pop("pausedAt", None)
 
+        # Selected retranslation updates translation data only. The existing
+        # rendered pages remain the valid job result until typesetting reruns.
         completed = final_return_code == 0 and (
-            selected_translation_only
-            or self.translated_cbz_path(code, job_id).is_file()
+            selected_translation_only or bool(self.final_page_files(code, job_id))
         )
         if was_terminated:
             status.update(
@@ -3559,8 +3558,6 @@ class JobManager(EditorManagerMixin):
                         [page_rerun["page"]],
                         resume_from=page_rerun["resumeFrom"],
                     )
-            status["webpQuality"] = package_webp_quality
-            status["jxlQuality"] = package_jxl_quality
             status.update(
                 {
                     "status": "complete",
@@ -3588,6 +3585,7 @@ class JobManager(EditorManagerMixin):
             status.pop("pendingResumePage", None)
             status.pop("pendingPageReruns", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
             status.pop("pendingEditorChangedPages", None)
@@ -3614,7 +3612,7 @@ class JobManager(EditorManagerMixin):
             "createdAt": now_utc(),
         }
         if status.get("pendingPackageOnly"):
-            self.run_package_regeneration_job(code, job_id, status)
+            self.run_package_generation_job(code, job_id, status)
             return
 
         pending_page_reruns = status.get("pendingPageReruns")
@@ -3681,7 +3679,7 @@ class JobManager(EditorManagerMixin):
                     "message": "Translation terminated.",
                 }
             )
-        elif return_code == 0 and self.status_pause_after_ocr(status) and not self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.status_pause_after_ocr(status) and not self.final_page_files(code, job_id):
             self.initialize_editor_v2(code, job_id)
             status.update(
                 {
@@ -3698,7 +3696,7 @@ class JobManager(EditorManagerMixin):
                     "lastResumePage": 0,
                 }
             )
-        elif return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.final_page_files(code, job_id):
             had_editor = self.has_editor_v2(code, job_id)
             self.initialize_editor_v2(code, job_id)
             if had_editor and status.get("lastResumeFrom") == "ocr_structured":
@@ -4443,24 +4441,9 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def rerun_job(request: Request, code: str, job_id: str) -> RedirectResponse:
         manager = manager_from_request(request)
         form = await request.form()
-        resume_from, package_selected = parse_rerun_job_stages(
+        resume_from = parse_rerun_job_stages(
             [str(value) for value in form.getlist("rerun_stage")]
         )
-        webp_quality = parse_quality_form(
-            str(form.get("webp_quality") or ""),
-            "WebP quality",
-            manager.config.default_webp_quality,
-        )
-        jxl_quality = parse_quality_form(
-            str(form.get("jxl_quality") or ""),
-            "JXL quality",
-            manager.config.default_jxl_quality,
-        )
-        if resume_from is None:
-            if not package_selected:
-                raise HTTPException(status_code=400, detail="Select at least one pass to rerun.")
-            manager.regenerate_completed_job_downloads(code, job_id, webp_quality, jxl_quality)
-            return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
         page_spec = str(form.get("page_spec") or "")
         manager.rerun_completed_job_pages(
@@ -4468,34 +4451,18 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             job_id,
             parse_page_selection(page_spec, allow_empty=True),
             resume_from,
-            webp_quality if package_selected else None,
-            jxl_quality if package_selected else None,
         )
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
-    @app.post("/job/{code}/{job_id}/regenerate-downloads")
-    async def regenerate_downloads(
+    @app.post("/job/{code}/{job_id}/generate-download/{variant}")
+    async def generate_download(
         request: Request,
         code: str,
         job_id: str,
-        webp_quality: str = Form(""),
-        jxl_quality: str = Form(""),
+        variant: str,
     ) -> RedirectResponse:
         manager = manager_from_request(request)
-        manager.regenerate_completed_job_downloads(
-            code,
-            job_id,
-            parse_quality_form(
-                webp_quality,
-                "WebP quality",
-                manager.config.default_webp_quality,
-            ),
-            parse_quality_form(
-                jxl_quality,
-                "JXL quality",
-                manager.config.default_jxl_quality,
-            ),
-        )
+        manager.generate_download(code, job_id, variant)
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.post("/job/{code}/{job_id}/delete")

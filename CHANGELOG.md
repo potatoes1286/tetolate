@@ -8,7 +8,8 @@
 
 ### Changed
 
-- JXL/Webp now parallelizes generation for faster gen
+- JXL/Webp now parallelizes generation for faster generation
+- cbz download now only generates after first request rather than generating them beforehand
 
 ### Fixed
 

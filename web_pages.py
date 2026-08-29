@@ -12,8 +12,6 @@ import paddle_ocr_image
 import translate_cbz
 
 
-DEFAULT_WEBP_QUALITY = translate_cbz.TRANSLATED_WEBP_QUALITY
-DEFAULT_JXL_QUALITY = translate_cbz.TRANSLATED_JXL_QUALITY
 DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKENS
 DEFAULT_PROOFREAD_TRANSLATIONS = True
 DEFAULT_WRITE_TRANSLATION_NOTES = True
@@ -29,7 +27,6 @@ UPLOAD_COMIC_ARCHIVE_ACCEPT = (
     ".cbz,.zip,application/vnd.comicbook+zip,application/zip"
 )
 OCR_MERGE_EDITOR_STAGE = "ocr_merge"
-RERUN_JOB_PACKAGE_STAGE = "package"
 UPLOAD_PAGE_IMAGE_ACCEPT = (
     ".png,.jpg,.jpeg,.webp,.jxl,.bmp,.tif,.tiff,.avif,.gif,"
     "image/png,image/jpeg,image/webp,image/jxl,image/bmp,image/tiff,image/avif,image/gif"
@@ -252,6 +249,11 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         "webp": "Download WebP CBZ",
         "jxl": "Download JXL CBZ",
     }
+    generate_labels = {
+        "png": "Generate PNG CBZ",
+        "webp": "Generate WebP CBZ",
+        "jxl": "Generate JXL CBZ",
+    }
     summary_parts: list[str] = []
     input_size = str(status.get("inputSize") or "")
     if input_size:
@@ -293,15 +295,20 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
             available = bool(item)
             size = ""
             token = ""
-        if not available:
-            continue
-        summary_label = label.removeprefix("Download ")
-        summary_parts.append(f"{summary_label}: {size}" if size else summary_label)
-        href = f"/job/{escape(code)}/{escape(job_id)}/download/{escape(variant)}"
-        if token:
-            href += f"?v={escape(token)}"
-        suffix = f" ({size})" if size else ""
-        links.append(f'<a class="button" href="{href}">{escape(label + suffix)}</a>')
+        if available:
+            summary_label = label.removeprefix("Download ")
+            summary_parts.append(f"{summary_label}: {size}" if size else summary_label)
+            href = f"/job/{escape(code)}/{escape(job_id)}/download/{escape(variant)}"
+            if token:
+                href += f"?v={escape(token)}"
+            suffix = f" ({size})" if size else ""
+            links.append(f'<a class="button" href="{href}">{escape(label + suffix)}</a>')
+        elif status.get("status") == "complete":
+            action = f"/job/{escape(code)}/{escape(job_id)}/generate-download/{escape(variant)}"
+            links.append(
+                f'<form action="{action}" method="post">'
+                f'<button type="submit">{escape(generate_labels[variant])}</button></form>'
+            )
     if status.get("canView"):
         view_url = str(status.get("viewUrl") or f"/job/{code}/{job_id}/view")
         page_count = status.get("finalPageCount")
@@ -648,8 +655,6 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     else:
         restart_target_text = f"from {restart_from} page {restart_page}"
     download_html = download_links_html(code, job_id, status)
-    webp_quality = status.get("webpQuality") or status.get("defaultWebpQuality") or DEFAULT_WEBP_QUALITY
-    jxl_quality = status.get("jxlQuality") or status.get("defaultJxlQuality") or DEFAULT_JXL_QUALITY
     thinking_budget = status.get("thinkingBudgetTokens")
     if thinking_budget is None:
         thinking_budget = status.get(
@@ -758,17 +763,14 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       <label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label>
       <label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label>
       <label><input name="rerun_stage" type="checkbox" value="render"> Render</label>
-      <label><input name="rerun_stage" type="checkbox" value="{RERUN_JOB_PACKAGE_STAGE}"> Package</label>
     </fieldset>
     <label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label>
-    <p class="muted">Leave pages empty to rerun every page. Package alone rebuilds download archives.</p>
-    <label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="{escape(webp_quality)}"></label>
-    <label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="{escape(jxl_quality)}"></label>
+    <p class="muted">Leave pages empty to rerun every page.</p>
     <button type="submit">Queue rerun</button>
   </form>
 </details>
 """
-        if status.get("canRerunPages") or status.get("canRegenerateDownloads")
+        if status.get("canRerunPages")
         else ""
     )
     edit_html = (
@@ -831,18 +833,21 @@ function restartMarkup(data) {{
 }}
 function downloadMarkup(data) {{
   const labels = {{png: "Download PNG CBZ", webp: "Download WebP CBZ", jxl: "Download JXL CBZ"}};
+  const generateLabels = {{png: "Generate PNG CBZ", webp: "Generate WebP CBZ", jxl: "Generate JXL CBZ"}};
   const downloads = data.downloads || {{}};
   const summary = [];
   if (data.inputSize) {{
     summary.push(`Original: ${{data.inputSize}}`);
   }}
   const links = Object.keys(labels)
-    .filter((variant) => {{
-      const item = downloads[variant];
-      return item && (typeof item !== "object" || item.available);
-    }})
+    .filter((variant) => data.status === "complete")
     .map((variant) => {{
       const item = downloads[variant];
+      const available = item && (typeof item !== "object" || item.available);
+      if (!available) {{
+        const action = `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download/${{variant}}`;
+        return `<form action="${{action}}" method="post"><button type="submit">${{generateLabels[variant]}}</button></form>`;
+      }}
       const size = item && typeof item === "object" && item.size ? ` (${{item.size}})` : "";
       const summaryLabel = labels[variant].replace("Download ", "");
       summary.push(size ? `${{summaryLabel}}: ${{item.size}}` : summaryLabel);
@@ -944,10 +949,8 @@ function advancedOptionsMarkup(data) {{
     </details><button type="submit">Save advanced options</button></form>`;
 }}
 function rerunJobMarkup(data) {{
-  if (!data.canRerunPages && !data.canRegenerateDownloads) return "";
-  const webpQuality = data.webpQuality ?? data.defaultWebpQuality ?? 90;
-  const jxlQuality = data.jxlQuality ?? data.defaultJxlQuality ?? 90;
-  return `<details><summary>Rerun job</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/rerun-job" method="post"><fieldset><legend>Passes</legend><label><input name="rerun_stage" type="checkbox" value="ocr_merge"> OCR &amp; Merge</label><label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structure</label><label><input name="rerun_stage" type="checkbox" value="alt_placement"> Erase &amp; Alternate Placement</label><label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label><label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label><label><input name="rerun_stage" type="checkbox" value="render"> Render</label><label><input name="rerun_stage" type="checkbox" value="package"> Package</label></fieldset><label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label><p class="muted">Leave pages empty to rerun every page. Package alone rebuilds download archives.</p><label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="${{webpQuality}}"></label><label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="${{jxlQuality}}"></label><button type="submit">Queue rerun</button></form></details>`;
+  if (!data.canRerunPages) return "";
+  return `<details><summary>Rerun job</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/rerun-job" method="post"><fieldset><legend>Passes</legend><label><input name="rerun_stage" type="checkbox" value="ocr_merge"> OCR &amp; Merge</label><label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structure</label><label><input name="rerun_stage" type="checkbox" value="alt_placement"> Erase &amp; Alternate Placement</label><label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label><label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label><label><input name="rerun_stage" type="checkbox" value="render"> Render</label></fieldset><label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label><p class="muted">Leave pages empty to rerun every page.</p><button type="submit">Queue rerun</button></form></details>`;
 }}
 function editMarkup(data) {{
   if (!data.canEdit) return "";
@@ -1050,7 +1053,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <button id="freeze-stage" type="button" data-tooltip="Protect all current values in this stage on this page. Later reruns keep them until you unprotect the stage.">Protect stage</button>
     <button id="freeze-page" type="button" data-tooltip="Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page."{complete_only}>Protect page</button>
     <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the stages after the current stage for this page. The current stage is used as input and is not regenerated."{complete_only}>Regenerate downstream</button>
-    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rebuild the downloads."{complete_only}>Regenerate all changes</button>
+    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rendered pages."{complete_only}>Regenerate all changes</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>
   </div>
