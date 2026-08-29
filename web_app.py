@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -51,6 +52,7 @@ import web_security
 from web_storage import write_json_atomic
 
 
+LOGGER = logging.getLogger(__name__)
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = translate_cbz.DATA_DIR
 DEFAULT_WEB_CONFIG = DEFAULT_DATA_DIR / "config" / "web_config.json"
@@ -90,6 +92,7 @@ WEB_CONFIG_FIELDS = {
 }
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 LOG_TAIL_BYTES = 2 * 1024 * 1024
+UPLOAD_COMIC_ARCHIVE_EXTENSIONS = {".cbz", ".zip"}
 UPLOAD_PAGE_IMAGE_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -106,6 +109,82 @@ UPLOAD_PAGE_IMAGE_ACCEPT = (
     ".png,.jpg,.jpeg,.webp,.jxl,.bmp,.tif,.tiff,.avif,.gif,"
     "image/png,image/jpeg,image/webp,image/jxl,image/bmp,image/tiff,image/avif,image/gif"
 )
+
+
+class UploadRequestTooLarge(Exception):
+    """Raised when an upload request exceeds the configured byte limit."""
+
+
+class UploadSizeLimitMiddleware:
+    """Reject oversized upload bodies before multipart parsing buffers them."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @staticmethod
+    async def _send_too_large(send: Any) -> None:
+        body = b'{"detail":"Upload request is too large."}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/upload" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        manager = getattr(getattr(self.app, "state", None), "manager", None)
+        config = getattr(manager, "config", None)
+        max_bytes = getattr(config, "max_upload_bytes", None)
+        if not isinstance(max_bytes, int) or max_bytes <= 0:
+            await self.app(scope, receive, send)
+            return
+
+        content_length = dict(scope.get("headers", [])).get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except (TypeError, ValueError):
+                declared_length = None
+            if declared_length is not None and declared_length > max_bytes:
+                await self._send_too_large(send)
+                return
+
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > max_bytes:
+                    raise UploadRequestTooLarge
+            return message
+
+        response_started = False
+
+        async def tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except UploadRequestTooLarge:
+            if not response_started:
+                await self._send_too_large(send)
+            else:
+                raise
 CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 JOB_ID_BYTES = 4
@@ -718,6 +797,55 @@ async def write_uploaded_file_to_path(
     if written == 0:
         raise HTTPException(status_code=400, detail=f"{size_label} was empty.")
     return written
+
+
+def validate_uploaded_comic_archive(path: Path, filename: str) -> None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = translate_cbz.validate_cbz_members(archive)
+            image_members = [
+                info
+                for info in members
+                if not info.is_dir() and translate_cbz.is_image_member(info.filename)
+            ]
+            if not image_members:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Comic archive must contain at least one supported image page.",
+                )
+            total_pixels = 0
+            for info in image_members:
+                try:
+                    with archive.open(info) as source, Image.open(source) as image:
+                        page_pixels = image.width * image.height
+                        if page_pixels > translate_cbz.MAX_PAGE_PIXELS:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Archive page is too large: {info.filename}",
+                            )
+                        total_pixels += page_pixels
+                        if total_pixels > translate_cbz.MAX_TOTAL_PAGE_PIXELS:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Archive image pages contain too many pixels.",
+                            )
+                        image.verify()
+                except HTTPException:
+                    raise
+                except (OSError, RuntimeError, Image.DecompressionBombError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Archive page is not a readable image: {info.filename}",
+                    ) from exc
+    except HTTPException:
+        raise
+    except translate_cbz.PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File is not a valid CBZ or ZIP archive: {filename}",
+        ) from exc
 
 
 def verify_output_png(path: Path, filename: str) -> None:
@@ -2577,7 +2705,7 @@ class JobManager(EditorManagerMixin):
                     detail="Only failed, cancelled, or paused jobs can be restarted.",
                 )
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
 
             pending_reruns = status.get("pendingPageReruns")
             first_pending = (
@@ -2700,7 +2828,7 @@ class JobManager(EditorManagerMixin):
             if status.get("status") != "complete":
                 raise HTTPException(status_code=400, detail="Only complete jobs can rerun pages.")
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
 
@@ -2864,7 +2992,7 @@ class JobManager(EditorManagerMixin):
                     detail="Only complete jobs can regenerate downloads.",
                 )
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
 
@@ -2909,7 +3037,18 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=409, detail="Job is queued or running.")
             if status.get("status") not in TERMINAL_JOB_STATUSES:
                 raise HTTPException(status_code=400, detail="Only finished jobs can be deleted from the web UI.")
-            shutil.rmtree(self.job_dir(code, job_id), ignore_errors=True)
+            try:
+                shutil.rmtree(self.job_dir(code, job_id))
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Job directory is missing.",
+                ) from None
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not delete job.",
+                ) from exc
 
     def worker_loop(self) -> None:
         while True:
@@ -3654,6 +3793,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             manager.stop()
 
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(UploadSizeLimitMiddleware)
 
     @app.middleware("http")
     async def require_admin_session(request: Request, call_next: Any) -> Any:
@@ -3856,62 +3996,80 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         if has_cbz == has_images:
             raise HTTPException(
                 status_code=400,
-                detail="Upload either one CBZ file or one or more page image files.",
+                detail="Upload one CBZ or ZIP archive, or upload one or more page images.",
             )
 
         job_id = manager.create_job_id(code)
-        manager.job_dir(code, job_id).mkdir(parents=True, exist_ok=True)
+        job_path = manager.job_dir(code, job_id)
         input_path = manager.input_path(code, job_id)
         original_filename = cbz_filename
         try:
-            if has_cbz:
-                if not cbz_filename.lower().endswith(".cbz"):
-                    raise HTTPException(status_code=400, detail="Upload must be a .cbz file.")
-                if cbz is None:
-                    raise HTTPException(status_code=400, detail="Upload must include a CBZ file.")
-                await write_uploaded_file_to_path(
-                    cbz,
-                    input_path,
-                    manager.config.max_upload_bytes,
-                    "Uploaded CBZ",
-                )
-            else:
-                _, original_filename = await write_uploaded_images_as_cbz(
-                    image_uploads,
-                    input_path,
-                    manager.config.max_upload_bytes,
-                )
-        except HTTPException:
-            input_path.unlink(missing_ok=True)
-            shutil.rmtree(manager.job_dir(code, job_id), ignore_errors=True)
-            raise
-        finally:
-            if cbz is not None:
-                await cbz.close()
-            for upload in page_images or []:
-                await upload.close()
+            job_path.mkdir(parents=True, exist_ok=True)
+            try:
+                if has_cbz:
+                    if Path(cbz_filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Comic archive must use the .cbz or .zip extension.",
+                        )
+                    if cbz is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Upload must include a CBZ or ZIP archive.",
+                        )
+                    await write_uploaded_file_to_path(
+                        cbz,
+                        input_path,
+                        manager.config.max_upload_bytes,
+                        "Uploaded archive",
+                    )
+                    await run_in_threadpool(
+                        validate_uploaded_comic_archive,
+                        input_path,
+                        cbz_filename,
+                    )
+                else:
+                    _, original_filename = await write_uploaded_images_as_cbz(
+                        image_uploads,
+                        input_path,
+                        manager.config.max_upload_bytes,
+                    )
+            finally:
+                if cbz is not None:
+                    await cbz.close()
+                for upload in page_images or []:
+                    await upload.close()
 
-        manager.submit_job(
-            code,
-            job_id,
-            original_filename,
-            translation_notes,
-            thinking_budget,
-            parsed_vlm_base_url,
-            parse_checkbox(pause_after_ocr),
-            parse_checkbox(enable_proofreading),
-            parse_checkbox(enable_translation_notes),
-            parse_checkbox(enable_alt_placement),
-            parsed_source_language,
-            parsed_ocr_engine,
-            parsed_paddleocr_vl_server_url,
-            parsed_paddleocr_vl_model,
-            parse_page_workers_form(ocr_page_workers, "OCR workers"),
-            parse_page_workers_form(lama_workers, "LaMa workers"),
-            parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
-            parse_auth_token_form(vlm_auth_token),
-            parse_auth_token_form(paddleocr_vl_auth_token),
-        )
+            manager.submit_job(
+                code,
+                job_id,
+                original_filename,
+                translation_notes,
+                thinking_budget,
+                parsed_vlm_base_url,
+                parse_checkbox(pause_after_ocr),
+                parse_checkbox(enable_proofreading),
+                parse_checkbox(enable_translation_notes),
+                parse_checkbox(enable_alt_placement),
+                parsed_source_language,
+                parsed_ocr_engine,
+                parsed_paddleocr_vl_server_url,
+                parsed_paddleocr_vl_model,
+                parse_page_workers_form(ocr_page_workers, "OCR workers"),
+                parse_page_workers_form(lama_workers, "LaMa workers"),
+                parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
+                parse_auth_token_form(vlm_auth_token),
+                parse_auth_token_form(paddleocr_vl_auth_token),
+            )
+        except Exception:
+            try:
+                shutil.rmtree(job_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOGGER.exception("Could not clean up failed upload job %s", job_path)
+            raise
+
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
@@ -4358,11 +4516,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         status = manager.load_status(code, job_id)
         input_path = manager.input_path(code, job_id)
         if status is None or not input_path.is_file():
-            raise HTTPException(status_code=404, detail="Original input CBZ is not available.")
+            raise HTTPException(status_code=404, detail="Original input archive is not available.")
+        original_suffix = (
+            ".zip"
+            if str(status.get("inputFilename") or "").lower().endswith(".zip")
+            else ".cbz"
+        )
         return FileResponse(
             input_path,
-            media_type="application/vnd.comicbook+zip",
-            filename=f"{code}_{job_id}_original.cbz",
+            media_type=(
+                "application/zip"
+                if original_suffix == ".zip"
+                else "application/vnd.comicbook+zip"
+            ),
+            filename=f"{code}_{job_id}_original{original_suffix}",
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",

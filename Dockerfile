@@ -3,9 +3,11 @@
 ARG PYTHON_VERSION=3.11
 ARG UV_VERSION=0.11.24
 ARG IMAGEMAGICK_VERSION=7.1.2-13
+ARG IMAGEMAGICK_SHA256=3617bffe497690ffe5b731227d026db1150e138ddb129481a1e202442e558512
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS imagemagick-builder
 ARG IMAGEMAGICK_VERSION
+ARG IMAGEMAGICK_SHA256
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -31,6 +33,7 @@ WORKDIR /tmp/imagemagick
 RUN curl -fsSL \
         "https://github.com/ImageMagick/ImageMagick/archive/refs/tags/${IMAGEMAGICK_VERSION}.tar.gz" \
         -o source.tar.gz \
+    && echo "${IMAGEMAGICK_SHA256}  source.tar.gz" | sha256sum -c - \
     && tar -xzf source.tar.gz --strip-components=1 \
     && ./configure \
         --prefix=/opt/imagemagick \

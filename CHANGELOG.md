@@ -1,12 +1,31 @@
 # Changelog
 
-## 0.2.0
+## 0.3.0 - Unreleased
+
+### Added
+
+- Added upload support for ZIP archives that contain comic image pages.
+
+### Changed
+
+- JXL/Webp now parallelizes generation for faster gen
+
+### Fixed
+
+- Fixed missing function in translate_cbz
+- JXL/Webp Quality now rejects fractional values
+- Imagemagick checksum added to dockerfile
+- Better rejection of oversized images
+
+
+## 0.2.0 - 2026-08-05
 
 ### Added
 
 - Added a five-stage job editor.
 - Added API key functionality to API endpoints in webui.
 - Added parallel worker controls for PaddleOCR-VL, LaMa, and ImageMagick.
+
 
 ### Changed
 

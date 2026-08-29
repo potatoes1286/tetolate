@@ -116,6 +116,22 @@ class RepositoryHygieneTests(unittest.TestCase):
             "DejaVu-Sans",
         )
 
+    def test_quality_config_rejects_fractional_values(self) -> None:
+        with self.assertRaises(translate_cbz.PipelineError):
+            translate_cbz.config_quality(
+                {"quality": 70.9}, "quality", 65, "output"
+            )
+        with self.assertRaises(translate_cbz.PipelineError):
+            translate_cbz.config_quality(
+                {"quality": "70.9"}, "quality", 65, "output"
+            )
+
+    def test_quality_config_accepts_integral_float_values(self) -> None:
+        self.assertEqual(
+            translate_cbz.config_quality({"quality": 70.0}, "quality", 65, "output"),
+            70,
+        )
+
 
 class PromptTemplateTests(unittest.TestCase):
     def test_prompt_files_are_valid_and_all_builders_render(self) -> None:
@@ -328,6 +344,188 @@ class WebAuthenticationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "unused_setting"):
                 web_app.load_web_config(config_path)
+
+    def test_delete_job_reports_directory_deletion_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "failed"})
+
+            with mock.patch(
+                "web_app.shutil.rmtree",
+                side_effect=PermissionError("permission denied"),
+            ):
+                with self.assertRaisesRegex(HTTPException, "Could not delete job") as raised:
+                    manager.delete_job("default", job_id)
+
+            self.assertEqual(raised.exception.status_code, 500)
+
+    def test_upload_removes_job_directory_when_submission_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_web_config(root)
+            manager = self.initialized_manager(root, ["default"])
+            app = web_app.create_app(config_path)
+            app.state.manager = manager
+
+            archive_bytes = io.BytesIO()
+            with zipfile.ZipFile(archive_bytes, "w") as archive:
+                image = io.BytesIO()
+                Image.new("RGB", (2, 2), "white").save(image, format="PNG")
+                archive.writestr("001.png", image.getvalue())
+
+            async def exercise_upload() -> None:
+                upload_endpoint = next(
+                    route.endpoint for route in app.routes if route.path == "/upload"
+                )
+                request = web_app.Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/upload",
+                        "raw_path": b"/upload",
+                        "scheme": "http",
+                        "query_string": b"",
+                        "headers": [],
+                        "server": ("testserver", 80),
+                        "client": ("testclient", 123),
+                        "root_path": "",
+                        "app": app,
+                    }
+                )
+                class FakeUpload:
+                    filename = "comic.cbz"
+
+                    def __init__(self, payload: bytes) -> None:
+                        self.payload = payload
+
+                    async def read(self, _size: int) -> bytes:
+                        payload, self.payload = self.payload, b""
+                        return payload
+
+                    async def close(self) -> None:
+                        return None
+
+                cbz = FakeUpload(archive_bytes.getvalue())
+                with mock.patch.object(
+                    manager,
+                    "submit_job",
+                    side_effect=RuntimeError("queue unavailable"),
+                ):
+                    async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                        return function(*args)  # type: ignore[operator]
+
+                    with mock.patch(
+                        "web_app.run_in_threadpool",
+                        side_effect=direct_run_in_threadpool,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "queue unavailable"):
+                            await upload_endpoint(
+                                request,
+                                category="default",
+                                cbz=cbz,
+                                page_images=None,
+                                translation_notes="",
+                                thinking_budget_tokens="",
+                                vlm_base_url="",
+                                pause_after_ocr=None,
+                                enable_alt_placement=None,
+                                enable_proofreading=None,
+                                enable_translation_notes=None,
+                                source_language="",
+                                ocr_engine="",
+                                paddleocr_vl_server_url="",
+                                paddleocr_vl_model="",
+                                ocr_page_workers="1",
+                                lama_workers="1",
+                                imagemagick_workers="1",
+                                vlm_auth_token="",
+                                paddleocr_vl_auth_token="",
+                            )
+
+            asyncio.run(exercise_upload())
+            self.assertEqual(list(manager.jobs_dir("default").iterdir()), [])
+
+    def test_upload_request_size_limit_rejects_declared_oversize_before_parsing(self) -> None:
+        downstream_called = False
+        sent_messages: list[dict[str, object]] = []
+
+        class Config:
+            max_upload_bytes = 3
+
+        class Manager:
+            config = Config()
+
+        async def downstream(scope: dict[str, object], receive: object, send: object) -> None:
+            nonlocal downstream_called
+            downstream_called = True
+
+        downstream.state = types.SimpleNamespace(manager=Manager())  # type: ignore[attr-defined]
+
+        async def receive() -> dict[str, object]:
+            raise AssertionError("the request body should not be read")
+
+        async def send(message: dict[str, object]) -> None:
+            sent_messages.append(message)
+
+        async def exercise() -> None:
+            middleware = web_app.UploadSizeLimitMiddleware(downstream)
+            await middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/upload",
+                    "headers": [(b"content-length", b"4")],
+                },
+                receive,
+                send,
+            )
+
+        asyncio.run(exercise())
+        self.assertFalse(downstream_called)
+        self.assertEqual(sent_messages[0]["status"], 413)
+
+    def test_upload_request_size_limit_rejects_oversize_stream(self) -> None:
+        sent_messages: list[dict[str, object]] = []
+        receive_calls = 0
+
+        class Config:
+            max_upload_bytes = 3
+
+        class Manager:
+            config = Config()
+
+        async def downstream(scope: dict[str, object], receive: object, send: object) -> None:
+            await receive()  # type: ignore[misc]
+            await receive()  # type: ignore[misc]
+
+        downstream.state = types.SimpleNamespace(manager=Manager())  # type: ignore[attr-defined]
+
+        async def receive() -> dict[str, object]:
+            nonlocal receive_calls
+            receive_calls += 1
+            return {"type": "http.request", "body": b"12", "more_body": True}
+
+        async def send(message: dict[str, object]) -> None:
+            sent_messages.append(message)
+
+        async def exercise() -> None:
+            middleware = web_app.UploadSizeLimitMiddleware(downstream)
+            await middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/upload",
+                    "headers": [],
+                },
+                receive,
+                send,
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(receive_calls, 2)
+        self.assertEqual(sent_messages[0]["status"], 413)
 
     def test_password_hash_round_trip_and_strict_parsing(self) -> None:
         encoded = web_security.hash_password("a sufficiently long password")
@@ -1210,8 +1408,106 @@ class AtomicPackagingTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), original_contents)
             self.assertEqual(list(output_dir.glob(f".{destination.name}.*.tmp")), [])
 
+    def test_packaging_converts_pages_in_parallel_and_validates_source_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            final_dir = translate_cbz.final_pages_dir(output_dir)
+            final_dir.mkdir(parents=True)
+            pages = []
+            for index in range(4):
+                page = translate_cbz.Page(index=index, image_path=Path(f"page-{index}.png"))
+                pages.append(page)
+                translate_cbz.final_page_png_path(output_dir, page).write_bytes(
+                    f"page {index}".encode()
+                )
+
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+                archive.writestr("ComicInfo.xml", b"<ComicInfo />")
+
+            fixture_dir = root / "fixtures"
+            fixture_dir.mkdir()
+            config = replace(
+                translate_cbz.load_config(None, fixture_dir),
+                imagemagick_workers=2,
+            )
+            barrier = threading.Barrier(2)
+
+            def convert(source: Path, destination: Path, _quality: int) -> None:
+                barrier.wait(timeout=2)
+                destination.write_bytes(source.read_bytes())
+
+            with (
+                mock.patch.object(
+                    translate_cbz,
+                    "convert_final_page_with_magick",
+                    side_effect=convert,
+                ),
+                mock.patch.object(
+                    translate_cbz,
+                    "validate_cbz_members",
+                    wraps=translate_cbz.validate_cbz_members,
+                ) as validate_members,
+                mock.patch("sys.stderr"),
+            ):
+                translate_cbz.print_packaged_cbz(pages, output_dir, input_cbz, config)
+
+            validate_members.assert_called_once()
+            for archive_path in (
+                translate_cbz.translated_cbz_path(output_dir),
+                translate_cbz.translated_webp_cbz_path(output_dir),
+                translate_cbz.translated_jxl_cbz_path(output_dir),
+            ):
+                with zipfile.ZipFile(archive_path) as archive:
+                    self.assertEqual(archive.read("ComicInfo.xml"), b"<ComicInfo />")
+                    self.assertEqual(
+                        archive.namelist()[:4],
+                        ["page-0.jpg", "page-1.webp", "page-2.webp", "page-3.webp"]
+                        if archive_path == translate_cbz.translated_webp_cbz_path(output_dir)
+                        else (
+                            ["page-0.jpg", "page-1.jxl", "page-2.jxl", "page-3.jxl"]
+                            if archive_path == translate_cbz.translated_jxl_cbz_path(output_dir)
+                            else ["page-0.png", "page-1.png", "page-2.png", "page-3.png"]
+                        ),
+                    )
+
 
 class ArchiveSafetyTests(unittest.TestCase):
+    def test_web_upload_accepts_zip_with_images_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "comic.zip"
+            image_data = io.BytesIO()
+            Image.new("RGB", (2, 2), "white").save(image_data, format="PNG")
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("pages/001.png", image_data.getvalue())
+                archive.writestr("ComicInfo.xml", "<ComicInfo />")
+
+            web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_upload_rejects_zip_without_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "metadata.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("ComicInfo.xml", "<ComicInfo />")
+
+            with self.assertRaisesRegex(HTTPException, "at least one supported image"):
+                web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_upload_rejects_zip_with_invalid_image_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "invalid-image.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("001.png", b"not an image")
+
+            with self.assertRaisesRegex(HTTPException, "not a readable image"):
+                web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_file_selector_accepts_cbz_and_zip(self) -> None:
+        self.assertIn(".cbz", web_pages.UPLOAD_COMIC_ARCHIVE_ACCEPT)
+        self.assertIn(".zip", web_pages.UPLOAD_COMIC_ARCHIVE_ACCEPT)
+
     def test_extraction_rejects_unsafe_member_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1809,6 +2105,18 @@ class OpenPlacementLabelTests(unittest.TestCase):
         self.assertEqual(placements[0]["boxno"], 7)
         self.assertEqual(placements[0]["box_2d"], [100, 200, 300, 400])
 
+    def test_expansion_placement_region_is_clipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            expansions = translate_cbz.validate_expansions_page(
+                translate_cbz.Page(0, image_path),
+                [{"boxno": 3, "openLettering": False}],
+                [{"label": 3, "placementRegion": [-10, -5, 120, 100]}],
+            )
+
+        self.assertEqual(expansions[0]["placementRegion"], [0, 0, 100, 80])
+
 
 class PlacementRayTests(unittest.TestCase):
     def test_ray_stopping_at_the_actual_image_edge_is_a_boundary(self) -> None:
@@ -2099,6 +2407,20 @@ class OriginalInputUiTests(unittest.TestCase):
         self.assertIn("View original (7 pages)", markup)
         self.assertIn("Download original CBZ (12.3 MB)", markup)
         self.assertIn("download-original?v=123-456", markup)
+
+    def test_original_zip_download_uses_zip_label(self) -> None:
+        markup = web_pages.download_links_html(
+            "category",
+            "abc12345",
+            {
+                "downloads": {},
+                "inputFilename": "comic.zip",
+                "hasOriginalDownload": True,
+                "originalDownloadUrl": "/job/category/abc12345/download-original",
+            },
+        )
+
+        self.assertIn("Download original ZIP", markup)
 
     def test_original_viewer_uses_original_image_routes(self) -> None:
         response = web_app.job_viewer_page(

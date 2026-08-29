@@ -35,6 +35,7 @@ from ocr_merge import (
 import overlay_text
 import paddle_ocr_image
 from placement_detection import (
+    clip_region_values,
     detect_expansions_page,
     dominant_text_container_brightness,
     expand_region,
@@ -607,10 +608,25 @@ def config_quality(data: dict[str, Any], key: str, default: int, label: str) -> 
     value = data.get(key, default)
     if isinstance(value, bool):
         raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.")
-    try:
+    if isinstance(value, int):
+        quality = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise PipelineError(
+                f"Config field {label}.{key} must be an integer from 1 to 100."
+            )
         quality = int(value)
-    except (TypeError, ValueError) as exc:
-        raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.") from exc
+    elif isinstance(value, str):
+        try:
+            quality = int(value.strip())
+        except ValueError as exc:
+            raise PipelineError(
+                f"Config field {label}.{key} must be an integer from 1 to 100."
+            ) from exc
+    else:
+        raise PipelineError(
+            f"Config field {label}.{key} must be an integer from 1 to 100."
+        )
     if quality < 1 or quality > 100:
         raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.")
     return quality
@@ -4224,26 +4240,40 @@ def write_preserved_non_image_members(
     archive: zipfile.ZipFile,
     input_cbz: Path,
     written_names: set[str],
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
 ) -> None:
-    try:
-        with zipfile.ZipFile(input_cbz) as source_archive:
+    def copy_members(
+        source: zipfile.ZipFile,
+        members: list[zipfile.ZipInfo],
+    ) -> None:
+        archive.comment = source.comment
+        for info in members:
+            if not is_preserved_non_image_member(info):
+                continue
+            if info.filename in written_names:
+                print(
+                    f"warning: skipping original non-image entry that conflicts with output: {info.filename}",
+                    file=sys.stderr,
+                )
+                continue
+            with source.open(info) as source_file, archive.open(
+                copy_zipinfo_for_deflated_write(info),
+                "w",
+            ) as destination:
+                shutil.copyfileobj(source_file, destination, length=1024 * 1024)
+            written_names.add(info.filename)
+
+    if source_archive is not None:
+        if source_members is None:
             source_members = validate_cbz_members(source_archive)
-            archive.comment = source_archive.comment
-            for info in source_members:
-                if not is_preserved_non_image_member(info):
-                    continue
-                if info.filename in written_names:
-                    print(
-                        f"warning: skipping original non-image entry that conflicts with output: {info.filename}",
-                        file=sys.stderr,
-                    )
-                    continue
-                with source_archive.open(info) as source, archive.open(
-                    copy_zipinfo_for_deflated_write(info),
-                    "w",
-                ) as destination:
-                    shutil.copyfileobj(source, destination, length=1024 * 1024)
-                written_names.add(info.filename)
+        copy_members(source_archive, source_members)
+        return
+
+    try:
+        with zipfile.ZipFile(input_cbz) as source:
+            copy_members(source, validate_cbz_members(source))
     except zipfile.BadZipFile as exc:
         raise PipelineError(f"Input file is not a valid CBZ/zip: {input_cbz}") from exc
 
@@ -4263,7 +4293,14 @@ def temporary_archive_path(destination: Path) -> Path:
         return Path(file.name)
 
 
-def package_cbz(pages: list[Page], output_dir: Path, input_cbz: Path) -> Path:
+def package_cbz(
+    pages: list[Page],
+    output_dir: Path,
+    input_cbz: Path,
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
+) -> Path:
     cbz_path = translated_cbz_path(output_dir)
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
     temp_cbz_path = temporary_archive_path(cbz_path)
@@ -4277,7 +4314,13 @@ def package_cbz(pages: list[Page], output_dir: Path, input_cbz: Path) -> Path:
                 archive.write(image_path, arcname=image_path.name)
                 written_names.add(image_path.name)
 
-            write_preserved_non_image_members(archive, input_cbz, written_names)
+            write_preserved_non_image_members(
+                archive,
+                input_cbz,
+                written_names,
+                source_archive=source_archive,
+                source_members=source_members,
+            )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
     finally:
@@ -4324,6 +4367,10 @@ def package_converted_cbz(
     cbz_path: Path,
     suffix: str,
     quality: int,
+    imagemagick_workers: int = DEFAULT_IMAGEMAGICK_WORKERS,
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
 ) -> Path:
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
     temp_cbz_path = temporary_archive_path(cbz_path)
@@ -4334,18 +4381,45 @@ def package_converted_cbz(
             temp_dir = Path(temp_dir_name)
             with zipfile.ZipFile(temp_cbz_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 written_names: set[str] = set()
+                conversion_jobs: list[tuple[Page, Path]] = []
                 for page in pages:
                     source_path = final_page_png_path(output_dir, page)
                     if not source_path.exists():
                         raise PipelineError(f"Final page image missing: {source_path}")
                     page_suffix = TRANSLATED_ALT_COVER_SUFFIX if page.index == 0 else suffix
                     converted_path = temp_dir / f"{page.image_path.stem}{page_suffix}"
-                    convert_final_page_with_magick(source_path, converted_path, quality)
-                    archive.write(converted_path, arcname=converted_path.name)
-                    written_names.add(converted_path.name)
-                    converted_path.unlink()
+                    conversion_jobs.append((page, converted_path))
 
-                write_preserved_non_image_members(archive, input_cbz, written_names)
+                if conversion_jobs:
+                    with ThreadPoolExecutor(
+                        max_workers=min(imagemagick_workers, len(conversion_jobs)),
+                        thread_name_prefix="tetolate-imagemagick-package",
+                    ) as executor:
+                        futures = [
+                            executor.submit(
+                                convert_final_page_with_magick,
+                                final_page_png_path(output_dir, page),
+                                converted_path,
+                                quality,
+                            )
+                            for page, converted_path in conversion_jobs
+                        ]
+                        for future, (_page, converted_path) in zip(
+                            futures,
+                            conversion_jobs,
+                        ):
+                            future.result()
+                            archive.write(converted_path, arcname=converted_path.name)
+                            written_names.add(converted_path.name)
+                            converted_path.unlink()
+
+                write_preserved_non_image_members(
+                    archive,
+                    input_cbz,
+                    written_names,
+                    source_archive=source_archive,
+                    source_members=source_members,
+                )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
     finally:
@@ -4359,27 +4433,41 @@ def print_packaged_cbz(
     input_cbz: Path,
     config: PipelineConfig,
 ) -> None:
-    cbz_path = package_cbz(pages, output_dir, input_cbz)
-    print(f"Wrote {cbz_path}", file=sys.stderr)
-    for variant_path, suffix, quality, label in (
-        (translated_webp_cbz_path(output_dir), ".webp", config.webp_quality, "WebP"),
-        (translated_jxl_cbz_path(output_dir), ".jxl", config.jxl_quality, "JXL"),
-    ):
-        try:
-            written_path = package_converted_cbz(
+    try:
+        with zipfile.ZipFile(input_cbz) as source_archive:
+            source_members = validate_cbz_members(source_archive)
+            cbz_path = package_cbz(
                 pages,
                 output_dir,
                 input_cbz,
-                variant_path,
-                suffix,
-                quality,
+                source_archive=source_archive,
+                source_members=source_members,
             )
-        except PipelineError as exc:
-            if variant_path.exists():
-                variant_path.unlink()
-            print(f"warning: skipped {label} CBZ output: {exc}", file=sys.stderr)
-            continue
-        print(f"Wrote {written_path}", file=sys.stderr)
+            print(f"Wrote {cbz_path}", file=sys.stderr)
+            for variant_path, suffix, quality, label in (
+                (translated_webp_cbz_path(output_dir), ".webp", config.webp_quality, "WebP"),
+                (translated_jxl_cbz_path(output_dir), ".jxl", config.jxl_quality, "JXL"),
+            ):
+                try:
+                    written_path = package_converted_cbz(
+                        pages,
+                        output_dir,
+                        input_cbz,
+                        variant_path,
+                        suffix,
+                        quality,
+                        config.imagemagick_workers,
+                        source_archive=source_archive,
+                        source_members=source_members,
+                    )
+                except PipelineError as exc:
+                    if variant_path.exists():
+                        variant_path.unlink()
+                    print(f"warning: skipped {label} CBZ output: {exc}", file=sys.stderr)
+                    continue
+                print(f"Wrote {written_path}", file=sys.stderr)
+    except zipfile.BadZipFile as exc:
+        raise PipelineError(f"Input file is not a valid CBZ/zip: {input_cbz}") from exc
 
 
 

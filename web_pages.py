@@ -25,6 +25,9 @@ DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
 DEFAULT_OCR_PAGE_WORKERS = translate_cbz.DEFAULT_OCR_PAGE_WORKERS
 DEFAULT_LAMA_WORKERS = translate_cbz.DEFAULT_LAMA_WORKERS
 DEFAULT_IMAGEMAGICK_WORKERS = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS
+UPLOAD_COMIC_ARCHIVE_ACCEPT = (
+    ".cbz,.zip,application/vnd.comicbook+zip,application/zip"
+)
 OCR_MERGE_EDITOR_STAGE = "ocr_merge"
 RERUN_JOB_PACKAGE_STAGE = "package"
 UPLOAD_PAGE_IMAGE_ACCEPT = (
@@ -272,8 +275,13 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         if token:
             href += f"?v={escape(token)}"
         suffix = f" ({input_size})" if input_size else ""
+        archive_type = (
+            "ZIP"
+            if str(status.get("inputFilename") or "").lower().endswith(".zip")
+            else "CBZ"
+        )
         original_links.append(
-            f'<a class="button" href="{escape(href)}">Download original CBZ{escape(suffix)}</a>'
+            f'<a class="button" href="{escape(href)}">Download original {archive_type}{escape(suffix)}</a>'
         )
     for variant, label in labels.items():
         item = downloads.get(variant)
@@ -598,9 +606,9 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
 <p><a href="/admin">Admin</a></p>
 <form action="/upload" method="post" enctype="multipart/form-data">
   <input name="category" type="hidden" value="{escape(code)}">
-  <label>CBZ file<br><input name="cbz" type="file" accept=".cbz,application/zip"></label>
+  <label>CBZ or ZIP archive<br><input name="cbz" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}"></label>
   <label>Page image files<br><input name="page_images" type="file" accept="{UPLOAD_PAGE_IMAGE_ACCEPT}" multiple></label>
-  <p class="muted">Upload either one CBZ or multiple image pages. Images use the picker/upload order and are converted to PNG internally.</p>
+  <p class="muted">Upload one CBZ or ZIP archive, or upload multiple image pages. A ZIP archive must contain image pages and can contain metadata. Separate images use the picker order and are converted to PNG.</p>
   {advanced_options_fields(
       default_thinking_budget_tokens,
       default_vlm_base_url,
@@ -851,7 +859,8 @@ function downloadMarkup(data) {{
     const inputSize = data.inputSize ? ` (${{data.inputSize}})` : "";
     const token = data.inputDownloadToken ? `?v=${{encodeURIComponent(data.inputDownloadToken)}}` : "";
     const url = data.originalDownloadUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/download-original`;
-    links.unshift(`<a class="button" href="${{url}}${{token}}">Download original CBZ${{inputSize}}</a>`);
+    const archiveType = String(data.inputFilename || "").toLowerCase().endsWith(".zip") ? "ZIP" : "CBZ";
+    links.unshift(`<a class="button" href="${{url}}${{token}}">Download original ${{archiveType}}${{inputSize}}</a>`);
   }}
   if (data.canViewOriginal) {{
     const viewUrl = data.originalViewUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/view-original`;

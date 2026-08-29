@@ -10,7 +10,7 @@ THIS IS NOT REAL TIME TRANSLATION SOFTWARE. With a 3090, Gemma 4 31B, I see abou
 
 ## Features
 
-Translates a .cbz or a collection of images to an English .cbz.
+Translates a `.cbz`, a CBZ-style `.zip`, or a collection of images to an English `.cbz`.
 
 Web UI to upload, view jobs, and download from.
 
@@ -36,7 +36,7 @@ placement, and rendered previews. Protected edits survive later model passes.
 
 - Docker or Podman
 - An OpenAI-compatible vision-language model endpoint -- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
-- If using PaddleOCR-VL 1.6 (recommended) 1+ gb of free RAM
+- If using PaddleOCR-VL 1.6 (recommended) 10+ gb of free RAM
 - font files for text -- recommended ones are listed in [the font config's readme](data/fonts/README.md), but it is up to you to obtain them or get alternatives from google fonts or wherever
 
 Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
@@ -98,7 +98,7 @@ Stopping the containers does not delete jobs or caches.
 - Log in with admin password.
 - Change the password from the auto-generated one once inside.
 - Create a new category (no relation between jobs in the same category, they are just there to organize).
-- Choose a cbz or list of images.
+- Choose a CBZ archive, a ZIP archive that contains image pages, or a list of images.
 - Under advanced options, set translation notes, optional passes, source language, OCR engine, endpoints, thinking tokens, and page worker counts, then submit the job.
 - Wait. (models will be downloaded on your first run, be warned!)
 - Download your cbz archive or view in browser.
