@@ -39,6 +39,96 @@ TERMINATE_JOB_CONFIRM = (
     "Terminate this running job? The local VLM request stream will be closed, "
     "but external providers may handle cancellation differently."
 )
+VLM_CONNECTION_TEST_SCRIPT = """
+<script>
+let loadedVlmModels = [];
+function htmlEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+function vlmModelOptions(selected) {
+  const models = [...new Set([...loadedVlmModels, selected].filter((model) => typeof model === "string" && model))];
+  if (!models.length) return '<option value="" selected>Choose a model after testing</option>';
+  const placeholder = selected ? "" : '<option value="" selected>Choose a model</option>';
+  return placeholder + models.map((model) => `<option value="${htmlEscape(model)}"${model === selected ? " selected" : ""}>${htmlEscape(model)}</option>`).join("");
+}
+function vlmTestMessage(body, fallback) {
+  if (body && typeof body.message === "string") return body.message;
+  if (body && typeof body.detail === "string") return body.detail;
+  return fallback;
+}
+async function testVlmConnection(button) {
+  const form = button.closest("form");
+  if (!form) return;
+  const endpoint = form.elements.vlm_base_url;
+  const token = form.elements.vlm_auth_token;
+  const modelSelect = form.elements.vlm_model;
+  const status = form.querySelector("[data-vlm-test-status]");
+  if (!endpoint || !modelSelect || !status) return;
+  const payload = {vlmBaseUrl: endpoint.value};
+  if (token && token.value) payload.vlmAuthToken = token.value;
+  const category = button.dataset.vlmTestCategory || form.elements.category?.value;
+  const testJobId = button.dataset.vlmTestJobId;
+  if (category) payload.category = category;
+  if (testJobId) payload.jobId = testJobId;
+  status.textContent = "Testing connection...";
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/vlm/test", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    let body = null;
+    try { body = await response.json(); } catch {}
+    if (!response.ok || !body || !body.ok) {
+      throw new Error(vlmTestMessage(body, `Connection test failed (${response.status}).`));
+    }
+    const selected = modelSelect.value;
+    loadedVlmModels = [...new Set((Array.isArray(body.models) ? body.models : [])
+      .filter((model) => typeof model === "string" && model))];
+    modelSelect.replaceChildren();
+    if (!selected) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Choose a model";
+      option.selected = true;
+      modelSelect.append(option);
+    }
+    for (const model of [...new Set([...loadedVlmModels, selected].filter(Boolean))]) {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      option.selected = model === selected;
+      modelSelect.append(option);
+    }
+    if (!modelSelect.options.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Choose a model after testing";
+      option.selected = true;
+      modelSelect.append(option);
+    }
+    status.textContent = `Connected. Found ${loadedVlmModels.length} model(s).`;
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".vlm-test-button");
+  if (!button) return;
+  event.preventDefault();
+  void testVlmConnection(button);
+});
+</script>
+"""
 
 
 def escape(value: Any) -> str:
@@ -424,6 +514,14 @@ def source_language_options(selected: str) -> str:
     return "\n".join(options)
 
 
+def vlm_model_options(selected: str) -> str:
+    """Return the current VLM model as the initial selectable option."""
+    if selected:
+        escaped = escape(selected)
+        return f'<option value="{escaped}" selected>{escaped}</option>'
+    return '<option value="" selected>Choose a model after testing</option>'
+
+
 def advanced_options_fields(
     thinking_budget_tokens: Any,
     vlm_base_url: str,
@@ -444,6 +542,9 @@ def advanced_options_fields(
     imagemagick_workers: int = DEFAULT_IMAGEMAGICK_WORKERS,
     has_vlm_auth_token: bool = False,
     has_paddleocr_vl_auth_token: bool = False,
+    vlm_model: str = "",
+    test_category: str = "",
+    test_job_id: str = "",
 ) -> str:
     try:
         budget = _thinking_budget(thinking_budget_tokens)
@@ -526,6 +627,11 @@ def advanced_options_fields(
     <label>Auth token<br><input name="vlm_auth_token" type="password" value="" autocomplete="new-password"></label>
     <p class="muted">{escape(vlm_token_hint)}</p>
     {clear_vlm_html}
+    <label>Model<br><select name="vlm_model" required>
+      {vlm_model_options(vlm_model)}
+    </select></label>
+    <button class="vlm-test-button" type="button" data-vlm-test-category="{escape(test_category)}" data-vlm-test-job-id="{escape(test_job_id)}">Test connection and load models</button>
+    <p class="muted" data-vlm-test-status aria-live="polite"></p>
     <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="{escape(budget)}"></label>
     <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
   </fieldset>
@@ -541,6 +647,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         DEFAULT_THINKING_BUDGET_TOKENS,
     )
     default_vlm_base_url = str(data.get("defaultVlmBaseUrl") or "")
+    default_vlm_model = str(data.get("defaultVlmModel") or "")
     pause_after_ocr = bool(data.get("pauseAfterOcr", False))
     proofread_translations = bool(
         data.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -632,9 +739,12 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
       ocr_page_workers=default_ocr_page_workers,
       lama_workers=default_lama_workers,
       imagemagick_workers=default_imagemagick_workers,
+      vlm_model=default_vlm_model,
+      test_category=code,
   )}
   <button type="submit">Queue new job</button>
 </form>
+{VLM_CONNECTION_TEST_SCRIPT}
 <h2>Jobs</h2>
 {jobs_html}
 """,
@@ -666,6 +776,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
         or status.get("defaultVlmBaseUrl")
         or ""
     )
+    vlm_model = str(status.get("vlmModel") or status.get("defaultVlmModel") or "")
     pause_after_ocr = bool(status.get("pauseAfterOcr"))
     proofread_translations = bool(
         status.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -715,6 +826,9 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       imagemagick_workers=imagemagick_workers,
       has_vlm_auth_token=bool(status.get("hasVlmAuthToken")),
       has_paddleocr_vl_auth_token=bool(status.get("hasPaddleocrVlAuthToken")),
+      vlm_model=vlm_model,
+      test_category=code,
+      test_job_id=job_id,
   )}
   <button type="submit">Save advanced options</button>
 </form>
@@ -805,6 +919,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 <div id="delete">{delete_html}</div>
 <h2>Recent Log</h2>
 <pre id="log" class="job-log">{escape(log_text)}</pre>
+{VLM_CONNECTION_TEST_SCRIPT}
 <script>
 const code = {json.dumps(code)};
 const jobId = {json.dumps(job_id)};
@@ -888,6 +1003,7 @@ function advancedOptionsMarkup(data) {{
   if (!data.canUpdateAdvancedOptions) return "";
   const thinkingBudget = data.thinkingBudgetTokens ?? data.defaultThinkingBudgetTokens ?? 2048;
   const vlmBaseUrl = htmlEscape(data.vlmBaseUrl || data.defaultVlmBaseUrl || "");
+  const vlmModel = data.vlmModel || data.defaultVlmModel || "";
   const pauseChecked = data.pauseAfterOcr ? " checked" : "";
   const proofreadChecked = data.proofreadTranslations ? " checked" : "";
   const notesChecked = data.writeTranslationNotes ? " checked" : "";
@@ -943,6 +1059,9 @@ function advancedOptionsMarkup(data) {{
         <label>Endpoint<br><input name="vlm_base_url" type="url" value="${{vlmBaseUrl}}" required></label>
         <label>Auth token<br><input name="vlm_auth_token" type="password" value="" autocomplete="new-password"></label>
         <p class="muted">${{vlmTokenHint}}</p>${{clearVlm}}
+        <label>Model<br><select name="vlm_model" required>${{vlmModelOptions(vlmModel)}}</select></label>
+        <button class="vlm-test-button" type="button" data-vlm-test-category="${{htmlEscape(code)}}" data-vlm-test-job-id="${{htmlEscape(jobId)}}">Test connection and load models</button>
+        <p class="muted" data-vlm-test-status aria-live="polite"></p>
         <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label>
         <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
       </fieldset>
@@ -980,7 +1099,12 @@ async function refreshStatus() {{
   document.getElementById("download").innerHTML = downloadMarkup(data);
   document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
   if (!(previousStatus === "complete" && data.status === "complete")) {{
-    document.getElementById("advanced-options").innerHTML = advancedOptionsMarkup(data);
+    const advancedOptions = document.getElementById("advanced-options");
+    if (!data.canUpdateAdvancedOptions) {{
+      advancedOptions.innerHTML = "";
+    }} else if (!advancedOptions.querySelector("form")) {{
+      advancedOptions.innerHTML = advancedOptionsMarkup(data);
+    }}
     document.getElementById("restart").innerHTML = restartMarkup(data);
     document.getElementById("terminate").innerHTML = terminateMarkup(data);
     document.getElementById("edit").innerHTML = editMarkup(data);

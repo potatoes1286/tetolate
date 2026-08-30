@@ -331,6 +331,21 @@ def normalize_vlm_base_url(value: Any, label: str = "VLM base URL") -> str:
     return endpoint
 
 
+def normalize_vlm_model(value: Any, label: str = "VLM model") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineError(f"{label} must be a non-empty model ID.")
+    return value.strip()
+
+
+def apply_vlm_model_override(config: PipelineConfig, value: Any) -> PipelineConfig:
+    if config.vlm is None:
+        raise PipelineError("--vlm-model requires a VLM config.")
+    return replace(
+        config,
+        vlm=replace(config.vlm, model=normalize_vlm_model(value, "--vlm-model")),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Translate a manga/manhwa/manhua CBZ using OCR, a VLM, LaMa, and ImageMagick.",
@@ -431,6 +446,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vlm-base-url",
         help="Override the OpenAI-compatible VLM base URL from the config.",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        help="Override the VLM model ID from the config.",
     )
     parser.add_argument(
         "--vlm-api-key",
@@ -765,7 +784,7 @@ def load_config(path: Path | None, fixture_dir: Path | None) -> PipelineConfig:
         vlm = VLMConfig(
             base_url=base_url,
             api_key=str(data.get("api_key", "not-needed")),
-            model=model_value or None,
+            model=(model_value.strip() or None) if isinstance(model_value, str) else None,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking_budget_tokens=thinking_budget_tokens,
@@ -5163,6 +5182,8 @@ def main() -> int:
                     base_url=normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url"),
                 ),
             )
+        if args.vlm_model is not None:
+            config = apply_vlm_model_override(config, args.vlm_model)
         vlm_api_key = args.vlm_api_key
         if vlm_api_key is None:
             vlm_api_key = os.environ.get("TETOLATE_VLM_API_KEY")

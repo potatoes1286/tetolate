@@ -10,6 +10,7 @@
 
 - JXL/Webp now parallelizes generation for faster generation
 - cbz download now only generates after first request rather than generating them beforehand
+- Added model selection to VLM endpoint settings
 
 ### Fixed
 

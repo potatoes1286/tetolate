@@ -29,6 +29,7 @@ import paddle_ocr_server
 import placement_detection
 import prompt_templates
 import translate_cbz
+import vlm_client
 import web_app
 import web_pages
 import web_security
@@ -131,6 +132,84 @@ class RepositoryHygieneTests(unittest.TestCase):
             translate_cbz.config_quality({"quality": 70.0}, "quality", 65, "output"),
             70,
         )
+
+
+class VLMModelDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def vlm_config(model: str | None = None) -> translate_cbz.VLMConfig:
+        return translate_cbz.VLMConfig(
+            base_url="http://vlm.example/v1",
+            api_key="not-needed",
+            model=model,
+            temperature=0.7,
+            max_tokens=1024,
+            thinking_budget_tokens=0,
+            timeout=30,
+            provider=None,
+        )
+
+    def test_list_vlm_model_ids_deduplicates_and_closes_client(self) -> None:
+        client = mock.Mock()
+        client.models.list.return_value = types.SimpleNamespace(
+            data=[
+                types.SimpleNamespace(id="first"),
+                {"id": "second"},
+                types.SimpleNamespace(id="first"),
+                types.SimpleNamespace(id="  third  "),
+                types.SimpleNamespace(id=""),
+            ]
+        )
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            result = vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        self.assertEqual(result, ["first", "second", "third"])
+        client.models.list.assert_called_once_with()
+        client.close.assert_called_once_with()
+
+    def test_list_vlm_model_ids_raises_safe_error_and_closes_client(self) -> None:
+        client = mock.Mock()
+        client.models.list.side_effect = RuntimeError("connection refused: secret-token")
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            with self.assertRaisesRegex(vlm_client.PipelineError, "Could not list VLM models") as raised:
+                vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        client.close.assert_called_once_with()
+
+    def test_list_vlm_model_ids_rejects_empty_results(self) -> None:
+        client = mock.Mock()
+        client.models.list.return_value = types.SimpleNamespace(data=[])
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            with self.assertRaisesRegex(vlm_client.PipelineError, "No VLM models"):
+                vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        client.close.assert_called_once_with()
+
+    def test_vlm_model_override_avoids_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "vlm_config.json"
+            config_path.write_text(
+                json.dumps({"base_url": "http://vlm.example/v1"}), encoding="utf-8"
+            )
+            config = translate_cbz.load_config(config_path, None)
+
+        overridden = translate_cbz.apply_vlm_model_override(config, " selected-model ")
+        assert overridden.vlm is not None
+        with mock.patch.object(vlm_client, "list_vlm_model_ids") as list_models:
+            self.assertEqual(vlm_client.resolve_vlm_model(overridden.vlm), "selected-model")
+
+        list_models.assert_not_called()
+
+    def test_vlm_model_override_requires_a_nonempty_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "vlm_config.json"
+            config_path.write_text(
+                json.dumps({"base_url": "http://vlm.example/v1"}), encoding="utf-8"
+            )
+            config = translate_cbz.load_config(config_path, None)
+
+        with self.assertRaisesRegex(translate_cbz.PipelineError, "non-empty model ID"):
+            translate_cbz.apply_vlm_model_override(config, "   ")
 
 
 class PromptTemplateTests(unittest.TestCase):
@@ -305,10 +384,14 @@ class WebAuthenticationTests(unittest.TestCase):
             "jobs_dir": str(root / "jobs"),
             "max_upload_bytes": 1024 * 1024,
         }
+        pipeline_data = json.loads(
+            (repo_dir / "data" / "config" / "vlm_config.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        pipeline_data["model"] = "test-vlm-model"
         (root / "vlm_config.json").write_text(
-            (
-                repo_dir / "data" / "config" / "vlm_config.example.json"
-            ).read_text(encoding="utf-8"),
+            json.dumps(pipeline_data),
             encoding="utf-8",
         )
         path = root / "web_config.json"
@@ -429,6 +512,7 @@ class WebAuthenticationTests(unittest.TestCase):
                                 translation_notes="",
                                 thinking_budget_tokens="",
                                 vlm_base_url="",
+                                vlm_model="vision-model",
                                 pause_after_ocr=None,
                                 enable_alt_placement=None,
                                 enable_proofreading=None,
@@ -632,6 +716,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 "default",
                 thinking_budget_tokens=256,
                 vlm_base_url=endpoint,
+                vlm_model="vision-model",
                 pause_after_ocr=False,
                 proofread_translations=True,
                 write_translation_notes=True,
@@ -651,6 +736,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 {
                     "status": "failed",
                     "vlmBaseUrl": endpoint,
+                    "vlmModel": "vision-model",
                 },
             )
             command = manager.build_command("default", job_id)
@@ -738,6 +824,175 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertIn('name="clear_vlm_auth_token"', markup)
         self.assertNotIn("test-vlm-token", markup)
         self.assertNotIn("test-ocr-token", markup)
+
+    def test_advanced_options_include_vlm_model_selection_and_connection_test(self) -> None:
+        markup = web_pages.advanced_options_fields(
+            2048,
+            "http://127.0.0.1:8080/v1",
+            vlm_model="example-vlm",
+            test_category="manga",
+            test_job_id="12345678",
+        )
+
+        self.assertIn('<select name="vlm_model" required>', markup)
+        self.assertIn('<option value="example-vlm" selected>example-vlm</option>', markup)
+        self.assertIn('class="vlm-test-button" type="button"', markup)
+        self.assertIn('data-vlm-test-category="manga"', markup)
+        self.assertIn('data-vlm-test-job-id="12345678"', markup)
+        self.assertIn("Test connection and load models", markup)
+        self.assertIn("data-vlm-test-status", markup)
+
+        category_body = web_pages.category_jobs_page(
+            "manga",
+            {"jobs": [], "defaultVlmModel": "example-vlm"},
+        ).body.decode("utf-8")
+        self.assertIn('<option value="example-vlm" selected>example-vlm</option>', category_body)
+        self.assertIn('data-vlm-test-category="manga"', category_body)
+        self.assertIn('fetch("/api/vlm/test"', category_body)
+
+        job_body = web_pages.job_page(
+            "manga",
+            "12345678",
+            {
+                "status": "failed",
+                "recentLog": [],
+                "canUpdateAdvancedOptions": True,
+                "vlmModel": "example-vlm",
+            },
+        ).body.decode("utf-8")
+        self.assertIn('data-vlm-test-job-id="12345678"', job_body)
+
+    def test_job_page_dynamic_advanced_options_include_vlm_connection_test(self) -> None:
+        body = web_pages.job_page(
+            "manga",
+            "12345678",
+            {"status": "failed", "recentLog": []},
+        ).body.decode("utf-8")
+
+        self.assertIn("function advancedOptionsMarkup(data)", body)
+        self.assertIn("data.vlmModel || data.defaultVlmModel", body)
+        self.assertIn('<select name="vlm_model" required>${vlmModelOptions(vlmModel)}</select>', body)
+        self.assertIn('fetch("/api/vlm/test"', body)
+        self.assertIn("vlmBaseUrl: endpoint.value", body)
+        self.assertIn("payload.vlmAuthToken = token.value", body)
+        self.assertIn("payload.category = category", body)
+        self.assertIn("payload.jobId = testJobId", body)
+        self.assertIn("Connected. Found ${loadedVlmModels.length} model(s).", body)
+        self.assertIn("status.textContent = error instanceof Error", body)
+        self.assertIn('advancedOptions.querySelector("form")', body)
+
+    def test_vlm_model_is_saved_and_passed_to_the_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            code, job_id = "default", "12345678"
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            manager.save_status(
+                code,
+                job_id,
+                {
+                    "status": "failed",
+                    "vlmModel": " selected-model ",
+                },
+            )
+
+            payload = manager.public_status(code, job_id, include_log=False)
+            command = manager.build_command(code, job_id)
+
+        self.assertEqual(payload["vlmModel"], "selected-model")
+        model_index = command.index("--vlm-model")
+        self.assertEqual(command[model_index + 1], "selected-model")
+
+    def test_vlm_probe_uses_supplied_or_saved_private_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_web_config(root)
+            manager = self.initialized_manager(root, ["default"])
+            code, job_id = "default", "12345678"
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.update_job_auth_tokens(
+                code,
+                job_id,
+                vlm_auth_token="saved-token",
+                paddleocr_vl_auth_token=None,
+                preserve_existing=False,
+            )
+            app = web_app.create_app(config_path)
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                transport = ASGITransport(app=app)
+                async with AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with mock.patch.object(
+                        manager,
+                        "probe_vlm_models",
+                        return_value=["first", "second"],
+                    ) as probe, mock.patch.object(
+                        web_app,
+                        "run_in_threadpool",
+                        new=direct_run_in_threadpool,
+                    ):
+                        response = await client.post(
+                            "/api/vlm/test",
+                            json={
+                                "vlmBaseUrl": "http://vlm.example/v1",
+                                "vlmAuthToken": "supplied-token",
+                                "category": code,
+                                "jobId": job_id,
+                            },
+                        )
+                        category_response = await client.post(
+                            "/api/vlm/test",
+                            json={
+                                "vlmBaseUrl": "http://vlm.example/v1",
+                                "category": code,
+                            },
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(category_response.status_code, 200)
+                self.assertEqual(
+                    response.json(),
+                    {
+                        "ok": True,
+                        "models": ["first", "second"],
+                        "message": "Connected. Found 2 model(s).",
+                    },
+                )
+                self.assertNotIn("supplied-token", response.text)
+                self.assertNotIn("saved-token", response.text)
+                self.assertEqual(
+                    probe.call_args_list,
+                    [
+                        mock.call("http://vlm.example/v1", "supplied-token"),
+                        mock.call("http://vlm.example/v1", None),
+                    ],
+                )
+
+            asyncio.run(exercise())
+
+    def test_vlm_probe_failure_adds_docker_note_only_for_localhost(self) -> None:
+        self.assertIn(
+            "host.docker.internal",
+            web_app.vlm_probe_failure_detail("http://127.0.0.1:8080/v1"),
+        )
+        self.assertIn(
+            "host.docker.internal",
+            web_app.vlm_probe_failure_detail("http://[::1]:8080/v1"),
+        )
+        self.assertNotIn(
+            "host.docker.internal",
+            web_app.vlm_probe_failure_detail("https://vlm.example/v1"),
+        )
 
     def test_page_worker_limits_are_validated(self) -> None:
         self.assertEqual(web_app.parse_page_workers_form("1", "OCR workers"), 1)
@@ -2593,12 +2848,13 @@ class EditorV2Tests(unittest.TestCase):
         config_dir = root / "config"
         config_dir.mkdir()
         pipeline_config = config_dir / "vlm_config.json"
-        pipeline_config.write_text(
+        pipeline_data = json.loads(
             (repo_dir / "data/config/vlm_config.example.json").read_text(
                 encoding="utf-8"
-            ),
-            encoding="utf-8",
+            )
         )
+        pipeline_data["model"] = "test-vlm-model"
+        pipeline_config.write_text(json.dumps(pipeline_data), encoding="utf-8")
         web_config = config_dir / "web_config.json"
         web_config.write_text(
             json.dumps(

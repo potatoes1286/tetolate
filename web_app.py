@@ -35,6 +35,7 @@ import paddle_ocr_image
 import editor_v2
 import lama_inpaint
 import translate_cbz
+import vlm_client
 from web_editor_backend import (
     EditorManagerMixin,
     parse_region,
@@ -74,6 +75,10 @@ DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
 DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
+DOCKER_LOCALHOST_NOTE = (
+    "If Tetolate runs in Docker, this address refers to the container. "
+    "To connect to a VLM on the host machine, use host.docker.internal instead."
+)
 OCR_REVIEW_CHECKPOINT = "ocr"
 GENERATED_TRANSLATION_NOTES_NAME = translate_cbz.GENERATED_TRANSLATION_NOTES_NAME
 DEFAULT_LISTEN = "127.0.0.1:8088"
@@ -259,6 +264,7 @@ class WebConfig:
     default_jxl_quality: int
     default_thinking_budget_tokens: int
     default_vlm_base_url: str
+    default_vlm_model: str
     default_alt_placement_enabled: bool
     default_source_language: str
     default_ocr_engine: str
@@ -398,6 +404,32 @@ def parse_vlm_base_url_form(value: str, config: WebConfig) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def validate_vlm_model(value: str) -> str:
+    model = value.strip()
+    if not model:
+        raise ValueError("VLM model is required.")
+    if len(model) > 1_024:
+        raise ValueError("VLM model is too long.")
+    if any(character in model for character in ("\0", "\r", "\n")):
+        raise ValueError("VLM model contains an invalid character.")
+    return model
+
+
+def parse_vlm_model_form(value: str) -> str:
+    try:
+        return validate_vlm_model(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def vlm_probe_failure_detail(endpoint: str) -> str:
+    host = urlsplit(endpoint).hostname
+    detail = "Could not connect to the VLM endpoint."
+    if host is not None and host.lower() in {"localhost", "127.0.0.1", "::1"}:
+        return f"{detail} {DOCKER_LOCALHOST_NOTE}"
+    return detail
+
+
 def http_origin(value: str, label: str) -> str:
     try:
         parsed = urlsplit(value)
@@ -458,7 +490,7 @@ def thinking_budget_text(value: Any) -> str:
     return f"{budget} tokens"
 
 
-def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, str, str, str]:
+def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, str, bool, str, str, str, str]:
     try:
         data = json.loads(
             path.read_text(encoding="utf-8"),
@@ -469,6 +501,9 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, s
         raise RuntimeError(f"Invalid JSON in pipeline config {path}: {detail}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Pipeline config root must be a JSON object.")
+    configured_vlm_model = data.get("model", "")
+    if configured_vlm_model is not None and not isinstance(configured_vlm_model, str):
+        raise RuntimeError("Pipeline config field model must be a string when provided.")
     output = data.get("output", {})
     if output is None:
         output = {}
@@ -518,6 +553,7 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, s
                 "thinking_budget_tokens",
             ),
             validate_vlm_base_url(str(data.get("base_url", "")), ""),
+            (configured_vlm_model or "").strip(),
             default_alt_placement_enabled,
             default_source_language,
             DEFAULT_OCR_ENGINE,
@@ -607,6 +643,7 @@ def load_web_config(path: Path | None = None) -> WebConfig:
         default_jxl_quality,
         default_thinking_budget_tokens,
         default_vlm_base_url,
+        default_vlm_model,
         default_alt_placement_enabled,
         default_source_language,
         default_ocr_engine,
@@ -625,6 +662,7 @@ def load_web_config(path: Path | None = None) -> WebConfig:
         default_jxl_quality=default_jxl_quality,
         default_thinking_budget_tokens=default_thinking_budget_tokens,
         default_vlm_base_url=default_vlm_base_url,
+        default_vlm_model=default_vlm_model,
         default_alt_placement_enabled=default_alt_placement_enabled,
         default_source_language=default_source_language,
         default_ocr_engine=default_ocr_engine,
@@ -1732,6 +1770,7 @@ class JobManager(EditorManagerMixin):
             "translationNotes": "",
             "thinkingBudgetTokens": self.config.default_thinking_budget_tokens,
             "vlmBaseUrl": self.config.default_vlm_base_url,
+            "vlmModel": self.config.default_vlm_model,
             "pauseAfterOcr": False,
             "proofreadTranslations": DEFAULT_PROOFREAD_TRANSLATIONS,
             "writeTranslationNotes": DEFAULT_WRITE_TRANSLATION_NOTES,
@@ -1767,6 +1806,12 @@ class JobManager(EditorManagerMixin):
             )
         except ValueError:
             pass
+        model = data.get("vlmModel")
+        if isinstance(model, str):
+            try:
+                normalized["vlmModel"] = validate_vlm_model(model)
+            except ValueError:
+                pass
         for key in (
             "pauseAfterOcr",
             "proofreadTranslations",
@@ -1820,6 +1865,7 @@ class JobManager(EditorManagerMixin):
         *,
         thinking_budget_tokens: int,
         vlm_base_url: str,
+        vlm_model: str,
         pause_after_ocr: bool,
         proofread_translations: bool,
         write_translation_notes: bool,
@@ -1839,6 +1885,7 @@ class JobManager(EditorManagerMixin):
                 {
                     "thinkingBudgetTokens": thinking_budget_tokens,
                     "vlmBaseUrl": vlm_base_url,
+                    "vlmModel": vlm_model,
                     "pauseAfterOcr": bool(pause_after_ocr),
                     "proofreadTranslations": bool(proofread_translations),
                     "writeTranslationNotes": bool(write_translation_notes),
@@ -2177,6 +2224,25 @@ class JobManager(EditorManagerMixin):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    def status_vlm_model(self, status: dict[str, Any]) -> str:
+        try:
+            return validate_vlm_model(
+                str(status.get("vlmModel", self.config.default_vlm_model) or "")
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def probe_vlm_models(self, endpoint: str, auth_token: str | None) -> list[str]:
+        pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+        if pipeline.vlm is None:
+            raise translate_cbz.PipelineError("Pipeline VLM configuration is unavailable.")
+        config = replace(
+            pipeline.vlm,
+            base_url=endpoint,
+            api_key=auth_token or pipeline.vlm.api_key,
+        )
+        return vlm_client.list_vlm_model_ids(config)
+
     def status_pause_after_ocr(self, status: dict[str, Any]) -> bool:
         return bool(status.get("pauseAfterOcr"))
 
@@ -2306,6 +2372,7 @@ class JobManager(EditorManagerMixin):
         )
         thinking_budget_tokens = self.status_thinking_budget_tokens(status)
         vlm_base_url = self.status_vlm_base_url(status)
+        vlm_model = self.status_vlm_model(status)
         pause_after_ocr = self.status_pause_after_ocr(status)
         proofread_translations = self.status_proofread_translations(status)
         write_translation_notes = self.status_write_translation_notes(status)
@@ -2376,6 +2443,8 @@ class JobManager(EditorManagerMixin):
             "defaultThinkingBudgetTokens": self.config.default_thinking_budget_tokens,
             "vlmBaseUrl": vlm_base_url,
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
+            "vlmModel": vlm_model,
+            "defaultVlmModel": self.config.default_vlm_model,
             "pauseAfterOcr": pause_after_ocr,
             "proofreadTranslations": proofread_translations,
             "writeTranslationNotes": write_translation_notes,
@@ -2426,6 +2495,7 @@ class JobManager(EditorManagerMixin):
             "translationNotes": options["translationNotes"],
             "defaultThinkingBudgetTokens": options["thinkingBudgetTokens"],
             "defaultVlmBaseUrl": options["vlmBaseUrl"],
+            "defaultVlmModel": options["vlmModel"],
             "pauseAfterOcr": options["pauseAfterOcr"],
             "proofreadTranslations": options["proofreadTranslations"],
             "writeTranslationNotes": options["writeTranslationNotes"],
@@ -2528,6 +2598,7 @@ class JobManager(EditorManagerMixin):
         translation_notes: str = "",
         thinking_budget_tokens: int | None = None,
         vlm_base_url: str | None = None,
+        vlm_model: str | None = None,
         pause_after_ocr: bool = False,
         proofread_translations: bool = DEFAULT_PROOFREAD_TRANSLATIONS,
         write_translation_notes: bool = DEFAULT_WRITE_TRANSLATION_NOTES,
@@ -2550,6 +2621,7 @@ class JobManager(EditorManagerMixin):
             vlm_base_url or "",
             self.config.default_vlm_base_url,
         )
+        vlm_model = validate_vlm_model(vlm_model or self.config.default_vlm_model)
         if source_language is None:
             source_language = self.config.default_source_language
         source_language = translate_cbz.normalize_source_language(source_language)
@@ -2577,6 +2649,7 @@ class JobManager(EditorManagerMixin):
             "inputFilename": original_filename,
             "thinkingBudgetTokens": thinking_budget_tokens,
             "vlmBaseUrl": vlm_base_url,
+            "vlmModel": vlm_model,
             "pauseAfterOcr": bool(pause_after_ocr),
             "proofreadTranslations": bool(proofread_translations),
             "writeTranslationNotes": bool(write_translation_notes),
@@ -2603,6 +2676,7 @@ class JobManager(EditorManagerMixin):
             translation_notes=translation_notes,
             thinking_budget_tokens=thinking_budget_tokens,
             vlm_base_url=vlm_base_url,
+            vlm_model=vlm_model,
             pause_after_ocr=pause_after_ocr,
             proofread_translations=proofread_translations,
             write_translation_notes=write_translation_notes,
@@ -2623,6 +2697,7 @@ class JobManager(EditorManagerMixin):
         job_id: str,
         thinking_budget_tokens: int,
         vlm_base_url: str,
+        vlm_model: str,
         pause_after_ocr: bool,
         proofread_translations: bool,
         write_translation_notes: bool,
@@ -2646,6 +2721,7 @@ class JobManager(EditorManagerMixin):
             vlm_base_url,
             self.config.default_vlm_base_url,
         )
+        vlm_model = validate_vlm_model(vlm_model)
         source_language = translate_cbz.normalize_source_language(source_language)
         ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
         ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")
@@ -2664,6 +2740,7 @@ class JobManager(EditorManagerMixin):
                 )
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
+            status["vlmModel"] = vlm_model
             status["pauseAfterOcr"] = bool(pause_after_ocr)
             status["proofreadTranslations"] = bool(proofread_translations)
             status["writeTranslationNotes"] = bool(write_translation_notes)
@@ -2689,6 +2766,7 @@ class JobManager(EditorManagerMixin):
                 code,
                 thinking_budget_tokens=thinking_budget_tokens,
                 vlm_base_url=vlm_base_url,
+                vlm_model=vlm_model,
                 pause_after_ocr=pause_after_ocr,
                 proofread_translations=proofread_translations,
                 write_translation_notes=write_translation_notes,
@@ -3179,6 +3257,7 @@ class JobManager(EditorManagerMixin):
                 ),
             ]
         )
+        command.extend(["--vlm-model", self.status_vlm_model(status)])
         ocr_engine = self.status_ocr_engine(status)
         command.extend(["--source-language", self.status_source_language(status)])
         command.extend(["--ocr-engine", ocr_engine])
@@ -3950,6 +4029,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         translation_notes: str = Form(""),
         thinking_budget_tokens: str = Form(""),
         vlm_base_url: str = Form(""),
+        vlm_model: str = Form(""),
         pause_after_ocr: str | None = Form(None),
         enable_alt_placement: str | None = Form(None),
         enable_proofreading: str | None = Form(None),
@@ -4045,6 +4125,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 translation_notes,
                 thinking_budget,
                 parsed_vlm_base_url,
+                parse_vlm_model_form(vlm_model),
                 parse_checkbox(pause_after_ocr),
                 parse_checkbox(enable_proofreading),
                 parse_checkbox(enable_translation_notes),
@@ -4153,6 +4234,72 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def job_status(request: Request, code: str, job_id: str) -> JSONResponse:
         manager = manager_from_request(request)
         return JSONResponse(manager.public_status(code, job_id))
+
+    @app.post("/api/vlm/test")
+    async def test_vlm_connection(request: Request) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+        endpoint_value = data.get("vlmBaseUrl")
+        if not isinstance(endpoint_value, str):
+            raise HTTPException(status_code=400, detail="vlmBaseUrl must be a string.")
+        try:
+            endpoint = validate_vlm_base_url(endpoint_value, "")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        token_value = data.get("vlmAuthToken", "")
+        if not isinstance(token_value, str):
+            raise HTTPException(status_code=400, detail="vlmAuthToken must be a string.")
+        supplied_token = parse_auth_token_form(token_value)
+
+        category_value = data.get("category")
+        job_id_value = data.get("jobId")
+        if category_value is None and job_id_value is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="jobId requires category.",
+            )
+        saved_token: str | None = None
+        if category_value is not None:
+            if not isinstance(category_value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="category must be a string.",
+                )
+            category = manager.validate_category(category_value)
+            if job_id_value is not None:
+                if not isinstance(job_id_value, str):
+                    raise HTTPException(status_code=400, detail="jobId must be a string.")
+                job_id = manager.validate_job_id(job_id_value)
+                if manager.load_status(category, job_id) is None:
+                    raise HTTPException(status_code=404, detail="Unknown job.")
+                if supplied_token is None:
+                    saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
+
+        try:
+            models = await run_in_threadpool(
+                manager.probe_vlm_models,
+                endpoint,
+                supplied_token or saved_token,
+            )
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=vlm_probe_failure_detail(endpoint),
+            ) from None
+        return JSONResponse(
+            {
+                "ok": True,
+                "models": models,
+                "message": f"Connected. Found {len(models)} model(s).",
+            }
+        )
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
     async def editor_v2_data(
@@ -4368,6 +4515,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         job_id: str,
         thinking_budget_tokens: str = Form(""),
         vlm_base_url: str = Form(""),
+        vlm_model: str = Form(""),
         pause_after_ocr: str | None = Form(None),
         enable_alt_placement: str | None = Form(None),
         enable_proofreading: str | None = Form(None),
@@ -4393,6 +4541,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 manager.config.default_thinking_budget_tokens,
             ),
             parse_vlm_base_url_form(vlm_base_url, manager.config),
+            parse_vlm_model_form(vlm_model),
             parse_checkbox(pause_after_ocr),
             parse_checkbox(enable_proofreading),
             parse_checkbox(enable_translation_notes),
