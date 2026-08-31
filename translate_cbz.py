@@ -129,8 +129,14 @@ FONT_DIR = DATA_DIR / "fonts"
 # User file describing intended uses for installed fonts; included in placement prompts.
 FONT_USE_PATH = FONT_DIR / "font_use.txt"
 
-# Fallback font passed to ImageMagick when a placement does not specify a local font.
-DEFAULT_RENDER_FONT = "DejaVu-Sans"
+# Fonts distributed with tetolate as usable stand-ins when no user fonts are installed.
+BUNDLED_FONT_DIR = Path(__file__).resolve().parent / "data" / "bundled_fonts"
+
+# Default intended uses for bundled fonts; replaced by a user font_use.txt when present.
+BUNDLED_FONT_USE_PATH = BUNDLED_FONT_DIR / "font_use.txt"
+
+# Fallback font used when a placement does not specify another available font.
+DEFAULT_RENDER_FONT = "ComicNeue-Bold.ttf"
 
 # Fallback text fill color for rendered translations when placement styling omits fill.
 DEFAULT_RENDER_FILL = "black"
@@ -1925,14 +1931,23 @@ def compact_records_table(records: list[dict[str, Any]], fields: tuple[str, ...]
     return json.dumps(table, ensure_ascii=False, separators=(",", ":"))
 
 
+def available_font_paths() -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for directory in (BUNDLED_FONT_DIR, FONT_DIR):
+        if not directory.is_dir():
+            continue
+        paths.update(
+            {
+                path.name: path
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS
+            }
+        )
+    return paths
+
+
 def available_font_names() -> set[str]:
-    if not FONT_DIR.is_dir():
-        return set()
-    return {
-        path.name
-        for path in FONT_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS
-    }
+    return set(available_font_paths())
 
 
 def normalize_font_name(value: Any, backup_font: str | None = None) -> str | None:
@@ -1950,13 +1965,12 @@ def normalize_font_name(value: Any, backup_font: str | None = None) -> str | Non
 
 
 def local_font_path(value: Any, fallback: str) -> str:
-    if isinstance(value, str) and value.strip():
-        name = Path(value.strip().strip("[]")).name
-        candidate = FONT_DIR / name
-        if candidate.is_file() and candidate.suffix.lower() in FONT_EXTENSIONS:
-            return str(candidate)
-        return value
-    return fallback
+    selected = value if isinstance(value, str) and value.strip() else fallback
+    name = Path(selected.strip().strip("[]")).name
+    candidate = available_font_paths().get(name)
+    if candidate is not None:
+        return str(candidate)
+    return selected
 
 
 def normalize_fill(value: Any) -> str | None:
@@ -2067,12 +2081,13 @@ def correct_placement_fills_for_legibility(
 
 
 def font_use_prompt(backup_font: str) -> str:
-    if not FONT_USE_PATH.is_file():
+    font_use_path = FONT_USE_PATH if FONT_USE_PATH.is_file() else BUNDLED_FONT_USE_PATH
+    if not font_use_path.is_file():
         return f"No local font_use.txt was found. Use backup font {backup_font!r}."
 
     lines: list[str] = []
     font_names = available_font_names()
-    for raw_line in FONT_USE_PATH.read_text(encoding="utf-8").splitlines():
+    for raw_line in font_use_path.read_text(encoding="utf-8").splitlines():
         if not raw_line.strip() or ":" not in raw_line:
             continue
         raw_name, raw_uses = raw_line.split(":", 1)

@@ -5,12 +5,16 @@
 ### Added
 
 - Added upload support for ZIP archives that contain comic image pages.
+- Added docker containers to ghcr
+- Added a Compose override for local container builds.
+- Added bundled OFL fonts for a better default
 
 ### Changed
 
 - JXL/Webp now parallelizes generation for faster generation
 - cbz download now only generates after first request rather than generating them beforehand
 - Added model selection to VLM endpoint settings
+- Install path now uses ghcr
 
 ### Fixed
 

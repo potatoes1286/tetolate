@@ -139,10 +139,12 @@ WORKDIR /app
 COPY *.py ./
 COPY web_editor/ ./web_editor/
 COPY data/config /app/data/config
+COPY data/bundled_fonts /app/data/bundled_fonts
 COPY data/prompts /app/data/prompts
 COPY docker ./docker
 
 RUN magick -version \
+    && magick -background none -font /app/data/bundled_fonts/ComicNeue-Bold.ttf label:Tetolate null: \
     && magick identify -list format | grep -Eq '^ *JXL.*rw' \
     && magick identify -list format | grep -Eq '^ *WEBP.*rw' \
     && /app/.venv/bin/python -c "import translate_cbz, web_app" \

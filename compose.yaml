@@ -3,10 +3,8 @@ name: tetolate
 services:
   tetolate:
     container_name: tetolate
-    build:
-      context: .
-      target: runtime
-    image: tetolate-core:local
+    image: ghcr.io/potatoes1286/tetolate:0.3.0
+    pull_policy: always
     ports:
       - "127.0.0.1:8088:8088"
     extra_hosts:

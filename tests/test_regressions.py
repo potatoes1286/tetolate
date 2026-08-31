@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import tempfile
@@ -92,7 +93,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assertEqual(config.jxl_quality, 65)
         self.assertEqual(config.ocr.min_score, 0.75)
         self.assertEqual(config.ocr.engine, paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL)
-        self.assertEqual(config.render_font, "DejaVu-Sans")
+        self.assertEqual(config.render_font, "ComicNeue-Bold.ttf")
 
     def test_hidden_ocr_options_are_not_read_from_vlm_config(self) -> None:
         language = translate_cbz.language_config_from_codes("jp", "en")
@@ -113,9 +114,86 @@ class RepositoryHygieneTests(unittest.TestCase):
 
     def test_missing_user_font_uses_backup_font(self) -> None:
         self.assertEqual(
-            translate_cbz.normalize_font_name(None, "DejaVu-Sans"),
-            "DejaVu-Sans",
+            translate_cbz.normalize_font_name(None, "ComicNeue-Bold.ttf"),
+            "ComicNeue-Bold.ttf",
         )
+        self.assertEqual(
+            Path(overlay_text.DEFAULT_FONT).name,
+            "ComicNeue-Bold.ttf",
+        )
+
+    def test_bundled_fonts_are_available_without_user_fonts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            with (
+                mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir),
+                mock.patch.object(
+                    translate_cbz,
+                    "FONT_USE_PATH",
+                    user_font_dir / "font_use.txt",
+                ),
+            ):
+                names = translate_cbz.available_font_names()
+                path = translate_cbz.local_font_path(
+                    None, translate_cbz.DEFAULT_RENDER_FONT
+                )
+                prompt = translate_cbz.font_use_prompt(
+                    translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertIn("ComicNeue-Bold.ttf", names)
+        self.assertEqual(Path(path).name, "ComicNeue-Bold.ttf")
+        self.assertIn("ComicNeue-BoldItalic.ttf", prompt)
+        self.assertIn("Bangers-Regular.ttf", prompt)
+
+    def test_bundled_font_files_match_recorded_checksums(self) -> None:
+        expected = {
+            "ArchitectsDaughter-Regular.ttf": "6159718a08898e34bc1cb7354086141a5f9a70b73e54dbec27ead0d59a697359",
+            "Bangers-Regular.ttf": "4160a7311de9342674cce9160cde9fcbb30f48190397d86ff1b70b455af65824",
+            "ComicNeue-Bold.ttf": "3e7e5fccfd7e0788f317b43312151c1bd5cf058c9697a8d83eac3939050bd61e",
+            "ComicNeue-BoldItalic.ttf": "5c312c2a2fa64eee82f3b87fcfab8f3b12a5e59b043124401d322eb323cfbf16",
+            "IBMPlexMono-Medium.ttf": "a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755",
+        }
+
+        actual = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in translate_cbz.BUNDLED_FONT_DIR.glob("*.ttf")
+        }
+
+        self.assertEqual(actual, expected)
+
+    def test_user_font_overrides_bundled_font_with_the_same_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            user_font = user_font_dir / "ComicNeue-Bold.ttf"
+            user_font.touch()
+            with mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir):
+                resolved = translate_cbz.local_font_path(
+                    "ComicNeue-Bold.ttf", translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertEqual(resolved, str(user_font))
+
+    def test_user_font_use_file_replaces_bundled_role_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            user_font = user_font_dir / "professional.ttf"
+            user_font.touch()
+            font_use_path = user_font_dir / "font_use.txt"
+            font_use_path.write_text(
+                "professional.ttf: talking, narrator, fallback\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir),
+                mock.patch.object(translate_cbz, "FONT_USE_PATH", font_use_path),
+            ):
+                prompt = translate_cbz.font_use_prompt(
+                    translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertIn("professional.ttf", prompt)
+        self.assertNotIn("Bangers-Regular.ttf", prompt)
 
     def test_quality_config_rejects_fractional_values(self) -> None:
         with self.assertRaises(translate_cbz.PipelineError):
