@@ -38,6 +38,7 @@ import editor_v2
 import lama_inpaint
 import translate_cbz
 import vlm_client
+from version import VERSION
 from web_editor_backend import (
     EditorManagerMixin,
     parse_region,
@@ -1311,6 +1312,7 @@ class JobManager(EditorManagerMixin):
         self._instance_lock_kind = ""
 
     def start(self) -> None:
+        print(f"tetolate {VERSION} starting", file=sys.stderr, flush=True)
         self.config.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.acquire_instance_lock()
         try:

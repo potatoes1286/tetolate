@@ -3,7 +3,7 @@ name: tetolate
 services:
   tetolate:
     container_name: tetolate
-    image: ghcr.io/potatoes1286/tetolate:0.3.0
+    image: ghcr.io/potatoes1286/tetolate:1.0.0
     pull_policy: always
     ports:
       - "127.0.0.1:8088:8088"

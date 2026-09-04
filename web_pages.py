@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 
 import paddle_ocr_image
 import translate_cbz
+from version import VERSION
 
 
 DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKENS
@@ -181,6 +182,7 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
 </head>
 <body{body_class}>
 {body}
+<footer class="muted">tetolate {escape(VERSION)}</footer>
 </body>
 </html>"""
     )

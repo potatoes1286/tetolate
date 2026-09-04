@@ -110,15 +110,22 @@ final image.
 
 Container images are published only when a `v*` tag is pushed. The workflow
 rejects a tag unless its numeric version is the same as the version in
-`pyproject.toml`. Before tagging, update `pyproject.toml` and `uv.lock`, add the
-release date to `CHANGELOG.md`, and complete the checks above.
+`pyproject.toml`. Set `VERSION` in `version.py`, add a dated changelog entry,
+then synchronize the release metadata:
+
+```bash
+python scripts/release.py
+```
+
+The script updates `pyproject.toml`, `uv.lock`, `compose.yaml`, and the current
+release references in the documentation. Complete the checks above before tagging.
 
 The first release is AMD64-only. The `dev` branch does not publish images. Push
 the release tag only after its commit is ready:
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 The workflow uses its repository `GITHUB_TOKEN`; it needs no personal access
@@ -128,7 +135,7 @@ public if GitHub created it as private.
 
 For the first publication, verify all of the following:
 
-- `docker pull ghcr.io/potatoes1286/tetolate:0.3.0` succeeds when signed out of GHCR.
+- `docker pull ghcr.io/potatoes1286/tetolate:1.0.0` succeeds when signed out of GHCR.
 - The versioned `compose.yaml` starts tetolate from a directory that does not contain the repository source.
 - `docker compose ps` reports the published image as healthy.
 - The container remains published only on `127.0.0.1:8088`.
