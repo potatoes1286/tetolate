@@ -35,6 +35,10 @@ DELETE_JOB_CONFIRM = "Delete this job and its generated files?"
 CATEGORY_DELETE_CONFIRM = (
     "Delete this category and every job, input, output, log, and download inside it?"
 )
+JOB_NAME_MAX_LENGTH = 256
+CBZ_TITLE_MODE_ORIGINAL = "original"
+CBZ_TITLE_MODE_TRANSLATED = "translated"
+CBZ_TITLE_MODE_OTHER = "other"
 TERMINATE_JOB_CONFIRM = (
     "Terminate this running job? The local VLM request stream will be closed, "
     "but external providers may handle cancellation differently."
@@ -222,7 +226,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         page = "" if item.get("page") is None else str(item.get("page"))
         active_rows.append(
             "<tr>"
-            f'<td><a href="{escape(item.get("url"))}">{escape(item.get("inputFilename") or item.get("jobId"))}</a></td>'
+            f'<td><a href="{escape(item.get("url"))}">{escape(item.get("jobName") or item.get("inputFilename") or item.get("jobId"))}</a></td>'
             f'<td>{escape(item.get("category"))}</td>'
             f'<td>{escape(item.get("status"))}</td>'
             f'<td>{escape(item.get("phase"))}</td>'
@@ -251,7 +255,8 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
             "<tr>"
             f'<td><a href="{escape(url)}">{escape(category)}</a></td>'
             f'<td>{escape(item.get("jobCount", 0))}</td>'
-            f'<td><a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
+            f'<td><a class="button" href="/admin/categories/{escape(category)}/rename">Rename...</a> '
+            f'<a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
             "</tr>"
         )
     categories_html = (
@@ -324,6 +329,23 @@ def category_delete_page(category: str, counts: dict[str, int], message: str = "
 <form action="/admin/categories/{escape(category)}/delete" method="post">
   <label>Type <code>{escape(category)}</code> to confirm<br><input name="confirmation" type="text" required autocomplete="off"></label>
   <button type="submit">Delete category and all jobs</button>
+</form>
+<p><a href="/admin">Cancel</a></p>
+""",
+    )
+
+
+def category_rename_page(category: str, message: str = "") -> HTMLResponse:
+    message_html = f'<p class="status">{escape(message)}</p>' if message else ""
+    return base_page(
+        f"Rename {category}",
+        f"""
+<h1>Rename Category: {escape(category)}</h1>
+{message_html}
+<p>Renaming keeps all jobs and files in this category.</p>
+<form action="/admin/categories/{escape(category)}/rename" method="post">
+  <label>New category name<br><input name="new_category" type="text" required pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" value="{escape(category)}" autocomplete="off"></label>
+  <button type="submit">Rename category</button>
 </form>
 <p><a href="/admin">Cancel</a></p>
 """,
@@ -414,8 +436,40 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         else ""
     )
     if not links:
-        return summary_html
-    return summary_html + "<p>" + " ".join(links) + "</p>"
+        links_html = ""
+    else:
+        links_html = "<p>" + " ".join(links) + "</p>"
+    if status.get("status") != "complete":
+        return summary_html + links_html
+    mode = str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL)
+    if mode not in {
+        CBZ_TITLE_MODE_ORIGINAL,
+        CBZ_TITLE_MODE_TRANSLATED,
+        CBZ_TITLE_MODE_OTHER,
+    }:
+        mode = CBZ_TITLE_MODE_ORIGINAL
+    instructions = str(status.get("cbzTitleInstructions") or "")
+    selected = " checked" if status.get("cbzAltTitleInNotes") else ""
+    regenerate = " checked" if status.get("cbzRegenerate") else ""
+    export_html = f"""
+<details>
+  <summary>CBZ export</summary>
+  <form action="/job/{escape(code)}/{escape(job_id)}/generate-download" method="post">
+    <label>Title in ComicInfo<br><select name="title_mode">
+      <option value="original"{" selected" if mode == CBZ_TITLE_MODE_ORIGINAL else ""}>Original title</option>
+      <option value="translated"{" selected" if mode == CBZ_TITLE_MODE_TRANSLATED else ""}>Translated title</option>
+      <option value="other"{" selected" if mode == CBZ_TITLE_MODE_OTHER else ""}>Other</option>
+    </select></label>
+    <label>Other title instructions<br><input name="title_instructions" type="text" value="{escape(instructions)}" placeholder="Instructions for the VLM"></label>
+    <label><input name="alt_title_in_notes" type="checkbox" value="1"{selected}> Add the alternate title to ComicInfo notes</label>
+    <label><input name="regenerate" type="checkbox" value="1"{regenerate}> Regenerate an existing CBZ download</label>
+    <p><button name="variant" value="png" type="submit">Generate PNG CBZ</button>
+      <button name="variant" value="webp" type="submit">Generate WebP CBZ</button>
+      <button name="variant" value="jxl" type="submit">Generate JXL CBZ</button></p>
+  </form>
+</details>
+"""
+    return summary_html + links_html + export_html
 
 
 def input_display_html(status: dict[str, Any]) -> str:
@@ -543,6 +597,7 @@ def advanced_options_fields(
     has_vlm_auth_token: bool = False,
     has_paddleocr_vl_auth_token: bool = False,
     vlm_model: str = "",
+    auto_translate_comicinfo_title: bool = False,
     test_category: str = "",
     test_job_id: str = "",
 ) -> str:
@@ -561,6 +616,7 @@ def advanced_options_fields(
     proofread_checked = " checked" if proofread_translations else ""
     write_notes_checked = " checked" if write_translation_notes else ""
     alt_placement_checked = " checked" if alt_placement_enabled else ""
+    auto_title_checked = " checked" if auto_translate_comicinfo_title else ""
     translation_notes_html = (
         '<label>Translation notes<br><textarea name="translation_notes" rows="4" '
         f'placeholder="Names, terms, tone, style guidance">{escape(translation_notes)}</textarea></label>'
@@ -596,6 +652,7 @@ def advanced_options_fields(
     <label><input name="enable_alt_placement" type="checkbox" value="1"{alt_placement_checked}> Enable alt-placement</label>
     <label><input name="enable_proofreading" type="checkbox" value="1"{proofread_checked}> Enable proofreading</label>
     <label><input name="enable_translation_notes" type="checkbox" value="1"{write_notes_checked}> Enable translation notes</label>
+    <label><input name="auto_translate_comicinfo_title" type="checkbox" value="1"{auto_title_checked}> Automatically translate ComicInfo titles when available</label>
   </fieldset>
   <fieldset>
     <legend>OCR</legend>
@@ -648,6 +705,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
     )
     default_vlm_base_url = str(data.get("defaultVlmBaseUrl") or "")
     default_vlm_model = str(data.get("defaultVlmModel") or "")
+    auto_translate_comicinfo_title = bool(data.get("autoTranslateComicInfoTitle", False))
     pause_after_ocr = bool(data.get("pauseAfterOcr", False))
     proofread_translations = bool(
         data.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -672,7 +730,13 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
     rows: list[str] = []
     for job in jobs:
         job_id = str(job.get("jobId", ""))
-        filename = str(job.get("inputFilename") or job_id)
+        job_name = str(job.get("jobName") or job.get("inputFilename") or job_id)
+        translated_job_name = str(job.get("translatedJobName") or "")
+        title_html = (
+            f'<br><span class="muted">{escape(translated_job_name)}</span>'
+            if translated_job_name
+            else ""
+        )
         page = "" if job.get("page") is None else str(job.get("page"))
         view_html = (
             f'<a class="button" href="/job/{escape(code)}/{escape(job_id)}/view">View</a>'
@@ -689,7 +753,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         actions_html = " ".join(item for item in (view_html, delete_html) if item)
         rows.append(
             "<tr>"
-            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(filename)}</a><br>'
+            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(job_name)}</a>{title_html}<br>'
             f'<span class="muted">{escape(job_id)}</span></td>'
             f'<td>{escape(job.get("status"))}</td>'
             f'<td>{escape(job.get("phase"))}</td>'
@@ -740,6 +804,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
       lama_workers=default_lama_workers,
       imagemagick_workers=default_imagemagick_workers,
       vlm_model=default_vlm_model,
+      auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
   )}
   <button type="submit">Queue new job</button>
@@ -765,6 +830,38 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     else:
         restart_target_text = f"from {restart_from} page {restart_page}"
     download_html = download_links_html(code, job_id, status)
+    job_name = str(status.get("jobName") or status.get("inputFilename") or job_id)
+    translated_job_name = str(status.get("translatedJobName") or "")
+    translated_title_html = (
+        f'<p class="translated-title"><strong>Translated title:</strong> {escape(translated_job_name)}</p>'
+        if translated_job_name
+        else ""
+    )
+    title_warning = str(status.get("titleTranslationWarning") or "")
+    title_warning_html = (
+        f'<p class="warning"><strong>Title warning:</strong> {escape(title_warning)}</p>'
+        if title_warning
+        else ""
+    )
+    rename_html = (
+        f"""
+<form action="/job/{escape(code)}/{escape(job_id)}/rename" method="post">
+  <label>Job name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(job_name)}"></label>
+  <button type="submit">Rename job</button>
+</form>
+"""
+        if status.get("canRenameJob")
+        else ""
+    )
+    translate_title_html = (
+        f"""
+<form action="/job/{escape(code)}/{escape(job_id)}/translate-title" method="post">
+  <button type="submit">Translate title</button>
+</form>
+"""
+        if status.get("canTranslateTitle")
+        else ""
+    )
     thinking_budget = status.get("thinkingBudgetTokens")
     if thinking_budget is None:
         thinking_budget = status.get(
@@ -777,6 +874,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
         or ""
     )
     vlm_model = str(status.get("vlmModel") or status.get("defaultVlmModel") or "")
+    auto_translate_comicinfo_title = bool(status.get("autoTranslateComicInfoTitle", False))
     pause_after_ocr = bool(status.get("pauseAfterOcr"))
     proofread_translations = bool(
         status.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -827,6 +925,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       has_vlm_auth_token=bool(status.get("hasVlmAuthToken")),
       has_paddleocr_vl_auth_token=bool(status.get("hasPaddleocrVlAuthToken")),
       vlm_model=vlm_model,
+      auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
       test_job_id=job_id,
   )}
@@ -896,8 +995,13 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     return base_page(
         f"Job {code} {job_id}",
         f"""
-<h1>Job {escape(job_id)}</h1>
+<h1>{escape(job_name)}</h1>
+{translated_title_html}
+{title_warning_html}
+<p class="muted">Job ID: {escape(job_id)}</p>
 <p><a href="/category/{escape(code)}">Back to category {escape(code)}</a></p>
+{rename_html}
+{translate_title_html}
 <dl>
   <dt>Category</dt><dd>{escape(code)}</dd>
   <dt>Input</dt><dd>{input_display_html(status)}</dd>
@@ -989,7 +1093,14 @@ function downloadMarkup(data) {{
   }}
   const summaryHtml = summary.length ? `<p class="muted">${{summary.join("; ")}}</p>` : "";
   const linksHtml = links.length ? `<p>${{links.join(" ")}}</p>` : "";
-  return summaryHtml + linksHtml;
+  if (data.status !== "complete") return summaryHtml + linksHtml;
+  const mode = ["original", "translated", "other"].includes(data.cbzTitleMode) ? data.cbzTitleMode : "original";
+  const modeOptions = `<option value="original"${{mode === "original" ? " selected" : ""}}>Original title</option><option value="translated"${{mode === "translated" ? " selected" : ""}}>Translated title</option><option value="other"${{mode === "other" ? " selected" : ""}}>Other</option>`;
+  const instructions = htmlEscape(data.cbzTitleInstructions || "");
+  const altChecked = data.cbzAltTitleInNotes ? " checked" : "";
+  const regenerateChecked = data.cbzRegenerate ? " checked" : "";
+  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label>Other title instructions<br><input name="title_instructions" type="text" value="${{instructions}}" placeholder="Instructions for the VLM"></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><label><input name="regenerate" type="checkbox" value="1"${{regenerateChecked}}> Regenerate an existing CBZ download</label><p><button name="variant" value="png" type="submit">Generate PNG CBZ</button> <button name="variant" value="webp" type="submit">Generate WebP CBZ</button> <button name="variant" value="jxl" type="submit">Generate JXL CBZ</button></p></form></details>`;
+  return summaryHtml + linksHtml + exportHtml;
 }}
 function deleteMarkup(data) {{
   if (!data.canDelete) return "";
@@ -1007,6 +1118,7 @@ function advancedOptionsMarkup(data) {{
   const pauseChecked = data.pauseAfterOcr ? " checked" : "";
   const proofreadChecked = data.proofreadTranslations ? " checked" : "";
   const notesChecked = data.writeTranslationNotes ? " checked" : "";
+  const autoTitleChecked = data.autoTranslateComicInfoTitle ? " checked" : "";
   const altPlacementChecked = (data.altPlacementEnabled ?? data.defaultAltPlacementEnabled ?? true) ? " checked" : "";
   const sourceLanguage = data.sourceLanguage || data.defaultSourceLanguage || "jp";
   const jpSelected = sourceLanguage === "jp" ? " selected" : "";
@@ -1038,6 +1150,7 @@ function advancedOptionsMarkup(data) {{
         <label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label>
         <label><input name="enable_proofreading" type="checkbox" value="1"${{proofreadChecked}}> Enable proofreading</label>
         <label><input name="enable_translation_notes" type="checkbox" value="1"${{notesChecked}}> Enable translation notes</label>
+        <label><input name="auto_translate_comicinfo_title" type="checkbox" value="1"${{autoTitleChecked}}> Automatically translate ComicInfo titles when available</label>
       </fieldset>
       <fieldset><legend>OCR</legend>
         <label>Source language<br><select name="source_language"><option value="jp"${{jpSelected}}>Japanese</option><option value="kr"${{krSelected}}>Korean</option><option value="cn"${{cnSelected}}>Chinese</option></select></label>

@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -415,6 +416,14 @@ def parse_args() -> argparse.Namespace:
             "Generate only this translated CBZ variant. Without this option, "
             "the package phase generates all variants."
         ),
+    )
+    parser.add_argument(
+        "--comicinfo-title",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--comicinfo-alt-title",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--webp-quality",
@@ -4287,7 +4296,61 @@ def write_preserved_non_image_members(
     *,
     source_archive: zipfile.ZipFile | None = None,
     source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> None:
+    def comicinfo_member_data(info: zipfile.ZipInfo, data: bytes) -> bytes:
+        info_name = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if comicinfo_title is None or info_name.casefold() != "comicinfo.xml":
+            return data
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            print(
+                f"warning: could not update malformed ComicInfo metadata: {info.filename}",
+                file=sys.stderr,
+            )
+            return data
+
+        def local_name(tag: str) -> str:
+            return tag.rsplit("}", 1)[-1]
+
+        title_element = next(
+            (element for element in root.iter() if local_name(element.tag) == "Title"),
+            None,
+        )
+        if title_element is None or not str(title_element.text or "").strip():
+            return data
+        title_element.text = comicinfo_title
+
+        notes_element = next(
+            (element for element in root.iter() if local_name(element.tag) == "Notes"),
+            None,
+        )
+        marker = "Tetolate alternate title:"
+        existing_notes = str(notes_element.text or "") if notes_element is not None else ""
+        note_lines = [
+            line for line in existing_notes.splitlines()
+            if not line.strip().startswith(marker)
+        ]
+        if comicinfo_alt_title:
+            note_lines.append(f"{marker} {comicinfo_alt_title}")
+        updated_notes = "\n".join(note_lines).strip()
+        if updated_notes:
+            if notes_element is None:
+                tag = next(
+                    (element.tag for element in root.iter() if local_name(element.tag) == "Title"),
+                    "Notes",
+                )
+                namespace = tag.split("}", 1)[0] + "}" if "}" in tag else ""
+                notes_element = ET.Element(f"{namespace}Notes")
+                root.append(notes_element)
+            notes_element.text = updated_notes
+        elif notes_element is not None:
+            notes_element.text = None
+
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
     def copy_members(
         source: zipfile.ZipFile,
         members: list[zipfile.ZipInfo],
@@ -4302,11 +4365,14 @@ def write_preserved_non_image_members(
                     file=sys.stderr,
                 )
                 continue
-            with source.open(info) as source_file, archive.open(
+            with source.open(info) as source_file:
+                member_data = source_file.read()
+            member_data = comicinfo_member_data(info, member_data)
+            with archive.open(
                 copy_zipinfo_for_deflated_write(info),
                 "w",
             ) as destination:
-                shutil.copyfileobj(source_file, destination, length=1024 * 1024)
+                destination.write(member_data)
             written_names.add(info.filename)
 
     if source_archive is not None:
@@ -4344,6 +4410,8 @@ def package_cbz(
     *,
     source_archive: zipfile.ZipFile | None = None,
     source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> Path:
     cbz_path = translated_cbz_path(output_dir)
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
@@ -4364,6 +4432,8 @@ def package_cbz(
                 written_names,
                 source_archive=source_archive,
                 source_members=source_members,
+                comicinfo_title=comicinfo_title,
+                comicinfo_alt_title=comicinfo_alt_title,
             )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
@@ -4415,6 +4485,8 @@ def package_converted_cbz(
     *,
     source_archive: zipfile.ZipFile | None = None,
     source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> Path:
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
     temp_cbz_path = temporary_archive_path(cbz_path)
@@ -4463,6 +4535,8 @@ def package_converted_cbz(
                     written_names,
                     source_archive=source_archive,
                     source_members=source_members,
+                    comicinfo_title=comicinfo_title,
+                    comicinfo_alt_title=comicinfo_alt_title,
                 )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
@@ -4477,6 +4551,8 @@ def print_packaged_cbz(
     input_cbz: Path,
     config: PipelineConfig,
     package_variant: str | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> None:
     if package_variant is not None and package_variant not in PACKAGE_VARIANTS:
         raise PipelineError(f"Unsupported package variant: {package_variant}")
@@ -4519,6 +4595,8 @@ def print_packaged_cbz(
                             input_cbz,
                             source_archive=source_archive,
                             source_members=source_members,
+                            comicinfo_title=comicinfo_title,
+                            comicinfo_alt_title=comicinfo_alt_title,
                         )
                     else:
                         assert suffix is not None
@@ -4533,6 +4611,8 @@ def print_packaged_cbz(
                             config.imagemagick_workers,
                             source_archive=source_archive,
                             source_members=source_members,
+                            comicinfo_title=comicinfo_title,
+                            comicinfo_alt_title=comicinfo_alt_title,
                         )
                 except PipelineError as exc:
                     if package_variant is not None or variant_name == "png":
@@ -4558,6 +4638,8 @@ def maybe_print_packaged_cbz(
         args.input_cbz,
         config,
         package_variant=getattr(args, "package_variant", None),
+        comicinfo_title=getattr(args, "comicinfo_title", None),
+        comicinfo_alt_title=getattr(args, "comicinfo_alt_title", None),
     )
 
 
@@ -5089,6 +5171,8 @@ def run_resume_pipeline(
             args.input_cbz,
             config,
             package_variant=getattr(args, "package_variant", None),
+            comicinfo_title=getattr(args, "comicinfo_title", None),
+            comicinfo_alt_title=getattr(args, "comicinfo_alt_title", None),
         )
         return
 

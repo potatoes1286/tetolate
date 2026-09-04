@@ -1,27 +1,22 @@
 # Changelog
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-09-04
 
 ### Added
 
-- Added upload support for ZIP archives that contain comic image pages.
-- Added docker containers to ghcr
-- Added a Compose override for local container builds.
-- Added bundled OFL fonts for a better default
+- Added GHCR images, public Compose installation, local builds, and bundled fonts.
+- Added ZIP uploads, lazy CBZ downloads, and ComicInfo title controls.
+- Added category and job naming controls.
 
 ### Changed
 
-- JXL/Webp now parallelizes generation for faster generation
-- cbz download now only generates after first request rather than generating them beforehand
-- Added model selection to VLM endpoint settings
-- Install path now uses ghcr
+- Improved VLM model and job setting persistence.
+- Installation now uses the published GHCR image.
 
 ### Fixed
 
-- Fixed missing function in translate_cbz
-- JXL/Webp Quality now rejects fractional values
-- Imagemagick checksum added to dockerfile
-- Better rejection of oversized images
+- Improved VLM connection errors and missing-model handling.
+- Improved validation for image and archive inputs.
 
 
 ## 0.2.0 - 2026-08-05
