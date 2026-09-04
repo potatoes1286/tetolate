@@ -78,6 +78,7 @@ DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
 DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
+DEFAULT_ADMIN_PASSWORD = "changeme"
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
 CBZ_TITLE_MODE_OTHER = "other"
@@ -1462,15 +1463,16 @@ class JobManager(EditorManagerMixin):
             category_names[folded] = category
             categories.add(category)
 
-        generated_password: str | None = None
+        default_password: str | None = None
         if not password_hash:
-            generated_password = web_security.generate_password()
-            password_hash = web_security.hash_password(generated_password)
+            default_password = DEFAULT_ADMIN_PASSWORD
+            password_hash = web_security.hash_password(default_password)
 
-        if generated_password is not None:
+        if default_password is not None:
             print(
-                "tetolate generated admin password (shown once): "
-                + generated_password,
+                "tetolate default admin password is: "
+                + default_password
+                + ". Change it after login.",
                 file=sys.stderr,
                 flush=True,
             )

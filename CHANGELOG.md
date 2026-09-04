@@ -17,6 +17,7 @@
 
 - Improved VLM connection errors and missing-model handling.
 - Improved validation for image and archive inputs.
+- First startup now uses the documented default admin password.
 
 
 ## 0.2.0 - 2026-08-05

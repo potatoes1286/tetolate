@@ -49,8 +49,9 @@ docker compose logs tetolate
 ```
 
 On first startup, tetolate creates the `data` directories, configuration files,
-default prompts, and an admin password automatically. Open
-`http://127.0.0.1:8088/admin` and use the password shown in the logs. Configure
+default prompts, and the admin password automatically. The initial password is
+`changeme`; change it after login. Open `http://127.0.0.1:8088/admin` and use
+that password. Configure
 and test the translation VLM endpoint in the web UI, then select one of the
 models returned by the endpoint. For a VLM that runs on the Docker host, use
 `host.docker.internal` instead of `127.0.0.1` in its endpoint URL.
@@ -116,7 +117,7 @@ data formats, follow that release's backup and rollback notes.
 ## Usage
 
 - Log in with admin password.
-- Change the password from the auto-generated one once inside.
+- Change the default password once inside.
 - Create a new category (no relation between jobs in the same category, they are just there to organize).
 - Choose a CBZ archive, a ZIP archive that contains image pages, or a list of images.
 - Under advanced options, test the translation VLM endpoint, select a returned model, then set translation notes, optional passes, source language, OCR engine, thinking tokens, and page worker counts.

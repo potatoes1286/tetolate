@@ -96,11 +96,6 @@ def verify_password(password: str, encoded: str) -> bool:
     return hmac.compare_digest(actual, expected)
 
 
-def generate_password() -> str:
-    """Generate a URL-safe password from 24 random bytes."""
-    return secrets.token_urlsafe(24)
-
-
 def read_json_object(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Read a UTF-8 JSON object, translating read and parse errors to ValueError."""
     try:

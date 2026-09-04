@@ -699,7 +699,7 @@ class WebAuthenticationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             web_security.parse_password_hash("not-a-password-hash")
 
-    def test_first_start_generates_password_and_private_state(self) -> None:
+    def test_first_start_uses_default_password_and_private_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = web_app.load_web_config(self.write_web_config(root))
@@ -710,15 +710,18 @@ class WebAuthenticationTests(unittest.TestCase):
             with mock.patch("sys.stderr", output):
                 manager.initialize_web_state()
 
-            generated = output.getvalue().split("shown once): ", 1)[1].strip()
             state_path = manager.web_state_path()
             state = web_security.read_json_object(state_path)
             self.assertTrue(
-                web_security.verify_password(generated, state["adminPasswordHash"])
+                web_security.verify_password(
+                    web_app.DEFAULT_ADMIN_PASSWORD,
+                    state["adminPasswordHash"],
+                )
             )
+            self.assertIn("default admin password is: changeme", output.getvalue())
             self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
 
-    def test_generated_password_is_printed_before_state_persistence(self) -> None:
+    def test_default_password_is_printed_before_state_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = web_app.load_web_config(self.write_web_config(root))
@@ -737,7 +740,7 @@ class WebAuthenticationTests(unittest.TestCase):
             ):
                 manager.initialize_web_state()
 
-            self.assertIn("generated admin password (shown once):", output.getvalue())
+            self.assertIn("default admin password is: changeme", output.getvalue())
 
     def test_sessions_are_individual_and_revocable(self) -> None:
         manager = object.__new__(web_app.JobManager)
