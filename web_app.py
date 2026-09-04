@@ -81,11 +81,9 @@ DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
 DEFAULT_ADMIN_PASSWORD = "changeme"
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
-CBZ_TITLE_MODE_OTHER = "other"
 CBZ_TITLE_MODES = {
     CBZ_TITLE_MODE_ORIGINAL,
     CBZ_TITLE_MODE_TRANSLATED,
-    CBZ_TITLE_MODE_OTHER,
 }
 DOCKER_LOCALHOST_NOTE = (
     "If in a docker container connecting to the local host, use "
@@ -2672,9 +2670,7 @@ class JobManager(EditorManagerMixin):
             "autoTranslateComicInfoTitle": bool(status.get("autoTranslateComicInfoTitle")),
             "comicInfoTitle": str(status.get("comicInfoTitle") or ""),
             "cbzTitleMode": str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL),
-            "cbzTitleInstructions": str(status.get("cbzTitleInstructions") or ""),
             "cbzAltTitleInNotes": bool(status.get("cbzAltTitleInNotes")),
-            "cbzRegenerate": bool(status.get("cbzRegenerate")),
             "titleTranslationWarning": str(status.get("titleTranslationWarning") or ""),
             "pauseAfterOcr": pause_after_ocr,
             "proofreadTranslations": proofread_translations,
@@ -2701,7 +2697,10 @@ class JobManager(EditorManagerMixin):
             "defaultImagemagickWorkers": translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
             "generatedTranslationNotes": generated_translation_notes,
             "hasGeneratedTranslationNotes": bool(generated_translation_notes),
-            "canUpdateAdvancedOptions": status_value in {"failed", "cancelled"} or logical_pause,
+            "canUpdateAdvancedOptions": (
+                not is_active
+                and status_value not in {"queued", "running", "terminating"}
+            ),
             "restartResumeFrom": restart_target[0] if restart_target is not None else None,
             "restartResumePage": restart_target[1] if restart_target is not None else None,
             "url": f"/job/{code}/{job_id}",
@@ -2975,10 +2974,15 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if status.get("status") not in {"failed", "cancelled", "paused"}:
+            if (code, job_id) in self._active_processes or status.get("status") not in {
+                "failed",
+                "cancelled",
+                "paused",
+                "complete",
+            }:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only failed, cancelled, or paused jobs can update advanced options.",
+                    detail="Only completed, failed, cancelled, or paused jobs can update advanced options.",
                 )
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
@@ -3311,7 +3315,6 @@ class JobManager(EditorManagerMixin):
         variant: str,
         *,
         title_mode: str = CBZ_TITLE_MODE_ORIGINAL,
-        title_instructions: str = "",
         alt_title_in_notes: bool = False,
         regenerate: bool = False,
     ) -> None:
@@ -3336,19 +3339,13 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
             if title_mode not in CBZ_TITLE_MODES:
                 raise HTTPException(status_code=400, detail="Unknown CBZ title mode.")
-            title_instructions = title_instructions.strip()
-            if title_mode == CBZ_TITLE_MODE_OTHER and not title_instructions:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Instructions are required for Other title mode.",
-                )
             if (
                 self.translated_cbz_variant_path(code, job_id, variant).is_file()
                 and not regenerate
             ):
                 raise HTTPException(
                     status_code=409,
-                    detail="That CBZ already exists. Select regenerate to replace it.",
+                    detail="That CBZ already exists. Use the regenerate action to replace it.",
                 )
 
             try:
@@ -3379,9 +3376,7 @@ class JobManager(EditorManagerMixin):
                     "lastResumeFrom": "package",
                     "lastResumePage": 0,
                     "cbzTitleMode": title_mode,
-                    "cbzTitleInstructions": title_instructions,
                     "cbzAltTitleInNotes": bool(alt_title_in_notes),
-                    "cbzRegenerate": bool(regenerate),
                 }
             )
             status.pop("pid", None)
@@ -3530,21 +3525,6 @@ class JobManager(EditorManagerMixin):
         selected_title = source_title
         if mode == CBZ_TITLE_MODE_TRANSLATED and translated:
             selected_title = translated
-        elif mode == CBZ_TITLE_MODE_OTHER:
-            instructions = str(status.get("cbzTitleInstructions") or "").strip()
-            try:
-                if not instructions:
-                    raise ValueError("Instructions are required for Other title mode.")
-                selected_title, _refused = self.request_vlm_title(
-                    code,
-                    job_id,
-                    source_title,
-                    instructions=instructions,
-                )
-            except Exception as exc:
-                warning = f"Could not generate the requested title; using the original title: {exc}"
-                selected_title = source_title
-
         alt_title: str | None = None
         if bool(status.get("cbzAltTitleInNotes")):
             if mode == CBZ_TITLE_MODE_TRANSLATED:
@@ -3590,9 +3570,32 @@ class JobManager(EditorManagerMixin):
             if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
                 raise HTTPException(status_code=409, detail="Wait for the job to stop before renaming it.")
             status["jobName"] = name
-            status.pop("translatedJobName", None)
             self.save_status(code, job_id, status)
         return name
+
+    def set_translated_title(self, code: str, job_id: str, name: str) -> str:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        name = name.strip()
+        translated = validate_job_name(name) if name else ""
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Wait for the job to stop before changing its title.",
+                )
+            if translated:
+                status["translatedJobName"] = translated
+                status["titleTranslationAttempted"] = True
+                status.pop("titleTranslationSkipped", None)
+                status.pop("titleTranslationWarning", None)
+            else:
+                status.pop("translatedJobName", None)
+            self.save_status(code, job_id, status)
+        return translated
 
     def translate_title(self, code: str, job_id: str) -> str:
         code = self.validate_category(code)
@@ -3645,8 +3648,80 @@ class JobManager(EditorManagerMixin):
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
             status["translatedJobName"] = translated
+            status.pop("titleTranslationSkipped", None)
+            status.pop("titleTranslationWarning", None)
             self.save_status(code, job_id, status)
         return translated
+
+    def retry_title_translation(
+        self,
+        code: str,
+        job_id: str,
+        manual_title: str = "",
+    ) -> str | None:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        manual_title = manual_title.strip()
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running", "terminating"} or (
+                code,
+                job_id,
+            ) in self._active_processes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Wait for the job to stop before translating its title.",
+                )
+            source_title = str(status.get("comicInfoTitle") or "").strip()
+            if not source_title:
+                source_title = job_name_from_status(status, job_id)
+
+            if manual_title:
+                translated = validate_job_name(manual_title)
+                status["titleTranslationAttempted"] = True
+                status.pop("titleTranslationSkipped", None)
+                status["translatedJobName"] = translated
+                status.pop("titleTranslationWarning", None)
+                self.save_status(code, job_id, status)
+                return translated
+
+            status["titleTranslationAttempted"] = True
+            status.pop("titleTranslationSkipped", None)
+            self.save_status(code, job_id, status)
+
+        try:
+            translated, refused = self.request_vlm_title(
+                code,
+                job_id,
+                source_title,
+                allow_refusal=True,
+            )
+        except Exception as exc:
+            with self._lock:
+                status = self.load_status(code, job_id)
+                if status is not None:
+                    status["titleTranslationWarning"] = (
+                        f"ComicInfo title translation was unavailable: {exc}"
+                    )
+                    self.save_status(code, job_id, status)
+            raise
+
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if refused:
+                status["titleTranslationSkipped"] = True
+                status.pop("titleTranslationWarning", None)
+                self.save_status(code, job_id, status)
+                return None
+            translated = safe_job_name(translated, source_title)
+            status["translatedJobName"] = translated
+            status.pop("titleTranslationWarning", None)
+            self.save_status(code, job_id, status)
+            return translated
 
     def worker_loop(self) -> None:
         while True:
@@ -5162,6 +5237,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         manager.rename_job(code, job_id, parse_job_name_form(name))
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
+    @app.post("/job/{code}/{job_id}/set-translated-title")
+    async def set_translated_title(
+        request: Request,
+        code: str,
+        job_id: str,
+        translated_name: str = Form(""),
+    ) -> RedirectResponse:
+        manager = manager_from_request(request)
+        try:
+            manager.set_translated_title(code, job_id, translated_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
     @app.post("/job/{code}/{job_id}/translate-title")
     async def translate_title(request: Request, code: str, job_id: str) -> Any:
         manager = manager_from_request(request)
@@ -5173,6 +5262,32 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             return job_page(code, job_id, status)
         except Exception as exc:
             LOGGER.exception("Title translation failed for %s/%s", code, job_id)
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/retry-title-translation")
+    async def retry_title_translation(
+        request: Request,
+        code: str,
+        job_id: str,
+        manual_title: str = Form(""),
+    ) -> Any:
+        manager = manager_from_request(request)
+        try:
+            await run_in_threadpool(
+                manager.retry_title_translation,
+                code,
+                job_id,
+                manual_title,
+            )
+        except (HTTPException, ValueError) as exc:
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
+        except Exception as exc:
+            LOGGER.exception("Title translation retry failed for %s/%s", code, job_id)
             status = manager.public_status(code, job_id)
             status["message"] = f"Title translation failed: {exc}"
             return job_page(code, job_id, status)
@@ -5213,7 +5328,6 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         job_id: str,
         variant: str = Form(...),
         title_mode: str = Form(CBZ_TITLE_MODE_ORIGINAL),
-        title_instructions: str = Form(""),
         alt_title_in_notes: str | None = Form(None),
         regenerate: str | None = Form(None),
     ) -> RedirectResponse:
@@ -5223,7 +5337,6 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             job_id,
             variant,
             title_mode=title_mode,
-            title_instructions=title_instructions,
             alt_title_in_notes=parse_checkbox(alt_title_in_notes),
             regenerate=parse_checkbox(regenerate),
         )

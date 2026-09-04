@@ -105,7 +105,7 @@ jobs:
 
           docker exec "${container}" test -f /data/config/vlm_config.json
           docker exec "${container}" test -f /data/config/web_config.json
-          docker logs "${container}" 2>&1 | grep -F "generated admin password (shown once):"
+          docker logs "${container}" 2>&1 | grep -F "default admin password is: changeme"
           test "$(docker inspect --format '{{.State.Running}}' "${container}")" = "true"
 
       - name: Log in to GitHub Container Registry

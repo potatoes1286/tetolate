@@ -38,7 +38,6 @@ CATEGORY_DELETE_CONFIRM = (
 JOB_NAME_MAX_LENGTH = 256
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
-CBZ_TITLE_MODE_OTHER = "other"
 TERMINATE_JOB_CONFIRM = (
     "Terminate this running job? The local VLM request stream will be closed, "
     "but external providers may handle cancellation differently."
@@ -166,6 +165,8 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
     input[type="text"], input[type="url"], input[type="password"] {{ width: min(32rem, 100%); box-sizing: border-box; }}
     textarea {{ width: min(40rem, 100%); }}
     button {{ cursor: pointer; }}
+    .title-setting-row {{ display: flex; align-items: flex-end; gap: 0.5rem; flex-wrap: wrap; }}
+    .title-setting-row label {{ flex: 0 1 32rem; min-width: 0; margin-bottom: 0; }}
     details > fieldset {{ margin: 1rem 0; padding: 1rem; }}
     details > fieldset > legend {{ font-weight: 700; }}
     .row {{ margin: 1rem 0; }}
@@ -274,9 +275,9 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         else '<p class="muted">No job categories. Create one to submit a job.</p>'
     )
     return base_page(
-        "Admin",
+        "tetolate",
         f"""
-<h1>Admin</h1>
+<h1>tetolate</h1>
 {message_html}
 <dl>
   <dt>Worker State</dt><dd class="status">{escape(state)}</dd>
@@ -442,15 +443,18 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
     if status.get("status") != "complete":
         return summary_html + links_html
     mode = str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL)
-    if mode not in {
-        CBZ_TITLE_MODE_ORIGINAL,
-        CBZ_TITLE_MODE_TRANSLATED,
-        CBZ_TITLE_MODE_OTHER,
-    }:
+    if mode not in {CBZ_TITLE_MODE_ORIGINAL, CBZ_TITLE_MODE_TRANSLATED}:
         mode = CBZ_TITLE_MODE_ORIGINAL
-    instructions = str(status.get("cbzTitleInstructions") or "")
     selected = " checked" if status.get("cbzAltTitleInNotes") else ""
-    regenerate = " checked" if status.get("cbzRegenerate") else ""
+    export_buttons: list[str] = []
+    for variant, label in generate_labels.items():
+        item = downloads.get(variant)
+        available = bool(item.get("available")) if isinstance(item, dict) else bool(item)
+        action = f"Regenerate {label.removeprefix('Generate ')}" if available else label
+        regenerate_attribute = ' name="regenerate" value="1"' if available else ""
+        export_buttons.append(
+            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}>{escape(action)}</button>'
+        )
     export_html = f"""
 <details>
   <summary>CBZ export</summary>
@@ -458,14 +462,9 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
     <label>Title in ComicInfo<br><select name="title_mode">
       <option value="original"{" selected" if mode == CBZ_TITLE_MODE_ORIGINAL else ""}>Original title</option>
       <option value="translated"{" selected" if mode == CBZ_TITLE_MODE_TRANSLATED else ""}>Translated title</option>
-      <option value="other"{" selected" if mode == CBZ_TITLE_MODE_OTHER else ""}>Other</option>
     </select></label>
-    <label>Other title instructions<br><input name="title_instructions" type="text" value="{escape(instructions)}" placeholder="Instructions for the VLM"></label>
     <label><input name="alt_title_in_notes" type="checkbox" value="1"{selected}> Add the alternate title to ComicInfo notes</label>
-    <label><input name="regenerate" type="checkbox" value="1"{regenerate}> Regenerate an existing CBZ download</label>
-    <p><button name="variant" value="png" type="submit">Generate PNG CBZ</button>
-      <button name="variant" value="webp" type="submit">Generate WebP CBZ</button>
-      <button name="variant" value="jxl" type="submit">Generate JXL CBZ</button></p>
+    <p>{" ".join(export_buttons)}</p>
   </form>
 </details>
 """
@@ -600,6 +599,7 @@ def advanced_options_fields(
     auto_translate_comicinfo_title: bool = False,
     test_category: str = "",
     test_job_id: str = "",
+    submit_label: str = "",
 ) -> str:
     try:
         budget = _thinking_budget(thinking_budget_tokens)
@@ -641,6 +641,11 @@ def advanced_options_fields(
     clear_paddle_html = (
         '<label><input name="clear_paddleocr_vl_auth_token" type="checkbox" value="1"> Remove saved PaddleOCR-VL token</label>'
         if has_paddleocr_vl_auth_token
+        else ""
+    )
+    submit_button_html = (
+        f'<button type="submit">{escape(submit_label)}</button>'
+        if submit_label
         else ""
     )
     return f"""
@@ -691,7 +696,8 @@ def advanced_options_fields(
     <p class="muted" data-vlm-test-status aria-live="polite"></p>
     <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="{escape(budget)}"></label>
     <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
-  </fieldset>
+</fieldset>
+  {submit_button_html}
 </details>
 """
 
@@ -833,9 +839,9 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     job_name = str(status.get("jobName") or status.get("inputFilename") or job_id)
     translated_job_name = str(status.get("translatedJobName") or "")
     translated_title_html = (
-        f'<p class="translated-title"><strong>Translated title:</strong> {escape(translated_job_name)}</p>'
+        f'<h2 id="translated-title" class="translated-title">{escape(translated_job_name)}</h2>'
         if translated_job_name
-        else ""
+        else '<h2 id="translated-title" class="translated-title" hidden></h2>'
     )
     title_warning = str(status.get("titleTranslationWarning") or "")
     title_warning_html = (
@@ -843,23 +849,26 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
         if title_warning
         else ""
     )
-    rename_html = (
+    title_settings_html = (
         f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/rename" method="post">
-  <label>Job name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(job_name)}"></label>
-  <button type="submit">Rename job</button>
-</form>
+<details>
+  <summary>Title settings</summary>
+  <form action="/job/{escape(code)}/{escape(job_id)}/rename" method="post">
+    <div class="title-setting-row">
+      <label>Original name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(job_name)}"></label>
+      <button type="submit">Set</button>
+    </div>
+  </form>
+  <form action="/job/{escape(code)}/{escape(job_id)}/set-translated-title" method="post">
+    <div class="title-setting-row">
+      <label>Translated name<br><input name="translated_name" type="text" maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(translated_job_name)}"></label>
+      <button type="submit">Set</button>
+      <button formaction="/job/{escape(code)}/{escape(job_id)}/translate-title" type="submit">Translate with VLM</button>
+    </div>
+  </form>
+</details>
 """
         if status.get("canRenameJob")
-        else ""
-    )
-    translate_title_html = (
-        f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/translate-title" method="post">
-  <button type="submit">Translate title</button>
-</form>
-"""
-        if status.get("canTranslateTitle")
         else ""
     )
     thinking_budget = status.get("thinkingBudgetTokens")
@@ -910,7 +919,6 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
   {advanced_options_fields(
       thinking_budget,
       vlm_base_url,
-      open_details=True,
       pause_after_ocr=pause_after_ocr,
       proofread_translations=proofread_translations,
       write_translation_notes=write_translation_notes,
@@ -928,8 +936,8 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
       test_job_id=job_id,
+      submit_label="Save advanced options",
   )}
-  <button type="submit">Save advanced options</button>
 </form>
 """
         if status.get("canUpdateAdvancedOptions")
@@ -1000,8 +1008,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 {title_warning_html}
 <p class="muted">Job ID: {escape(job_id)}</p>
 <p><a href="/category/{escape(code)}">Back to category {escape(code)}</a></p>
-{rename_html}
-{translate_title_html}
+<div id="title-settings">{title_settings_html}</div>
 <dl>
   <dt>Category</dt><dd>{escape(code)}</dd>
   <dt>Input</dt><dd>{input_display_html(status)}</dd>
@@ -1029,6 +1036,13 @@ const code = {json.dumps(code)};
 const jobId = {json.dumps(job_id)};
 const deleteJobConfirm = {json.dumps(DELETE_JOB_CONFIRM)};
 const terminateJobConfirm = {json.dumps(TERMINATE_JOB_CONFIRM)};
+function titleSettingsMarkup(data) {{
+  if (!data.canRenameJob) return "";
+  const originalName = htmlEscape(data.jobName || data.inputFilename || jobId);
+  const translatedName = htmlEscape(data.translatedJobName || "");
+  const baseUrl = `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}`;
+  return `<details><summary>Title settings</summary><form action="${{baseUrl}}/rename" method="post"><div class="title-setting-row"><label>Original name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="${{originalName}}"></label><button type="submit">Set</button></div></form><form action="${{baseUrl}}/set-translated-title" method="post"><div class="title-setting-row"><label>Translated name<br><input name="translated_name" type="text" maxlength="{JOB_NAME_MAX_LENGTH}" value="${{translatedName}}"></label><button type="submit">Set</button><button formaction="${{baseUrl}}/translate-title" type="submit">Translate with VLM</button></div></form></details>`;
+}}
 function htmlEscape(value) {{
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
     "&": "&amp;",
@@ -1094,12 +1108,18 @@ function downloadMarkup(data) {{
   const summaryHtml = summary.length ? `<p class="muted">${{summary.join("; ")}}</p>` : "";
   const linksHtml = links.length ? `<p>${{links.join(" ")}}</p>` : "";
   if (data.status !== "complete") return summaryHtml + linksHtml;
-  const mode = ["original", "translated", "other"].includes(data.cbzTitleMode) ? data.cbzTitleMode : "original";
-  const modeOptions = `<option value="original"${{mode === "original" ? " selected" : ""}}>Original title</option><option value="translated"${{mode === "translated" ? " selected" : ""}}>Translated title</option><option value="other"${{mode === "other" ? " selected" : ""}}>Other</option>`;
-  const instructions = htmlEscape(data.cbzTitleInstructions || "");
+  const mode = ["original", "translated"].includes(data.cbzTitleMode) ? data.cbzTitleMode : "original";
+  const modeOptions = `<option value="original"${{mode === "original" ? " selected" : ""}}>Original title</option><option value="translated"${{mode === "translated" ? " selected" : ""}}>Translated title</option>`;
   const altChecked = data.cbzAltTitleInNotes ? " checked" : "";
-  const regenerateChecked = data.cbzRegenerate ? " checked" : "";
-  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label>Other title instructions<br><input name="title_instructions" type="text" value="${{instructions}}" placeholder="Instructions for the VLM"></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><label><input name="regenerate" type="checkbox" value="1"${{regenerateChecked}}> Regenerate an existing CBZ download</label><p><button name="variant" value="png" type="submit">Generate PNG CBZ</button> <button name="variant" value="webp" type="submit">Generate WebP CBZ</button> <button name="variant" value="jxl" type="submit">Generate JXL CBZ</button></p></form></details>`;
+  const regenerateLabels = {{png: "Regenerate PNG CBZ", webp: "Regenerate WebP CBZ", jxl: "Regenerate JXL CBZ"}};
+  const exportButtons = Object.keys(generateLabels).map((variant) => {{
+    const item = downloads[variant];
+    const available = item && (typeof item !== "object" || item.available);
+    const label = available ? regenerateLabels[variant] : generateLabels[variant];
+    const regenerateAttribute = available ? ' name="regenerate" value="1"' : "";
+    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}>${{label}}</button>`;
+  }}).join(" ");
+  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p></form></details>`;
   return summaryHtml + linksHtml + exportHtml;
 }}
 function deleteMarkup(data) {{
@@ -1145,7 +1165,7 @@ function advancedOptionsMarkup(data) {{
     ? `<label><input name="clear_vlm_auth_token" type="checkbox" value="1"> Remove saved translation VLM token</label>`
     : "";
   return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post">
-    <details open><summary>Advanced options</summary>
+    <details><summary>Advanced options</summary>
       <fieldset><legend>Workflow</legend>
         <label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label>
         <label><input name="enable_proofreading" type="checkbox" value="1"${{proofreadChecked}}> Enable proofreading</label>
@@ -1178,7 +1198,8 @@ function advancedOptionsMarkup(data) {{
         <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label>
         <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
       </fieldset>
-    </details><button type="submit">Save advanced options</button></form>`;
+      <button type="submit">Save advanced options</button>
+    </details></form>`;
 }}
 function rerunJobMarkup(data) {{
   if (!data.canRerunPages) return "";
@@ -1205,11 +1226,16 @@ async function refreshStatus() {{
   document.getElementById("elapsed").textContent = data.elapsed || "";
   document.getElementById("thinking-budget").textContent = data.thinkingBudget || "";
   document.getElementById("message").textContent = data.message || "";
+  const translatedTitle = document.getElementById("translated-title");
+  const translatedName = String(data.translatedJobName || "");
+  translatedTitle.textContent = translatedName;
+  translatedTitle.hidden = !translatedName;
   const log = document.getElementById("log");
   const keepAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
   log.textContent = (data.recentLog || []).join("\\n");
   if (keepAtBottom) log.scrollTop = log.scrollHeight;
   document.getElementById("download").innerHTML = downloadMarkup(data);
+  document.getElementById("title-settings").innerHTML = titleSettingsMarkup(data);
   document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
   if (!(previousStatus === "complete" && data.status === "complete")) {{
     const advancedOptions = document.getElementById("advanced-options");

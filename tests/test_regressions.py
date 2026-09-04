@@ -993,17 +993,24 @@ class WebAuthenticationTests(unittest.TestCase):
                 "translatedJobName": "Translated title",
                 "canRenameJob": True,
                 "canTranslateTitle": True,
+                "canUpdateAdvancedOptions": True,
                 "status": "complete",
                 "recentLog": [],
             },
         ).body.decode("utf-8")
         self.assertIn("Original title", titled_body)
         self.assertIn("Translated title", titled_body)
+        self.assertIn('<h2 id="translated-title" class="translated-title">Translated title</h2>', titled_body)
+        self.assertIn('class="title-setting-row"', titled_body)
         self.assertIn('/job/manga/12345678/rename', titled_body)
-        self.assertIn('/job/manga/12345678/translate-title', titled_body)
+        self.assertIn('/job/manga/12345678/set-translated-title', titled_body)
+        self.assertIn('name="translated_name"', titled_body)
+        self.assertIn("Translate with VLM", titled_body)
+        self.assertIn("<summary>Title settings</summary>", titled_body)
+        self.assertIn('<legend>Translation VLM</legend>', titled_body)
+        self.assertIn("Save advanced options", titled_body)
         self.assertIn('name="title_mode"', titled_body)
-        self.assertIn('name="title_instructions"', titled_body)
-        self.assertIn('name="regenerate"', titled_body)
+        self.assertNotIn("Regenerate an existing CBZ download", titled_body)
 
     def test_vlm_model_is_saved_and_passed_to_the_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1079,7 +1086,7 @@ class WebAuthenticationTests(unittest.TestCase):
 
         self.assertNotIn("--vlm-model", command)
 
-    def test_job_rename_clears_old_translated_title_and_sets_download_name(self) -> None:
+    def test_job_rename_preserves_translated_title_and_sets_download_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = self.initialized_manager(Path(temp_dir), ["default"])
             job_id = "12345678"
@@ -1101,8 +1108,25 @@ class WebAuthenticationTests(unittest.TestCase):
 
         assert status is not None
         self.assertEqual(status["jobName"], "Renamed title")
-        self.assertNotIn("translatedJobName", status)
-        self.assertEqual(download_name, "Renamed title.cbz")
+        self.assertEqual(status["translatedJobName"], "Translated title")
+        self.assertEqual(download_name, "Translated title.cbz")
+
+    def test_translated_title_can_be_set_manually(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {"status": "complete", "jobName": "Original title"},
+            )
+
+            manager.set_translated_title("default", job_id, "Translated title")
+            status = manager.load_status("default", job_id)
+
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "Translated title")
 
     def test_comicinfo_title_becomes_initial_job_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1151,6 +1175,97 @@ class WebAuthenticationTests(unittest.TestCase):
         prompt = call_vlm.call_args.args[1]
         self.assertIn("Original title", prompt)
         self.assertEqual(call_vlm.call_args.args[0].model, "title-model")
+
+    def test_completed_job_can_update_advanced_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "complete"})
+
+            public = manager.public_status("default", job_id, include_log=False)
+
+        self.assertTrue(public["canUpdateAdvancedOptions"])
+
+    def test_retry_title_translation_can_use_a_manual_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "comicInfoTitle": "原題",
+                    "titleTranslationWarning": "The previous key was invalid.",
+                },
+            )
+            with mock.patch.object(manager, "request_vlm_title") as request_vlm_title:
+                translated = manager.retry_title_translation(
+                    "default", job_id, "Manual English title"
+                )
+            status = manager.load_status("default", job_id)
+
+        self.assertEqual(translated, "Manual English title")
+        request_vlm_title.assert_not_called()
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "Manual English title")
+        self.assertNotIn("titleTranslationWarning", status)
+
+    def test_retry_title_translation_retries_comicinfo_title_with_vlm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "comicInfoTitle": "原題",
+                    "titleTranslationWarning": "The previous key was invalid.",
+                    "titleTranslationAttempted": True,
+                },
+            )
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                return_value=("English title", False),
+            ) as request_vlm_title:
+                translated = manager.retry_title_translation("default", job_id)
+            status = manager.load_status("default", job_id)
+
+        self.assertEqual(translated, "English title")
+        request_vlm_title.assert_called_once_with(
+            "default", job_id, "原題", allow_refusal=True
+        )
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "English title")
+        self.assertNotIn("titleTranslationWarning", status)
+
+    def test_retry_title_translation_keeps_a_vlm_failure_as_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {"status": "complete", "comicInfoTitle": "原題"},
+            )
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                side_effect=RuntimeError("401 Unauthorized"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "401 Unauthorized"):
+                    manager.retry_title_translation("default", job_id)
+            status = manager.load_status("default", job_id)
+
+        assert status is not None
+        self.assertIn("ComicInfo title translation was unavailable", status["titleTranslationWarning"])
+        self.assertIn("401 Unauthorized", status["titleTranslationWarning"])
 
     def test_cbz_export_translated_title_is_generated_when_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3186,6 +3301,9 @@ class OriginalInputUiTests(unittest.TestCase):
         self.assertIn("/download/png?v=png-1", markup)
         self.assertIn("Generate WebP CBZ", markup)
         self.assertIn("Generate JXL CBZ", markup)
+        self.assertIn("Regenerate PNG CBZ", markup)
+        self.assertIn('name="regenerate" value="1"', markup)
+        self.assertNotIn("Regenerate an existing CBZ download", markup)
         self.assertIn(
             'action="/job/manga/abc12345/generate-download/webp" method="post"',
             markup,
