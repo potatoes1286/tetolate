@@ -3,10 +3,8 @@ name: tetolate
 services:
   tetolate:
     container_name: tetolate
-    build:
-      context: .
-      target: runtime
-    image: tetolate-core:local
+    image: ghcr.io/potatoes1286/tetolate:latest
+    pull_policy: always
     ports:
       - "127.0.0.1:8088:8088"
     extra_hosts:
@@ -22,7 +20,7 @@ services:
 
   llama-paddleocr-vl16:
     profiles: ["paddleocr-vl"]
-    image: ghcr.io/ggml-org/llama.cpp:server-b9445@sha256:8dd148c53936b6e8b0e75309841e66eab13adc50b004a5e86ab1fec477c17d8e
+    image: ghcr.io/ggml-org/llama.cpp:server
     container_name: tetolate-llama-paddleocr-vl16
     restart: unless-stopped
     ports:

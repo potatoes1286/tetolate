@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import tempfile
@@ -29,6 +30,7 @@ import paddle_ocr_server
 import placement_detection
 import prompt_templates
 import translate_cbz
+import vlm_client
 import web_app
 import web_pages
 import web_security
@@ -91,7 +93,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assertEqual(config.jxl_quality, 65)
         self.assertEqual(config.ocr.min_score, 0.75)
         self.assertEqual(config.ocr.engine, paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL)
-        self.assertEqual(config.render_font, "DejaVu-Sans")
+        self.assertEqual(config.render_font, "ComicNeue-Bold.ttf")
 
     def test_hidden_ocr_options_are_not_read_from_vlm_config(self) -> None:
         language = translate_cbz.language_config_from_codes("jp", "en")
@@ -112,9 +114,180 @@ class RepositoryHygieneTests(unittest.TestCase):
 
     def test_missing_user_font_uses_backup_font(self) -> None:
         self.assertEqual(
-            translate_cbz.normalize_font_name(None, "DejaVu-Sans"),
-            "DejaVu-Sans",
+            translate_cbz.normalize_font_name(None, "ComicNeue-Bold.ttf"),
+            "ComicNeue-Bold.ttf",
         )
+        self.assertEqual(
+            Path(overlay_text.DEFAULT_FONT).name,
+            "ComicNeue-Bold.ttf",
+        )
+
+    def test_bundled_fonts_are_available_without_user_fonts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            with (
+                mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir),
+                mock.patch.object(
+                    translate_cbz,
+                    "FONT_USE_PATH",
+                    user_font_dir / "font_use.txt",
+                ),
+            ):
+                names = translate_cbz.available_font_names()
+                path = translate_cbz.local_font_path(
+                    None, translate_cbz.DEFAULT_RENDER_FONT
+                )
+                prompt = translate_cbz.font_use_prompt(
+                    translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertIn("ComicNeue-Bold.ttf", names)
+        self.assertEqual(Path(path).name, "ComicNeue-Bold.ttf")
+        self.assertIn("ComicNeue-BoldItalic.ttf", prompt)
+        self.assertIn("Bangers-Regular.ttf", prompt)
+
+    def test_bundled_font_files_match_recorded_checksums(self) -> None:
+        expected = {
+            "ArchitectsDaughter-Regular.ttf": "6159718a08898e34bc1cb7354086141a5f9a70b73e54dbec27ead0d59a697359",
+            "Bangers-Regular.ttf": "4160a7311de9342674cce9160cde9fcbb30f48190397d86ff1b70b455af65824",
+            "ComicNeue-Bold.ttf": "3e7e5fccfd7e0788f317b43312151c1bd5cf058c9697a8d83eac3939050bd61e",
+            "ComicNeue-BoldItalic.ttf": "5c312c2a2fa64eee82f3b87fcfab8f3b12a5e59b043124401d322eb323cfbf16",
+            "IBMPlexMono-Medium.ttf": "a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755",
+        }
+
+        actual = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in translate_cbz.BUNDLED_FONT_DIR.glob("*.ttf")
+        }
+
+        self.assertEqual(actual, expected)
+
+    def test_user_font_overrides_bundled_font_with_the_same_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            user_font = user_font_dir / "ComicNeue-Bold.ttf"
+            user_font.touch()
+            with mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir):
+                resolved = translate_cbz.local_font_path(
+                    "ComicNeue-Bold.ttf", translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertEqual(resolved, str(user_font))
+
+    def test_user_font_use_file_replaces_bundled_role_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            user_font_dir = Path(temp_dir)
+            user_font = user_font_dir / "professional.ttf"
+            user_font.touch()
+            font_use_path = user_font_dir / "font_use.txt"
+            font_use_path.write_text(
+                "professional.ttf: talking, narrator, fallback\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(translate_cbz, "FONT_DIR", user_font_dir),
+                mock.patch.object(translate_cbz, "FONT_USE_PATH", font_use_path),
+            ):
+                prompt = translate_cbz.font_use_prompt(
+                    translate_cbz.DEFAULT_RENDER_FONT
+                )
+
+        self.assertIn("professional.ttf", prompt)
+        self.assertNotIn("Bangers-Regular.ttf", prompt)
+
+    def test_quality_config_rejects_fractional_values(self) -> None:
+        with self.assertRaises(translate_cbz.PipelineError):
+            translate_cbz.config_quality(
+                {"quality": 70.9}, "quality", 65, "output"
+            )
+        with self.assertRaises(translate_cbz.PipelineError):
+            translate_cbz.config_quality(
+                {"quality": "70.9"}, "quality", 65, "output"
+            )
+
+    def test_quality_config_accepts_integral_float_values(self) -> None:
+        self.assertEqual(
+            translate_cbz.config_quality({"quality": 70.0}, "quality", 65, "output"),
+            70,
+        )
+
+
+class VLMModelDiscoveryTests(unittest.TestCase):
+    @staticmethod
+    def vlm_config(model: str | None = None) -> translate_cbz.VLMConfig:
+        return translate_cbz.VLMConfig(
+            base_url="http://vlm.example/v1",
+            api_key="not-needed",
+            model=model,
+            temperature=0.7,
+            max_tokens=1024,
+            thinking_budget_tokens=0,
+            timeout=30,
+            provider=None,
+        )
+
+    def test_list_vlm_model_ids_deduplicates_and_closes_client(self) -> None:
+        client = mock.Mock()
+        client.models.list.return_value = types.SimpleNamespace(
+            data=[
+                types.SimpleNamespace(id="first"),
+                {"id": "second"},
+                types.SimpleNamespace(id="first"),
+                types.SimpleNamespace(id="  third  "),
+                types.SimpleNamespace(id=""),
+            ]
+        )
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            result = vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        self.assertEqual(result, ["first", "second", "third"])
+        client.models.list.assert_called_once_with()
+        client.close.assert_called_once_with()
+
+    def test_list_vlm_model_ids_raises_safe_error_and_closes_client(self) -> None:
+        client = mock.Mock()
+        client.models.list.side_effect = RuntimeError("connection refused: secret-token")
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            with self.assertRaisesRegex(vlm_client.PipelineError, "Could not list VLM models") as raised:
+                vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        self.assertNotIn("secret-token", str(raised.exception))
+        client.close.assert_called_once_with()
+
+    def test_list_vlm_model_ids_rejects_empty_results(self) -> None:
+        client = mock.Mock()
+        client.models.list.return_value = types.SimpleNamespace(data=[])
+        with mock.patch.object(vlm_client, "openai_client", return_value=client):
+            with self.assertRaisesRegex(vlm_client.PipelineError, "No VLM models"):
+                vlm_client.list_vlm_model_ids(self.vlm_config())
+
+        client.close.assert_called_once_with()
+
+    def test_vlm_model_override_avoids_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "vlm_config.json"
+            config_path.write_text(
+                json.dumps({"base_url": "http://vlm.example/v1"}), encoding="utf-8"
+            )
+            config = translate_cbz.load_config(config_path, None)
+
+        overridden = translate_cbz.apply_vlm_model_override(config, " selected-model ")
+        assert overridden.vlm is not None
+        with mock.patch.object(vlm_client, "list_vlm_model_ids") as list_models:
+            self.assertEqual(vlm_client.resolve_vlm_model(overridden.vlm), "selected-model")
+
+        list_models.assert_not_called()
+
+    def test_vlm_model_override_requires_a_nonempty_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "vlm_config.json"
+            config_path.write_text(
+                json.dumps({"base_url": "http://vlm.example/v1"}), encoding="utf-8"
+            )
+            config = translate_cbz.load_config(config_path, None)
+
+        with self.assertRaisesRegex(translate_cbz.PipelineError, "non-empty model ID"):
+            translate_cbz.apply_vlm_model_override(config, "   ")
 
 
 class PromptTemplateTests(unittest.TestCase):
@@ -289,10 +462,14 @@ class WebAuthenticationTests(unittest.TestCase):
             "jobs_dir": str(root / "jobs"),
             "max_upload_bytes": 1024 * 1024,
         }
+        pipeline_data = json.loads(
+            (repo_dir / "data" / "config" / "vlm_config.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        pipeline_data["model"] = "test-vlm-model"
         (root / "vlm_config.json").write_text(
-            (
-                repo_dir / "data" / "config" / "vlm_config.example.json"
-            ).read_text(encoding="utf-8"),
+            json.dumps(pipeline_data),
             encoding="utf-8",
         )
         path = root / "web_config.json"
@@ -329,6 +506,189 @@ class WebAuthenticationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unused_setting"):
                 web_app.load_web_config(config_path)
 
+    def test_delete_job_reports_directory_deletion_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "failed"})
+
+            with mock.patch(
+                "web_app.shutil.rmtree",
+                side_effect=PermissionError("permission denied"),
+            ):
+                with self.assertRaisesRegex(HTTPException, "Could not delete job") as raised:
+                    manager.delete_job("default", job_id)
+
+            self.assertEqual(raised.exception.status_code, 500)
+
+    def test_upload_removes_job_directory_when_submission_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_web_config(root)
+            manager = self.initialized_manager(root, ["default"])
+            app = web_app.create_app(config_path)
+            app.state.manager = manager
+
+            archive_bytes = io.BytesIO()
+            with zipfile.ZipFile(archive_bytes, "w") as archive:
+                image = io.BytesIO()
+                Image.new("RGB", (2, 2), "white").save(image, format="PNG")
+                archive.writestr("001.png", image.getvalue())
+
+            async def exercise_upload() -> None:
+                upload_endpoint = next(
+                    route.endpoint for route in app.routes if route.path == "/upload"
+                )
+                request = web_app.Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/upload",
+                        "raw_path": b"/upload",
+                        "scheme": "http",
+                        "query_string": b"",
+                        "headers": [],
+                        "server": ("testserver", 80),
+                        "client": ("testclient", 123),
+                        "root_path": "",
+                        "app": app,
+                    }
+                )
+                class FakeUpload:
+                    filename = "comic.cbz"
+
+                    def __init__(self, payload: bytes) -> None:
+                        self.payload = payload
+
+                    async def read(self, _size: int) -> bytes:
+                        payload, self.payload = self.payload, b""
+                        return payload
+
+                    async def close(self) -> None:
+                        return None
+
+                cbz = FakeUpload(archive_bytes.getvalue())
+                with mock.patch.object(
+                    manager,
+                    "submit_job",
+                    side_effect=RuntimeError("queue unavailable"),
+                ):
+                    async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                        return function(*args)  # type: ignore[operator]
+
+                    with mock.patch(
+                        "web_app.run_in_threadpool",
+                        side_effect=direct_run_in_threadpool,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "queue unavailable"):
+                            await upload_endpoint(
+                                request,
+                                category="default",
+                                cbz=cbz,
+                                page_images=None,
+                                translation_notes="",
+                                thinking_budget_tokens="",
+                                vlm_base_url="",
+                                vlm_model="vision-model",
+                                pause_after_ocr=None,
+                                enable_alt_placement=None,
+                                enable_proofreading=None,
+                                enable_translation_notes=None,
+                                source_language="",
+                                ocr_engine="",
+                                paddleocr_vl_server_url="",
+                                paddleocr_vl_model="",
+                                ocr_page_workers="1",
+                                lama_workers="1",
+                                imagemagick_workers="1",
+                                vlm_auth_token="",
+                                paddleocr_vl_auth_token="",
+                            )
+
+            asyncio.run(exercise_upload())
+            self.assertEqual(list(manager.jobs_dir("default").iterdir()), [])
+
+    def test_upload_request_size_limit_rejects_declared_oversize_before_parsing(self) -> None:
+        downstream_called = False
+        sent_messages: list[dict[str, object]] = []
+
+        class Config:
+            max_upload_bytes = 3
+
+        class Manager:
+            config = Config()
+
+        async def downstream(scope: dict[str, object], receive: object, send: object) -> None:
+            nonlocal downstream_called
+            downstream_called = True
+
+        downstream.state = types.SimpleNamespace(manager=Manager())  # type: ignore[attr-defined]
+
+        async def receive() -> dict[str, object]:
+            raise AssertionError("the request body should not be read")
+
+        async def send(message: dict[str, object]) -> None:
+            sent_messages.append(message)
+
+        async def exercise() -> None:
+            middleware = web_app.UploadSizeLimitMiddleware(downstream)
+            await middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/upload",
+                    "headers": [(b"content-length", b"4")],
+                },
+                receive,
+                send,
+            )
+
+        asyncio.run(exercise())
+        self.assertFalse(downstream_called)
+        self.assertEqual(sent_messages[0]["status"], 413)
+
+    def test_upload_request_size_limit_rejects_oversize_stream(self) -> None:
+        sent_messages: list[dict[str, object]] = []
+        receive_calls = 0
+
+        class Config:
+            max_upload_bytes = 3
+
+        class Manager:
+            config = Config()
+
+        async def downstream(scope: dict[str, object], receive: object, send: object) -> None:
+            await receive()  # type: ignore[misc]
+            await receive()  # type: ignore[misc]
+
+        downstream.state = types.SimpleNamespace(manager=Manager())  # type: ignore[attr-defined]
+
+        async def receive() -> dict[str, object]:
+            nonlocal receive_calls
+            receive_calls += 1
+            return {"type": "http.request", "body": b"12", "more_body": True}
+
+        async def send(message: dict[str, object]) -> None:
+            sent_messages.append(message)
+
+        async def exercise() -> None:
+            middleware = web_app.UploadSizeLimitMiddleware(downstream)
+            await middleware(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/upload",
+                    "headers": [],
+                },
+                receive,
+                send,
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(receive_calls, 2)
+        self.assertEqual(sent_messages[0]["status"], 413)
+
     def test_password_hash_round_trip_and_strict_parsing(self) -> None:
         encoded = web_security.hash_password("a sufficiently long password")
 
@@ -339,7 +699,7 @@ class WebAuthenticationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             web_security.parse_password_hash("not-a-password-hash")
 
-    def test_first_start_generates_password_and_private_state(self) -> None:
+    def test_first_start_uses_default_password_and_private_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = web_app.load_web_config(self.write_web_config(root))
@@ -350,15 +710,25 @@ class WebAuthenticationTests(unittest.TestCase):
             with mock.patch("sys.stderr", output):
                 manager.initialize_web_state()
 
-            generated = output.getvalue().split("shown once): ", 1)[1].strip()
             state_path = manager.web_state_path()
             state = web_security.read_json_object(state_path)
             self.assertTrue(
-                web_security.verify_password(generated, state["adminPasswordHash"])
+                web_security.verify_password(
+                    web_app.DEFAULT_ADMIN_PASSWORD,
+                    state["adminPasswordHash"],
+                )
             )
+            self.assertIn("default admin password is: changeme", output.getvalue())
             self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(manager.categories(), (web_app.DEFAULT_CATEGORY,))
+            self.assertTrue(manager.category_dir(web_app.DEFAULT_CATEGORY).is_dir())
+            self.assertTrue(
+                manager.load_category_advanced_options(web_app.DEFAULT_CATEGORY)[
+                    "autoTranslateComicInfoTitle"
+                ]
+            )
 
-    def test_generated_password_is_printed_before_state_persistence(self) -> None:
+    def test_default_password_is_printed_before_state_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config = web_app.load_web_config(self.write_web_config(root))
@@ -377,7 +747,7 @@ class WebAuthenticationTests(unittest.TestCase):
             ):
                 manager.initialize_web_state()
 
-            self.assertIn("generated admin password (shown once):", output.getvalue())
+            self.assertIn("default admin password is: changeme", output.getvalue())
 
     def test_sessions_are_individual_and_revocable(self) -> None:
         manager = object.__new__(web_app.JobManager)
@@ -424,6 +794,26 @@ class WebAuthenticationTests(unittest.TestCase):
             self.assertNotIn("volume-one", manager.categories())
             self.assertFalse(manager.category_dir("volume-one").exists())
 
+    def test_category_rename_preserves_jobs_and_updates_status_category(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir))
+            manager.create_category("volume-one")
+            job_id = "12345678"
+            manager.job_dir("volume-one", job_id).mkdir(parents=True)
+            manager.save_status("volume-one", job_id, {"status": "complete"})
+
+            renamed = manager.rename_category("volume-one", "volume-two")
+            status = manager.load_status("volume-two", job_id)
+            new_job_exists = manager.job_dir("volume-two", job_id).exists()
+
+        self.assertEqual(renamed, "volume-two")
+        self.assertNotIn("volume-one", manager.categories())
+        self.assertIn("volume-two", manager.categories())
+        self.assertFalse(manager.category_dir("volume-one").exists())
+        self.assertTrue(new_job_exists)
+        assert status is not None
+        self.assertEqual(status["category"], "volume-two")
+
     def test_vlm_endpoint_is_remembered_and_passed_to_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -434,6 +824,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 "default",
                 thinking_budget_tokens=256,
                 vlm_base_url=endpoint,
+                vlm_model="vision-model",
                 pause_after_ocr=False,
                 proofread_translations=True,
                 write_translation_notes=True,
@@ -453,6 +844,7 @@ class WebAuthenticationTests(unittest.TestCase):
                 {
                     "status": "failed",
                     "vlmBaseUrl": endpoint,
+                    "vlmModel": "vision-model",
                 },
             )
             command = manager.build_command("default", job_id)
@@ -541,6 +933,589 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertNotIn("test-vlm-token", markup)
         self.assertNotIn("test-ocr-token", markup)
 
+    def test_advanced_options_include_vlm_model_selection_and_connection_test(self) -> None:
+        markup = web_pages.advanced_options_fields(
+            2048,
+            "http://127.0.0.1:8080/v1",
+            vlm_model="example-vlm",
+            test_category="manga",
+            test_job_id="12345678",
+        )
+
+        self.assertIn('<select name="vlm_model" required>', markup)
+        self.assertIn('<option value="example-vlm" selected>example-vlm</option>', markup)
+        self.assertIn('class="vlm-test-button" type="button"', markup)
+        self.assertIn('data-vlm-test-category="manga"', markup)
+        self.assertIn('data-vlm-test-job-id="12345678"', markup)
+        self.assertIn("Test connection and load models", markup)
+        self.assertIn("data-vlm-test-status", markup)
+
+        rename_page = web_pages.category_rename_page("old-name")
+        self.assertIn("Rename category", rename_page.body.decode("utf-8"))
+
+        category_body = web_pages.category_jobs_page(
+            "manga",
+            {"jobs": [], "defaultVlmModel": "example-vlm"},
+        ).body.decode("utf-8")
+        self.assertIn('<option value="example-vlm" selected>example-vlm</option>', category_body)
+        self.assertIn('data-vlm-test-category="manga"', category_body)
+        self.assertIn('fetch("/api/vlm/test"', category_body)
+        self.assertIn("[data-vlm-test-status] { white-space: pre-line; }", category_body)
+
+        job_body = web_pages.job_page(
+            "manga",
+            "12345678",
+            {
+                "status": "failed",
+                "recentLog": [],
+                "canUpdateAdvancedOptions": True,
+                "vlmModel": "example-vlm",
+            },
+        ).body.decode("utf-8")
+        self.assertIn('data-vlm-test-job-id="12345678"', job_body)
+
+    def test_job_page_dynamic_advanced_options_include_vlm_connection_test(self) -> None:
+        body = web_pages.job_page(
+            "manga",
+            "12345678",
+            {"status": "failed", "recentLog": []},
+        ).body.decode("utf-8")
+
+        self.assertIn("function advancedOptionsMarkup(data)", body)
+        self.assertIn("data.vlmModel || data.defaultVlmModel", body)
+        self.assertIn('<select name="vlm_model" required>${vlmModelOptions(vlmModel)}</select>', body)
+        self.assertIn('fetch("/api/vlm/test"', body)
+        self.assertIn("vlmBaseUrl: endpoint.value", body)
+        self.assertIn("payload.vlmAuthToken = token.value", body)
+        self.assertIn("payload.category = category", body)
+        self.assertIn("payload.jobId = testJobId", body)
+        self.assertIn("Connected. Found ${loadedVlmModels.length} model(s).", body)
+        self.assertIn("status.textContent = error instanceof Error", body)
+        self.assertIn('advancedOptions.querySelector("form")', body)
+
+        titled_body = web_pages.job_page(
+            "manga",
+            "12345678",
+            {
+                "jobName": "Original title",
+                "translatedJobName": "Translated title",
+                "canRenameJob": True,
+                "canTranslateTitle": True,
+                "canUpdateAdvancedOptions": True,
+                "status": "complete",
+                "recentLog": [],
+            },
+        ).body.decode("utf-8")
+        self.assertIn("Original title", titled_body)
+        self.assertIn("Translated title", titled_body)
+        self.assertIn('<h2 id="translated-title" class="translated-title">Translated title</h2>', titled_body)
+        self.assertIn('class="title-setting-row"', titled_body)
+        self.assertIn('/job/manga/12345678/rename', titled_body)
+        self.assertIn('/job/manga/12345678/set-translated-title', titled_body)
+        self.assertIn('name="translated_name"', titled_body)
+        self.assertIn("Translate with VLM", titled_body)
+        self.assertIn("<summary>Title settings</summary>", titled_body)
+        self.assertIn('<legend>Translation VLM</legend>', titled_body)
+        self.assertIn("Save advanced options", titled_body)
+        self.assertIn('name="title_mode"', titled_body)
+        self.assertNotIn("Regenerate an existing CBZ download", titled_body)
+
+    def test_vlm_model_is_saved_and_passed_to_the_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            code, job_id = "default", "12345678"
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            manager.save_status(
+                code,
+                job_id,
+                {
+                    "status": "failed",
+                    "vlmModel": " selected-model ",
+                },
+            )
+
+            payload = manager.public_status(code, job_id, include_log=False)
+            command = manager.build_command(code, job_id)
+
+        self.assertEqual(payload["vlmModel"], "selected-model")
+        model_index = command.index("--vlm-model")
+        self.assertEqual(command[model_index + 1], "selected-model")
+
+    def test_existing_job_without_vlm_model_remains_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            manager.config = replace(manager.config, default_vlm_model="")
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "complete"})
+
+            public = manager.public_status("default", job_id, include_log=False)
+            category = manager.public_category_jobs("default")
+
+        self.assertEqual(public["vlmModel"], "")
+        self.assertEqual(len(category["jobs"]), 1)
+
+    def test_new_job_without_vlm_model_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            manager.config = replace(manager.config, default_vlm_model="")
+            manager.job_dir("default", "12345678").mkdir(parents=True)
+
+            with self.assertRaisesRegex(ValueError, "VLM model is required"):
+                manager.submit_job("default", "12345678", "comic.cbz")
+
+    def test_old_job_rerun_without_vlm_model_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            manager.config = replace(manager.config, default_vlm_model="")
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "failed"})
+            manager.input_path("default", job_id).write_bytes(b"input")
+
+            with self.assertRaisesRegex(HTTPException, "VLM model is required"):
+                manager.build_command("default", job_id)
+
+    def test_package_only_command_without_vlm_model_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            manager.config = replace(manager.config, default_vlm_model="")
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "complete"})
+
+            command = manager.build_command(
+                "default", job_id, "package", 0, package_variant="webp"
+            )
+
+        self.assertNotIn("--vlm-model", command)
+
+    def test_job_rename_preserves_translated_title_and_sets_download_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "inputFilename": "original.cbz",
+                    "jobName": "Original title",
+                    "translatedJobName": "Translated title",
+                },
+            )
+
+            manager.rename_job("default", job_id, "Renamed title")
+            status = manager.load_status("default", job_id)
+            download_name = manager.translated_cbz_download_name("default", job_id)
+
+        assert status is not None
+        self.assertEqual(status["jobName"], "Renamed title")
+        self.assertEqual(status["translatedJobName"], "Translated title")
+        self.assertEqual(download_name, "Translated title.cbz")
+
+    def test_translated_title_can_be_set_manually(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {"status": "complete", "jobName": "Original title"},
+            )
+
+            manager.set_translated_title("default", job_id, "Translated title")
+            status = manager.load_status("default", job_id)
+
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "Translated title")
+
+    def test_comicinfo_title_becomes_initial_job_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            with zipfile.ZipFile(manager.input_path("default", job_id), "w") as archive:
+                archive.writestr("page.png", b"source")
+                archive.writestr("ComicInfo.xml", "<ComicInfo><Title>Comic title</Title></ComicInfo>")
+
+            manager.submit_job("default", job_id, "uploaded.cbz")
+            status = manager.load_status("default", job_id)
+
+        assert status is not None
+        self.assertEqual(status["comicInfoTitle"], "Comic title")
+        self.assertEqual(status["jobName"], "Comic title")
+
+    def test_title_translation_uses_vlm_and_saves_translated_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "jobName": "Original title",
+                    "vlmModel": "title-model",
+                },
+            )
+            with mock.patch.object(
+                web_app.vlm_client,
+                "call_vlm",
+                return_value=types.SimpleNamespace(output='"Translated title"'),
+            ) as call_vlm:
+                translated = manager.translate_title("default", job_id)
+            status = manager.load_status("default", job_id)
+            download_name = manager.translated_cbz_download_name("default", job_id)
+
+        self.assertEqual(translated, "Translated title")
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "Translated title")
+        self.assertEqual(download_name, "Translated title.cbz")
+        prompt = call_vlm.call_args.args[1]
+        self.assertIn("Original title", prompt)
+        self.assertEqual(call_vlm.call_args.args[0].model, "title-model")
+
+    def test_completed_job_can_update_advanced_options(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "complete"})
+
+            public = manager.public_status("default", job_id, include_log=False)
+
+        self.assertTrue(public["canUpdateAdvancedOptions"])
+
+    def test_retry_title_translation_can_use_a_manual_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "comicInfoTitle": "原題",
+                    "titleTranslationWarning": "The previous key was invalid.",
+                },
+            )
+            with mock.patch.object(manager, "request_vlm_title") as request_vlm_title:
+                translated = manager.retry_title_translation(
+                    "default", job_id, "Manual English title"
+                )
+            status = manager.load_status("default", job_id)
+
+        self.assertEqual(translated, "Manual English title")
+        request_vlm_title.assert_not_called()
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "Manual English title")
+        self.assertNotIn("titleTranslationWarning", status)
+
+    def test_retry_title_translation_retries_comicinfo_title_with_vlm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "comicInfoTitle": "原題",
+                    "titleTranslationWarning": "The previous key was invalid.",
+                    "titleTranslationAttempted": True,
+                },
+            )
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                return_value=("English title", False),
+            ) as request_vlm_title:
+                translated = manager.retry_title_translation("default", job_id)
+            status = manager.load_status("default", job_id)
+
+        self.assertEqual(translated, "English title")
+        request_vlm_title.assert_called_once_with(
+            "default", job_id, "原題", allow_refusal=True
+        )
+        assert status is not None
+        self.assertEqual(status["translatedJobName"], "English title")
+        self.assertNotIn("titleTranslationWarning", status)
+
+    def test_retry_title_translation_keeps_a_vlm_failure_as_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {"status": "complete", "comicInfoTitle": "原題"},
+            )
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                side_effect=RuntimeError("401 Unauthorized"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "401 Unauthorized"):
+                    manager.retry_title_translation("default", job_id)
+            status = manager.load_status("default", job_id)
+
+        assert status is not None
+        self.assertIn("ComicInfo title translation was unavailable", status["titleTranslationWarning"])
+        self.assertIn("401 Unauthorized", status["titleTranslationWarning"])
+
+    def test_cbz_export_translated_title_is_generated_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status(
+                "default",
+                job_id,
+                {
+                    "status": "complete",
+                    "comicInfoTitle": "原題",
+                    "cbzTitleMode": "translated",
+                    "cbzAltTitleInNotes": True,
+                    "vlmModel": "title-model",
+                },
+            )
+            status = manager.load_status("default", job_id)
+            assert status is not None
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                return_value=("English title", False),
+            ):
+                selected, alternate, warning = manager.resolve_cbz_export_titles(
+                    "default", job_id, status
+                )
+
+        self.assertEqual(selected, "English title")
+        self.assertEqual(alternate, "原題")
+        self.assertIsNone(warning)
+        self.assertEqual(status["translatedJobName"], "English title")
+
+    def test_cbz_export_falls_back_to_original_when_title_vlm_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self.initialized_manager(Path(temp_dir), ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            status = {
+                "status": "complete",
+                "comicInfoTitle": "原題",
+                "cbzTitleMode": "translated",
+            }
+            with mock.patch.object(
+                manager,
+                "request_vlm_title",
+                side_effect=RuntimeError("endpoint unavailable"),
+            ):
+                selected, alternate, warning = manager.resolve_cbz_export_titles(
+                    "default", job_id, status
+                )
+
+        self.assertEqual(selected, "原題")
+        self.assertIsNone(alternate)
+        self.assertIn("using", warning or "")
+
+    def test_vlm_probe_uses_supplied_or_saved_private_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_web_config(root)
+            manager = self.initialized_manager(root, ["default"])
+            code, job_id = "default", "12345678"
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.update_job_auth_tokens(
+                code,
+                job_id,
+                vlm_auth_token="saved-token",
+                paddleocr_vl_auth_token=None,
+                preserve_existing=False,
+            )
+            app = web_app.create_app(config_path)
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                transport = ASGITransport(app=app)
+                async with AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with mock.patch.object(
+                        manager,
+                        "probe_vlm_models",
+                        return_value=["first", "second"],
+                    ) as probe, mock.patch.object(
+                        web_app,
+                        "run_in_threadpool",
+                        new=direct_run_in_threadpool,
+                    ):
+                        response = await client.post(
+                            "/api/vlm/test",
+                            json={
+                                "vlmBaseUrl": "http://vlm.example/v1",
+                                "vlmAuthToken": "supplied-token",
+                                "category": code,
+                                "jobId": job_id,
+                            },
+                        )
+                        category_response = await client.post(
+                            "/api/vlm/test",
+                            json={
+                                "vlmBaseUrl": "http://vlm.example/v1",
+                                "category": code,
+                            },
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(category_response.status_code, 200)
+                self.assertEqual(
+                    response.json(),
+                    {
+                        "ok": True,
+                        "models": ["first", "second"],
+                        "message": "Connected. Found 2 model(s).",
+                    },
+                )
+                self.assertNotIn("supplied-token", response.text)
+                self.assertNotIn("saved-token", response.text)
+                self.assertEqual(
+                    probe.call_args_list,
+                    [
+                        mock.call("http://vlm.example/v1", "supplied-token"),
+                        mock.call("http://vlm.example/v1", None),
+                    ],
+                )
+
+            asyncio.run(exercise())
+
+    def test_vlm_probe_remembers_supplied_token_for_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_web_config(root)
+            manager = self.initialized_manager(root, ["default"])
+            code, job_id = "default", "12345678"
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            app = web_app.create_app(config_path)
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                transport = ASGITransport(app=app)
+                async with AsyncClient(
+                    transport=transport,
+                    base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with mock.patch.object(
+                        manager,
+                        "probe_vlm_models",
+                        return_value=["model"],
+                    ), mock.patch.object(
+                        web_app,
+                        "run_in_threadpool",
+                        new=direct_run_in_threadpool,
+                    ):
+                        response = await client.post(
+                            "/api/vlm/test",
+                            json={
+                                "vlmBaseUrl": "http://vlm.example/v1",
+                                "vlmAuthToken": "supplied-token",
+                                "category": code,
+                                "jobId": job_id,
+                            },
+                        )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    manager.load_job_secrets(code, job_id)["vlmAuthToken"],
+                    "supplied-token",
+                )
+                self.assertNotIn("supplied-token", response.text)
+
+            asyncio.run(exercise())
+
+    def test_vlm_probe_failure_adds_docker_note_only_for_localhost(self) -> None:
+        self.assertEqual(
+            web_app.vlm_probe_failure_detail("http://127.0.0.1:8080/v1"),
+            "Could not connect to the VLM endpoint.\n- Is your API key correct?\n"
+            "- If in a docker container connecting to the local host, use "
+            "http://host.docker.internal instead of http://127.0.0.1.",
+        )
+        self.assertIn(
+            "host.docker.internal",
+            web_app.vlm_probe_failure_detail("http://[::1]:8080/v1"),
+        )
+        self.assertNotIn(
+            "host.docker.internal",
+            web_app.vlm_probe_failure_detail("https://vlm.example/v1"),
+        )
+
+    def test_vlm_probe_failure_identifies_authentication_errors(self) -> None:
+        error = RuntimeError("Client error '401 Unauthorized' for url 'http://vlm.example/v1/models'")
+        error.status_code = 401  # type: ignore[attr-defined]
+        self.assertEqual(
+            web_app.vlm_probe_failure_detail(
+                "https://vlm.example/v1",
+                error,
+            ),
+            "The VLM endpoint rejected the request.\n- Is your API key correct?\n\n"
+            "Endpoint error: 401 Unauthorized",
+        )
+
+    def test_vlm_probe_failure_omits_docker_guidance_for_http_errors(self) -> None:
+        error = RuntimeError("Server error")
+        error.status_code = 500  # type: ignore[attr-defined]
+        detail = web_app.vlm_probe_failure_detail(
+            "http://127.0.0.1:5001/v1",
+            error,
+        )
+        self.assertEqual(
+            detail,
+            "The VLM endpoint returned an error.\n\n"
+            "Endpoint error: 500 Internal Server Error",
+        )
+
+    def test_vlm_probe_failure_adds_connection_guidance(self) -> None:
+        error = ConnectionError("[Errno 111] Connection refused")
+        detail = web_app.vlm_probe_failure_detail(
+            "http://host.docker.internal",
+            error,
+        )
+        self.assertIn("- Did you forget to set the port?", detail)
+        self.assertIn("- Most API endpoints require http://address/v1.", detail)
+
+        detail = web_app.vlm_probe_failure_detail(
+            "http://192.168.1.25:5001/v1",
+            error,
+        )
+        self.assertIn("- Did you forget to set the port?", detail)
+        self.assertNotIn("Most API endpoints require", detail)
+
     def test_page_worker_limits_are_validated(self) -> None:
         self.assertEqual(web_app.parse_page_workers_form("1", "OCR workers"), 1)
         self.assertEqual(web_app.parse_page_workers_form("32", "OCR workers"), 32)
@@ -570,6 +1545,27 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--ocr-workers") + 1], "2")
         self.assertEqual(command[command.index("--lama-workers") + 1], "3")
         self.assertEqual(command[command.index("--imagemagick-workers") + 1], "4")
+
+    def test_web_pipeline_skips_archives_and_package_generation_selects_one_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            job_id = "12345678"
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.save_status("default", job_id, {"status": "failed"})
+
+            normal_command = manager.build_command("default", job_id)
+            package_command = manager.build_command(
+                "default", job_id, "package", 0, package_variant="webp"
+            )
+
+        self.assertIn("--skip-package", normal_command)
+        self.assertNotIn("--package-variant", normal_command)
+        self.assertNotIn("--skip-package", package_command)
+        self.assertEqual(
+            package_command[package_command.index("--package-variant") + 1],
+            "webp",
+        )
 
     def test_case_colliding_saved_categories_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1189,6 +2185,35 @@ class CleanTextRegionTests(unittest.TestCase):
 
 
 class AtomicPackagingTests(unittest.TestCase):
+    def test_packaging_updates_comicinfo_title_and_alternate_note(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("page.png", b"source")
+                archive.writestr(
+                    "ComicInfo.xml",
+                    "<ComicInfo><Title>原題</Title><Notes>Existing note</Notes></ComicInfo>",
+                )
+
+            translate_cbz.package_cbz(
+                [page],
+                output_dir,
+                input_cbz,
+                comicinfo_title="Translated title",
+                comicinfo_alt_title="原題",
+            )
+
+            with zipfile.ZipFile(translate_cbz.translated_cbz_path(output_dir)) as archive:
+                metadata = archive.read("ComicInfo.xml").decode("utf-8")
+            self.assertIn("<Title>Translated title</Title>", metadata)
+            self.assertIn("Existing note", metadata)
+            self.assertIn("Tetolate alternate title: 原題", metadata)
+
     def test_failed_packaging_preserves_existing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1210,8 +2235,197 @@ class AtomicPackagingTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), original_contents)
             self.assertEqual(list(output_dir.glob(f".{destination.name}.*.tmp")), [])
 
+    def test_packaging_converts_pages_in_parallel_and_validates_source_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            final_dir = translate_cbz.final_pages_dir(output_dir)
+            final_dir.mkdir(parents=True)
+            pages = []
+            for index in range(4):
+                page = translate_cbz.Page(index=index, image_path=Path(f"page-{index}.png"))
+                pages.append(page)
+                translate_cbz.final_page_png_path(output_dir, page).write_bytes(
+                    f"page {index}".encode()
+                )
+
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+                archive.writestr("ComicInfo.xml", b"<ComicInfo />")
+
+            fixture_dir = root / "fixtures"
+            fixture_dir.mkdir()
+            config = replace(
+                translate_cbz.load_config(None, fixture_dir),
+                imagemagick_workers=2,
+            )
+            barrier = threading.Barrier(2)
+
+            def convert(source: Path, destination: Path, _quality: int) -> None:
+                barrier.wait(timeout=2)
+                destination.write_bytes(source.read_bytes())
+
+            with (
+                mock.patch.object(
+                    translate_cbz,
+                    "convert_final_page_with_magick",
+                    side_effect=convert,
+                ),
+                mock.patch.object(
+                    translate_cbz,
+                    "validate_cbz_members",
+                    wraps=translate_cbz.validate_cbz_members,
+                ) as validate_members,
+                mock.patch("sys.stderr"),
+            ):
+                translate_cbz.print_packaged_cbz(pages, output_dir, input_cbz, config)
+
+            validate_members.assert_called_once()
+            for archive_path in (
+                translate_cbz.translated_cbz_path(output_dir),
+                translate_cbz.translated_webp_cbz_path(output_dir),
+                translate_cbz.translated_jxl_cbz_path(output_dir),
+            ):
+                with zipfile.ZipFile(archive_path) as archive:
+                    self.assertEqual(archive.read("ComicInfo.xml"), b"<ComicInfo />")
+                    self.assertEqual(
+                        archive.namelist()[:4],
+                        ["page-0.jpg", "page-1.webp", "page-2.webp", "page-3.webp"]
+                        if archive_path == translate_cbz.translated_webp_cbz_path(output_dir)
+                        else (
+                            ["page-0.jpg", "page-1.jxl", "page-2.jxl", "page-3.jxl"]
+                            if archive_path == translate_cbz.translated_jxl_cbz_path(output_dir)
+                            else ["page-0.png", "page-1.png", "page-2.png", "page-3.png"]
+                        ),
+                    )
+
+    def test_package_variant_generates_only_requested_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+
+            config = translate_cbz.load_config(None, root / "fixtures")
+
+            def convert(source: Path, destination: Path, _quality: int) -> None:
+                destination.write_bytes(source.read_bytes())
+
+            with mock.patch.object(
+                translate_cbz,
+                "convert_final_page_with_magick",
+                side_effect=convert,
+            ), mock.patch("sys.stderr"):
+                translate_cbz.print_packaged_cbz(
+                    [page],
+                    output_dir,
+                    input_cbz,
+                    config,
+                    package_variant="webp",
+                )
+
+            self.assertFalse(translate_cbz.translated_cbz_path(output_dir).exists())
+            self.assertTrue(translate_cbz.translated_webp_cbz_path(output_dir).exists())
+            self.assertFalse(translate_cbz.translated_jxl_cbz_path(output_dir).exists())
+
+    def test_package_variant_png_does_not_generate_alternate_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+
+            config = translate_cbz.load_config(None, root / "fixtures")
+            with mock.patch.object(
+                translate_cbz,
+                "package_converted_cbz",
+            ) as alternate_package, mock.patch("sys.stderr"):
+                translate_cbz.print_packaged_cbz(
+                    [page],
+                    output_dir,
+                    input_cbz,
+                    config,
+                    package_variant="png",
+                )
+
+            alternate_package.assert_not_called()
+            self.assertTrue(translate_cbz.translated_cbz_path(output_dir).exists())
+
+    def test_requested_variant_failure_preserves_existing_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            translate_cbz.final_pages_dir(output_dir).mkdir(parents=True)
+            page = translate_cbz.Page(index=0, image_path=Path("page.png"))
+            translate_cbz.final_page_png_path(output_dir, page).write_bytes(b"page")
+            input_cbz = root / "input.cbz"
+            with zipfile.ZipFile(input_cbz, "w") as archive:
+                archive.writestr("original.png", b"source")
+            destination = translate_cbz.translated_webp_cbz_path(output_dir)
+            destination.write_bytes(b"previous archive")
+            config = translate_cbz.load_config(None, root / "fixtures")
+
+            with mock.patch.object(
+                translate_cbz,
+                "convert_final_page_with_magick",
+                side_effect=translate_cbz.PipelineError("conversion failed"),
+            ), mock.patch("sys.stderr"):
+                with self.assertRaises(translate_cbz.PipelineError):
+                    translate_cbz.print_packaged_cbz(
+                        [page],
+                        output_dir,
+                        input_cbz,
+                        config,
+                        package_variant="webp",
+                    )
+
+            self.assertEqual(destination.read_bytes(), b"previous archive")
+            self.assertEqual(list(output_dir.glob(f".{destination.name}.*.tmp")), [])
+
 
 class ArchiveSafetyTests(unittest.TestCase):
+    def test_web_upload_accepts_zip_with_images_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "comic.zip"
+            image_data = io.BytesIO()
+            Image.new("RGB", (2, 2), "white").save(image_data, format="PNG")
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("pages/001.png", image_data.getvalue())
+                archive.writestr("ComicInfo.xml", "<ComicInfo />")
+
+            web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_upload_rejects_zip_without_images(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "metadata.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("ComicInfo.xml", "<ComicInfo />")
+
+            with self.assertRaisesRegex(HTTPException, "at least one supported image"):
+                web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_upload_rejects_zip_with_invalid_image_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "invalid-image.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("001.png", b"not an image")
+
+            with self.assertRaisesRegex(HTTPException, "not a readable image"):
+                web_app.validate_uploaded_comic_archive(archive_path, archive_path.name)
+
+    def test_web_file_selector_accepts_cbz_and_zip(self) -> None:
+        self.assertIn(".cbz", web_pages.UPLOAD_COMIC_ARCHIVE_ACCEPT)
+        self.assertIn(".zip", web_pages.UPLOAD_COMIC_ARCHIVE_ACCEPT)
+
     def test_extraction_rejects_unsafe_member_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1809,6 +3023,18 @@ class OpenPlacementLabelTests(unittest.TestCase):
         self.assertEqual(placements[0]["boxno"], 7)
         self.assertEqual(placements[0]["box_2d"], [100, 200, 300, 400])
 
+    def test_expansion_placement_region_is_clipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "page.png"
+            Image.new("RGB", (100, 80), "white").save(image_path)
+            expansions = translate_cbz.validate_expansions_page(
+                translate_cbz.Page(0, image_path),
+                [{"boxno": 3, "openLettering": False}],
+                [{"label": 3, "placementRegion": [-10, -5, 120, 100]}],
+            )
+
+        self.assertEqual(expansions[0]["placementRegion"], [0, 0, 100, 80])
+
 
 class PlacementRayTests(unittest.TestCase):
     def test_ray_stopping_at_the_actual_image_edge_is_a_boundary(self) -> None:
@@ -2080,6 +3306,47 @@ class StrictInputTests(unittest.TestCase):
 
 
 class OriginalInputUiTests(unittest.TestCase):
+    def test_complete_job_generates_missing_translated_archives(self) -> None:
+        markup = web_pages.download_links_html(
+            "manga",
+            "abc12345",
+            {
+                "status": "complete",
+                "downloads": {
+                    "png": {"available": True, "size": "1 MB", "downloadToken": "png-1"},
+                    "webp": {"available": False},
+                    "jxl": {"available": False},
+                },
+                "canView": True,
+            },
+        )
+
+        self.assertIn("Download PNG CBZ (1 MB)", markup)
+        self.assertIn("/download/png?v=png-1", markup)
+        self.assertIn("Generate WebP CBZ", markup)
+        self.assertIn("Generate JXL CBZ", markup)
+        self.assertIn("Regenerate PNG CBZ", markup)
+        self.assertIn('name="regenerate" value="1"', markup)
+        self.assertNotIn("Regenerate an existing CBZ download", markup)
+        self.assertIn(
+            'action="/job/manga/abc12345/generate-download/webp" method="post"',
+            markup,
+        )
+        self.assertIn(
+            'action="/job/manga/abc12345/generate-download/jxl" method="post"',
+            markup,
+        )
+
+    def test_incomplete_job_does_not_show_translated_archive_controls(self) -> None:
+        markup = web_pages.download_links_html(
+            "manga",
+            "abc12345",
+            {"status": "running", "downloads": {}},
+        )
+
+        self.assertNotIn("Generate PNG CBZ", markup)
+        self.assertNotIn("Download PNG CBZ", markup)
+
     def test_job_download_links_include_original_view_and_cbz(self) -> None:
         markup = web_pages.download_links_html(
             "manga",
@@ -2099,6 +3366,20 @@ class OriginalInputUiTests(unittest.TestCase):
         self.assertIn("View original (7 pages)", markup)
         self.assertIn("Download original CBZ (12.3 MB)", markup)
         self.assertIn("download-original?v=123-456", markup)
+
+    def test_original_zip_download_uses_zip_label(self) -> None:
+        markup = web_pages.download_links_html(
+            "category",
+            "abc12345",
+            {
+                "downloads": {},
+                "inputFilename": "comic.zip",
+                "hasOriginalDownload": True,
+                "originalDownloadUrl": "/job/category/abc12345/download-original",
+            },
+        )
+
+        self.assertIn("Download original ZIP", markup)
 
     def test_original_viewer_uses_original_image_routes(self) -> None:
         response = web_app.job_viewer_page(
@@ -2121,12 +3402,13 @@ class EditorV2Tests(unittest.TestCase):
         config_dir = root / "config"
         config_dir.mkdir()
         pipeline_config = config_dir / "vlm_config.json"
-        pipeline_config.write_text(
+        pipeline_data = json.loads(
             (repo_dir / "data/config/vlm_config.example.json").read_text(
                 encoding="utf-8"
-            ),
-            encoding="utf-8",
+            )
         )
+        pipeline_data["model"] = "test-vlm-model"
+        pipeline_config.write_text(json.dumps(pipeline_data), encoding="utf-8")
         web_config = config_dir / "web_config.json"
         web_config.write_text(
             json.dumps(
@@ -2148,6 +3430,25 @@ class EditorV2Tests(unittest.TestCase):
         original_dir.mkdir(parents=True)
         Image.new("RGB", (100, 120), "white").save(original_dir / "0000.png")
         return manager, code, job_id
+
+    def test_page_rerun_invalidates_all_translated_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager, code, job_id = self.create_job(Path(temp_dir))
+            manager.input_path(code, job_id).write_bytes(b"input")
+            output_dir = manager.output_dir(code, job_id)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for variant in web_app.TRANSLATED_CBZ_FILENAMES:
+                manager.translated_cbz_variant_path(code, job_id, variant).write_bytes(
+                    b"stale archive"
+                )
+
+            with mock.patch.object(manager, "enqueue"):
+                manager.rerun_completed_job_pages(code, job_id, [0], "render")
+
+            for variant in web_app.TRANSLATED_CBZ_FILENAMES:
+                self.assertFalse(
+                    manager.translated_cbz_variant_path(code, job_id, variant).exists()
+                )
 
     def test_changed_fields_are_protected_and_unprotected_fields_are_rebased(self) -> None:
         manifest = editor_v2.default_manifest()
@@ -2481,45 +3782,6 @@ class EditorV2Tests(unittest.TestCase):
             with mock.patch.object(manager, "run_page_rerun_batch_job") as rerun:
                 manager.run_job(code, job_id)
             self.assertEqual(rerun.call_args.args[3], failed["pendingPageReruns"])
-
-    def test_failed_batch_packaging_restarts_without_rerendering_pages(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            manager, code, job_id = self.create_job(Path(temp_dir))
-            manager.input_path(code, job_id).write_bytes(b"input")
-            status = manager.load_status(code, job_id)
-            self.assertIsNotNone(status)
-            status.update(
-                {
-                    "status": "running",
-                    "pendingPageReruns": [{"page": 2, "resumeFrom": "render"}],
-                    "pendingResumeFrom": "render",
-                    "pendingResumePage": 2,
-                    "lastResumeFrom": "render",
-                    "lastResumePage": 2,
-                }
-            )
-            manager.save_status(code, job_id, status)
-
-            with mock.patch.object(
-                manager,
-                "run_pipeline_process",
-                side_effect=[0, 1],
-            ):
-                manager.run_page_rerun_batch_job(
-                    code, job_id, status, status["pendingPageReruns"]
-                )
-
-            failed = manager.load_status(code, job_id)
-            self.assertEqual(failed["status"], "failed")
-            self.assertTrue(failed["pendingPackageOnly"])
-            self.assertEqual(failed["pendingResumeFrom"], "package")
-            self.assertNotIn("pendingPageReruns", failed)
-
-            with mock.patch.object(manager, "enqueue"):
-                manager.restart_failed_job(code, job_id)
-            with mock.patch.object(manager, "run_package_regeneration_job") as package:
-                manager.run_job(code, job_id)
-            package.assert_called_once()
 
     def test_caption_layout_keeps_trailing_punctuation_with_its_word(self) -> None:
         normalized = overlay_text.normalize_caption_text("A generic sample .")

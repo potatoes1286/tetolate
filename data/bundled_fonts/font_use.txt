@@ -1,0 +1,5 @@
+ComicNeue-Bold.ttf: talking, narrator, general text, fallback
+ComicNeue-BoldItalic.ttf: thinking, monologue, quiet internal speech
+IBMPlexMono-Medium.ttf: computer text, terminal text, electronic text
+ArchitectsDaughter-Regular.ttf: handwritten text, notes, letters
+Bangers-Regular.ttf: sfx, loud shout, explosive or emphatic text

@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 import zipfile
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -35,6 +36,7 @@ from ocr_merge import (
 import overlay_text
 import paddle_ocr_image
 from placement_detection import (
+    clip_region_values,
     detect_expansions_page,
     dominant_text_container_brightness,
     expand_region,
@@ -101,6 +103,9 @@ TRANSLATED_WEBP_CBZ_NAME = "translated_webp.cbz"
 # Alternate translated archive using lossy JPEG XL pages for smaller output size.
 TRANSLATED_JXL_CBZ_NAME = "translated_jxl.cbz"
 
+# Output archive variants accepted by the package phase.
+PACKAGE_VARIANTS = ("png", "webp", "jxl")
+
 # Cover image suffix used inside WebP/JXL CBZ variants for readers that cannot
 # use WebP/JXL files as archive thumbnails.
 TRANSLATED_ALT_COVER_SUFFIX = ".jpg"
@@ -125,8 +130,14 @@ FONT_DIR = DATA_DIR / "fonts"
 # User file describing intended uses for installed fonts; included in placement prompts.
 FONT_USE_PATH = FONT_DIR / "font_use.txt"
 
-# Fallback font passed to ImageMagick when a placement does not specify a local font.
-DEFAULT_RENDER_FONT = "DejaVu-Sans"
+# Fonts distributed with tetolate as usable stand-ins when no user fonts are installed.
+BUNDLED_FONT_DIR = Path(__file__).resolve().parent / "data" / "bundled_fonts"
+
+# Default intended uses for bundled fonts; replaced by a user font_use.txt when present.
+BUNDLED_FONT_USE_PATH = BUNDLED_FONT_DIR / "font_use.txt"
+
+# Fallback font used when a placement does not specify another available font.
+DEFAULT_RENDER_FONT = "ComicNeue-Bold.ttf"
 
 # Fallback text fill color for rendered translations when placement styling omits fill.
 DEFAULT_RENDER_FILL = "black"
@@ -159,6 +170,7 @@ DEFAULT_VLM_TIMEOUT = 1000.0
 
 # Default for the VLM erase-safety pass that decides whether text needs alternate placement.
 DEFAULT_ALT_PLACEMENT_ENABLED = True
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = True
 
 # Default llama.cpp/Gemma thinking budget. Negative means omit the field and
 # leave reasoning unlimited/server-defined.
@@ -327,6 +339,21 @@ def normalize_vlm_base_url(value: Any, label: str = "VLM base URL") -> str:
     return endpoint
 
 
+def normalize_vlm_model(value: Any, label: str = "VLM model") -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise PipelineError(f"{label} must be a non-empty model ID.")
+    return value.strip()
+
+
+def apply_vlm_model_override(config: PipelineConfig, value: Any) -> PipelineConfig:
+    if config.vlm is None:
+        raise PipelineError("--vlm-model requires a VLM config.")
+    return replace(
+        config,
+        vlm=replace(config.vlm, model=normalize_vlm_model(value, "--vlm-model")),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Translate a manga/manhwa/manhua CBZ using OCR, a VLM, LaMa, and ImageMagick.",
@@ -368,7 +395,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "With --resume-from ocr_raw, ocr_structured, alt_placement, translations, placements, or render, "
-            "regenerate only --resume-page through render and then rebuild translated.cbz."
+            "regenerate only --resume-page through render."
         ),
     )
     parser.add_argument(
@@ -380,9 +407,24 @@ def parse_args() -> argparse.Namespace:
         "--skip-package",
         action="store_true",
         help=(
-            "Run the requested work without rebuilding translated CBZ archives. "
-            "Intended for batched web reruns that package once at the end."
+            "Run the requested work without rebuilding translated CBZ archives."
         ),
+    )
+    parser.add_argument(
+        "--package-variant",
+        choices=PACKAGE_VARIANTS,
+        help=(
+            "Generate only this translated CBZ variant. Without this option, "
+            "the package phase generates all variants."
+        ),
+    )
+    parser.add_argument(
+        "--comicinfo-title",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--comicinfo-alt-title",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--webp-quality",
@@ -420,6 +462,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vlm-base-url",
         help="Override the OpenAI-compatible VLM base URL from the config.",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        help="Override the VLM model ID from the config.",
     )
     parser.add_argument(
         "--vlm-api-key",
@@ -607,10 +653,25 @@ def config_quality(data: dict[str, Any], key: str, default: int, label: str) -> 
     value = data.get(key, default)
     if isinstance(value, bool):
         raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.")
-    try:
+    if isinstance(value, int):
+        quality = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise PipelineError(
+                f"Config field {label}.{key} must be an integer from 1 to 100."
+            )
         quality = int(value)
-    except (TypeError, ValueError) as exc:
-        raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.") from exc
+    elif isinstance(value, str):
+        try:
+            quality = int(value.strip())
+        except ValueError as exc:
+            raise PipelineError(
+                f"Config field {label}.{key} must be an integer from 1 to 100."
+            ) from exc
+    else:
+        raise PipelineError(
+            f"Config field {label}.{key} must be an integer from 1 to 100."
+        )
     if quality < 1 or quality > 100:
         raise PipelineError(f"Config field {label}.{key} must be an integer from 1 to 100.")
     return quality
@@ -739,7 +800,7 @@ def load_config(path: Path | None, fixture_dir: Path | None) -> PipelineConfig:
         vlm = VLMConfig(
             base_url=base_url,
             api_key=str(data.get("api_key", "not-needed")),
-            model=model_value or None,
+            model=(model_value.strip() or None) if isinstance(model_value, str) else None,
             temperature=temperature,
             max_tokens=max_tokens,
             thinking_budget_tokens=thinking_budget_tokens,
@@ -1880,14 +1941,23 @@ def compact_records_table(records: list[dict[str, Any]], fields: tuple[str, ...]
     return json.dumps(table, ensure_ascii=False, separators=(",", ":"))
 
 
+def available_font_paths() -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for directory in (BUNDLED_FONT_DIR, FONT_DIR):
+        if not directory.is_dir():
+            continue
+        paths.update(
+            {
+                path.name: path
+                for path in directory.iterdir()
+                if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS
+            }
+        )
+    return paths
+
+
 def available_font_names() -> set[str]:
-    if not FONT_DIR.is_dir():
-        return set()
-    return {
-        path.name
-        for path in FONT_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in FONT_EXTENSIONS
-    }
+    return set(available_font_paths())
 
 
 def normalize_font_name(value: Any, backup_font: str | None = None) -> str | None:
@@ -1905,13 +1975,12 @@ def normalize_font_name(value: Any, backup_font: str | None = None) -> str | Non
 
 
 def local_font_path(value: Any, fallback: str) -> str:
-    if isinstance(value, str) and value.strip():
-        name = Path(value.strip().strip("[]")).name
-        candidate = FONT_DIR / name
-        if candidate.is_file() and candidate.suffix.lower() in FONT_EXTENSIONS:
-            return str(candidate)
-        return value
-    return fallback
+    selected = value if isinstance(value, str) and value.strip() else fallback
+    name = Path(selected.strip().strip("[]")).name
+    candidate = available_font_paths().get(name)
+    if candidate is not None:
+        return str(candidate)
+    return selected
 
 
 def normalize_fill(value: Any) -> str | None:
@@ -2022,12 +2091,13 @@ def correct_placement_fills_for_legibility(
 
 
 def font_use_prompt(backup_font: str) -> str:
-    if not FONT_USE_PATH.is_file():
+    font_use_path = FONT_USE_PATH if FONT_USE_PATH.is_file() else BUNDLED_FONT_USE_PATH
+    if not font_use_path.is_file():
         return f"No local font_use.txt was found. Use backup font {backup_font!r}."
 
     lines: list[str] = []
     font_names = available_font_names()
-    for raw_line in FONT_USE_PATH.read_text(encoding="utf-8").splitlines():
+    for raw_line in font_use_path.read_text(encoding="utf-8").splitlines():
         if not raw_line.strip() or ":" not in raw_line:
             continue
         raw_name, raw_uses = raw_line.split(":", 1)
@@ -4224,26 +4294,97 @@ def write_preserved_non_image_members(
     archive: zipfile.ZipFile,
     input_cbz: Path,
     written_names: set[str],
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> None:
-    try:
-        with zipfile.ZipFile(input_cbz) as source_archive:
+    def comicinfo_member_data(info: zipfile.ZipInfo, data: bytes) -> bytes:
+        info_name = info.filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if comicinfo_title is None or info_name.casefold() != "comicinfo.xml":
+            return data
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            print(
+                f"warning: could not update malformed ComicInfo metadata: {info.filename}",
+                file=sys.stderr,
+            )
+            return data
+
+        def local_name(tag: str) -> str:
+            return tag.rsplit("}", 1)[-1]
+
+        title_element = next(
+            (element for element in root.iter() if local_name(element.tag) == "Title"),
+            None,
+        )
+        if title_element is None or not str(title_element.text or "").strip():
+            return data
+        title_element.text = comicinfo_title
+
+        notes_element = next(
+            (element for element in root.iter() if local_name(element.tag) == "Notes"),
+            None,
+        )
+        marker = "Tetolate alternate title:"
+        existing_notes = str(notes_element.text or "") if notes_element is not None else ""
+        note_lines = [
+            line for line in existing_notes.splitlines()
+            if not line.strip().startswith(marker)
+        ]
+        if comicinfo_alt_title:
+            note_lines.append(f"{marker} {comicinfo_alt_title}")
+        updated_notes = "\n".join(note_lines).strip()
+        if updated_notes:
+            if notes_element is None:
+                tag = next(
+                    (element.tag for element in root.iter() if local_name(element.tag) == "Title"),
+                    "Notes",
+                )
+                namespace = tag.split("}", 1)[0] + "}" if "}" in tag else ""
+                notes_element = ET.Element(f"{namespace}Notes")
+                root.append(notes_element)
+            notes_element.text = updated_notes
+        elif notes_element is not None:
+            notes_element.text = None
+
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def copy_members(
+        source: zipfile.ZipFile,
+        members: list[zipfile.ZipInfo],
+    ) -> None:
+        archive.comment = source.comment
+        for info in members:
+            if not is_preserved_non_image_member(info):
+                continue
+            if info.filename in written_names:
+                print(
+                    f"warning: skipping original non-image entry that conflicts with output: {info.filename}",
+                    file=sys.stderr,
+                )
+                continue
+            with source.open(info) as source_file:
+                member_data = source_file.read()
+            member_data = comicinfo_member_data(info, member_data)
+            with archive.open(
+                copy_zipinfo_for_deflated_write(info),
+                "w",
+            ) as destination:
+                destination.write(member_data)
+            written_names.add(info.filename)
+
+    if source_archive is not None:
+        if source_members is None:
             source_members = validate_cbz_members(source_archive)
-            archive.comment = source_archive.comment
-            for info in source_members:
-                if not is_preserved_non_image_member(info):
-                    continue
-                if info.filename in written_names:
-                    print(
-                        f"warning: skipping original non-image entry that conflicts with output: {info.filename}",
-                        file=sys.stderr,
-                    )
-                    continue
-                with source_archive.open(info) as source, archive.open(
-                    copy_zipinfo_for_deflated_write(info),
-                    "w",
-                ) as destination:
-                    shutil.copyfileobj(source, destination, length=1024 * 1024)
-                written_names.add(info.filename)
+        copy_members(source_archive, source_members)
+        return
+
+    try:
+        with zipfile.ZipFile(input_cbz) as source:
+            copy_members(source, validate_cbz_members(source))
     except zipfile.BadZipFile as exc:
         raise PipelineError(f"Input file is not a valid CBZ/zip: {input_cbz}") from exc
 
@@ -4263,7 +4404,16 @@ def temporary_archive_path(destination: Path) -> Path:
         return Path(file.name)
 
 
-def package_cbz(pages: list[Page], output_dir: Path, input_cbz: Path) -> Path:
+def package_cbz(
+    pages: list[Page],
+    output_dir: Path,
+    input_cbz: Path,
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
+) -> Path:
     cbz_path = translated_cbz_path(output_dir)
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
     temp_cbz_path = temporary_archive_path(cbz_path)
@@ -4277,7 +4427,15 @@ def package_cbz(pages: list[Page], output_dir: Path, input_cbz: Path) -> Path:
                 archive.write(image_path, arcname=image_path.name)
                 written_names.add(image_path.name)
 
-            write_preserved_non_image_members(archive, input_cbz, written_names)
+            write_preserved_non_image_members(
+                archive,
+                input_cbz,
+                written_names,
+                source_archive=source_archive,
+                source_members=source_members,
+                comicinfo_title=comicinfo_title,
+                comicinfo_alt_title=comicinfo_alt_title,
+            )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
     finally:
@@ -4324,6 +4482,12 @@ def package_converted_cbz(
     cbz_path: Path,
     suffix: str,
     quality: int,
+    imagemagick_workers: int = DEFAULT_IMAGEMAGICK_WORKERS,
+    *,
+    source_archive: zipfile.ZipFile | None = None,
+    source_members: list[zipfile.ZipInfo] | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> Path:
     output_mode = cbz_path.stat().st_mode & 0o777 if cbz_path.exists() else 0o644
     temp_cbz_path = temporary_archive_path(cbz_path)
@@ -4334,18 +4498,47 @@ def package_converted_cbz(
             temp_dir = Path(temp_dir_name)
             with zipfile.ZipFile(temp_cbz_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 written_names: set[str] = set()
+                conversion_jobs: list[tuple[Page, Path]] = []
                 for page in pages:
                     source_path = final_page_png_path(output_dir, page)
                     if not source_path.exists():
                         raise PipelineError(f"Final page image missing: {source_path}")
                     page_suffix = TRANSLATED_ALT_COVER_SUFFIX if page.index == 0 else suffix
                     converted_path = temp_dir / f"{page.image_path.stem}{page_suffix}"
-                    convert_final_page_with_magick(source_path, converted_path, quality)
-                    archive.write(converted_path, arcname=converted_path.name)
-                    written_names.add(converted_path.name)
-                    converted_path.unlink()
+                    conversion_jobs.append((page, converted_path))
 
-                write_preserved_non_image_members(archive, input_cbz, written_names)
+                if conversion_jobs:
+                    with ThreadPoolExecutor(
+                        max_workers=min(imagemagick_workers, len(conversion_jobs)),
+                        thread_name_prefix="tetolate-imagemagick-package",
+                    ) as executor:
+                        futures = [
+                            executor.submit(
+                                convert_final_page_with_magick,
+                                final_page_png_path(output_dir, page),
+                                converted_path,
+                                quality,
+                            )
+                            for page, converted_path in conversion_jobs
+                        ]
+                        for future, (_page, converted_path) in zip(
+                            futures,
+                            conversion_jobs,
+                        ):
+                            future.result()
+                            archive.write(converted_path, arcname=converted_path.name)
+                            written_names.add(converted_path.name)
+                            converted_path.unlink()
+
+                write_preserved_non_image_members(
+                    archive,
+                    input_cbz,
+                    written_names,
+                    source_archive=source_archive,
+                    source_members=source_members,
+                    comicinfo_title=comicinfo_title,
+                    comicinfo_alt_title=comicinfo_alt_title,
+                )
         os.chmod(temp_cbz_path, output_mode)
         os.replace(temp_cbz_path, cbz_path)
     finally:
@@ -4358,28 +4551,97 @@ def print_packaged_cbz(
     output_dir: Path,
     input_cbz: Path,
     config: PipelineConfig,
+    package_variant: str | None = None,
+    comicinfo_title: str | None = None,
+    comicinfo_alt_title: str | None = None,
 ) -> None:
-    cbz_path = package_cbz(pages, output_dir, input_cbz)
-    print(f"Wrote {cbz_path}", file=sys.stderr)
-    for variant_path, suffix, quality, label in (
-        (translated_webp_cbz_path(output_dir), ".webp", config.webp_quality, "WebP"),
-        (translated_jxl_cbz_path(output_dir), ".jxl", config.jxl_quality, "JXL"),
-    ):
-        try:
-            written_path = package_converted_cbz(
-                pages,
-                output_dir,
-                input_cbz,
-                variant_path,
-                suffix,
-                quality,
+    if package_variant is not None and package_variant not in PACKAGE_VARIANTS:
+        raise PipelineError(f"Unsupported package variant: {package_variant}")
+
+    try:
+        with zipfile.ZipFile(input_cbz) as source_archive:
+            source_members = validate_cbz_members(source_archive)
+            variants = {
+                "png": (
+                    translated_cbz_path(output_dir),
+                    None,
+                    None,
+                    "PNG",
+                ),
+                "webp": (
+                    translated_webp_cbz_path(output_dir),
+                    ".webp",
+                    config.webp_quality,
+                    "WebP",
+                ),
+                "jxl": (
+                    translated_jxl_cbz_path(output_dir),
+                    ".jxl",
+                    config.jxl_quality,
+                    "JXL",
+                ),
+            }
+            variant_names = (
+                (package_variant,)
+                if package_variant is not None
+                else PACKAGE_VARIANTS
             )
-        except PipelineError as exc:
-            if variant_path.exists():
-                variant_path.unlink()
-            print(f"warning: skipped {label} CBZ output: {exc}", file=sys.stderr)
-            continue
-        print(f"Wrote {written_path}", file=sys.stderr)
+            for variant_name in variant_names:
+                variant_path, suffix, quality, label = variants[variant_name]
+                try:
+                    if variant_name == "png":
+                        written_path = package_cbz(
+                            pages,
+                            output_dir,
+                            input_cbz,
+                            source_archive=source_archive,
+                            source_members=source_members,
+                            comicinfo_title=comicinfo_title,
+                            comicinfo_alt_title=comicinfo_alt_title,
+                        )
+                    else:
+                        assert suffix is not None
+                        assert quality is not None
+                        written_path = package_converted_cbz(
+                            pages,
+                            output_dir,
+                            input_cbz,
+                            variant_path,
+                            suffix,
+                            quality,
+                            config.imagemagick_workers,
+                            source_archive=source_archive,
+                            source_members=source_members,
+                            comicinfo_title=comicinfo_title,
+                            comicinfo_alt_title=comicinfo_alt_title,
+                        )
+                except PipelineError as exc:
+                    if package_variant is not None or variant_name == "png":
+                        raise
+                    print(f"warning: skipped {label} CBZ output: {exc}", file=sys.stderr)
+                    continue
+                print(f"Wrote {written_path}", file=sys.stderr)
+    except zipfile.BadZipFile as exc:
+        raise PipelineError(f"Input file is not a valid CBZ/zip: {input_cbz}") from exc
+
+
+def maybe_print_packaged_cbz(
+    args: argparse.Namespace,
+    pages: list[Page],
+    config: PipelineConfig,
+) -> None:
+    """Package output unless the caller explicitly requested rendered pages only."""
+    if getattr(args, "skip_package", False):
+        return
+    print_packaged_cbz(
+        pages,
+        args.output_dir,
+        args.input_cbz,
+        config,
+        package_variant=getattr(args, "package_variant", None),
+        comicinfo_title=getattr(args, "comicinfo_title", None),
+        comicinfo_alt_title=getattr(args, "comicinfo_alt_title", None),
+    )
 
 
 
@@ -4473,7 +4735,7 @@ def run_full_pipeline(
     )
     run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
     render_pages(pages, structured_by_page, args.output_dir, config)
-    print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+    maybe_print_packaged_cbz(args, pages, config)
 
 
 def run_single_page_resume_pipeline(
@@ -4591,8 +4853,7 @@ def run_single_page_resume_pipeline(
         start_page=target_page,
         end_page=target_page,
     )
-    if not args.skip_package:
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+    maybe_print_packaged_cbz(args, pages, config)
 
 
 def run_resume_pipeline(
@@ -4644,7 +4905,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     verify_resume_input(args.input_cbz, args.output_dir)
@@ -4697,7 +4958,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "ocr_structured":
@@ -4758,7 +5019,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "alt_placement":
@@ -4802,7 +5063,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "translations":
@@ -4832,7 +5093,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "proofreading":
@@ -4849,7 +5110,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "translation_notes":
@@ -4866,7 +5127,7 @@ def run_resume_pipeline(
         )
         run_placement_phase(pages, structured_by_page, args.output_dir, config, args.fixture_dir)
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "placements":
@@ -4887,7 +5148,7 @@ def run_resume_pipeline(
             existing_by_page=placement_prior,
         )
         render_pages(pages, structured_by_page, args.output_dir, config)
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "render":
@@ -4901,11 +5162,19 @@ def run_resume_pipeline(
             config,
             start_page=start_page,
         )
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        maybe_print_packaged_cbz(args, pages, config)
         return
 
     if phase == "package":
-        print_packaged_cbz(pages, args.output_dir, args.input_cbz, config)
+        print_packaged_cbz(
+            pages,
+            args.output_dir,
+            args.input_cbz,
+            config,
+            package_variant=getattr(args, "package_variant", None),
+            comicinfo_title=getattr(args, "comicinfo_title", None),
+            comicinfo_alt_title=getattr(args, "comicinfo_alt_title", None),
+        )
         return
 
     raise PipelineError(f"Unsupported resume phase: {phase}")
@@ -4936,8 +5205,6 @@ def main() -> int:
             raise PipelineError("--resume-page requires --resume-from.")
         if args.resume_from is None and args.single_page:
             raise PipelineError("--single-page requires --resume-from.")
-        if args.skip_package and not args.single_page:
-            raise PipelineError("--skip-package requires --single-page.")
         if args.translation_boxno is not None:
             if args.translation_boxno < 0:
                 raise PipelineError("--translation-boxno must be zero or greater.")
@@ -5015,6 +5282,8 @@ def main() -> int:
                     base_url=normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url"),
                 ),
             )
+        if args.vlm_model is not None:
+            config = apply_vlm_model_override(config, args.vlm_model)
         vlm_api_key = args.vlm_api_key
         if vlm_api_key is None:
             vlm_api_key = os.environ.get("TETOLATE_VLM_API_KEY")

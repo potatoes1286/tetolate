@@ -1,0 +1,7 @@
+services:
+  tetolate:
+    build:
+      context: .
+      target: runtime
+    image: tetolate-core:local
+    pull_policy: build

@@ -1,5 +1,6 @@
 - `config/`: copy and edit the example configuration files before startup.
-- `fonts/`: optional user-provided fonts and `font_use.txt`.
+- `bundled_fonts/`: open stand-in fonts included with tetolate.
+- `fonts/`: optional user-provided fonts and `font_use.txt` overrides.
 - `models/`: PaddleOCR-VL model files used by the `paddleocr-vl` profile.
 - `jobs/`: uploaded inputs, intermediate stages, logs, and output archives.
 - `cache/`: downloaded PaddleOCR and LaMa model caches.

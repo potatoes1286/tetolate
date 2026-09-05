@@ -13,6 +13,13 @@ Main components include:
 - [OpenCV](https://opencv.org/)
 - [Pillow](https://python-pillow.org/)
 - [FastAPI](https://fastapi.tiangolo.com/)
+- [Comic Neue](https://github.com/crozynski/comicneue)
+- [IBM Plex Mono](https://github.com/googlefonts/plex)
+- [Architects Daughter](https://github.com/googlefonts/architectsdaughter)
+- [Bangers](https://github.com/googlefonts/bangers)
 
-Downloaded models and user-provided fonts are not distributed by this repository.
-Check their licenses before use or redistribution.
+The bundled fonts use the SIL Open Font License 1.1. Their copyright notices
+and complete license texts are under `data/bundled_fonts/licenses/`.
+
+Downloaded models and additional user-provided fonts are not distributed by
+this repository. Check their licenses before use or redistribution.

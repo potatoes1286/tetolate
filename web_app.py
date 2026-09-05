@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import logging
 import os
 import queue
 import re
@@ -18,9 +20,11 @@ import tempfile
 import threading
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,6 +38,8 @@ import paddle_ocr_image
 import editor_v2
 import lama_inpaint
 import translate_cbz
+import vlm_client
+from version import VERSION
 from web_editor_backend import (
     EditorManagerMixin,
     parse_region,
@@ -43,6 +49,7 @@ from web_pages import (
     admin_login_page,
     category_delete_page,
     category_jobs_page,
+    category_rename_page,
     editor_page,
     job_page,
     job_viewer_page,
@@ -51,6 +58,7 @@ import web_security
 from web_storage import write_json_atomic
 
 
+LOGGER = logging.getLogger(__name__)
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = translate_cbz.DATA_DIR
 DEFAULT_WEB_CONFIG = DEFAULT_DATA_DIR / "config" / "web_config.json"
@@ -68,10 +76,23 @@ DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKEN
 DEFAULT_PROOFREAD_TRANSLATIONS = True
 DEFAULT_WRITE_TRANSLATION_NOTES = True
 DEFAULT_ALT_PLACEMENT_ENABLED = translate_cbz.DEFAULT_ALT_PLACEMENT_ENABLED
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = translate_cbz.DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE
 DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
 DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
+DEFAULT_ADMIN_PASSWORD = "changeme"
+DEFAULT_CATEGORY = "default"
+CBZ_TITLE_MODE_ORIGINAL = "original"
+CBZ_TITLE_MODE_TRANSLATED = "translated"
+CBZ_TITLE_MODES = {
+    CBZ_TITLE_MODE_ORIGINAL,
+    CBZ_TITLE_MODE_TRANSLATED,
+}
+DOCKER_LOCALHOST_NOTE = (
+    "If in a docker container connecting to the local host, use "
+    "http://host.docker.internal instead of http://127.0.0.1."
+)
 OCR_REVIEW_CHECKPOINT = "ocr"
 GENERATED_TRANSLATION_NOTES_NAME = translate_cbz.GENERATED_TRANSLATION_NOTES_NAME
 DEFAULT_LISTEN = "127.0.0.1:8088"
@@ -90,6 +111,7 @@ WEB_CONFIG_FIELDS = {
 }
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 LOG_TAIL_BYTES = 2 * 1024 * 1024
+UPLOAD_COMIC_ARCHIVE_EXTENSIONS = {".cbz", ".zip"}
 UPLOAD_PAGE_IMAGE_EXTENSIONS = {
     ".png",
     ".jpg",
@@ -106,8 +128,85 @@ UPLOAD_PAGE_IMAGE_ACCEPT = (
     ".png,.jpg,.jpeg,.webp,.jxl,.bmp,.tif,.tiff,.avif,.gif,"
     "image/png,image/jpeg,image/webp,image/jxl,image/bmp,image/tiff,image/avif,image/gif"
 )
+
+
+class UploadRequestTooLarge(Exception):
+    """Raised when an upload request exceeds the configured byte limit."""
+
+
+class UploadSizeLimitMiddleware:
+    """Reject oversized upload bodies before multipart parsing buffers them."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @staticmethod
+    async def _send_too_large(send: Any) -> None:
+        body = b'{"detail":"Upload request is too large."}'
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/upload" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        manager = getattr(getattr(self.app, "state", None), "manager", None)
+        config = getattr(manager, "config", None)
+        max_bytes = getattr(config, "max_upload_bytes", None)
+        if not isinstance(max_bytes, int) or max_bytes <= 0:
+            await self.app(scope, receive, send)
+            return
+
+        content_length = dict(scope.get("headers", [])).get(b"content-length")
+        if content_length is not None:
+            try:
+                declared_length = int(content_length)
+            except (TypeError, ValueError):
+                declared_length = None
+            if declared_length is not None and declared_length > max_bytes:
+                await self._send_too_large(send)
+                return
+
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > max_bytes:
+                    raise UploadRequestTooLarge
+            return message
+
+        response_started = False
+
+        async def tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except UploadRequestTooLarge:
+            if not response_started:
+                await self._send_too_large(send)
+            else:
+                raise
 CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+JOB_NAME_MAX_LENGTH = 256
 JOB_ID_BYTES = 4
 VLM_LIVE_PROGRESS_PATTERN = re.compile(r"^VLM .+: (?:waiting|reasoning|answering) \| ")
 RESUME_PHASE_BY_PROGRESS = {
@@ -153,7 +252,6 @@ RERUN_JOB_STAGE_RESUME = {
     "placements": "placements",
     "render": "render",
 }
-RERUN_JOB_PACKAGE_STAGE = "package"
 EDITOR_META_DIRNAME = "web_meta"
 TRANSLATION_NOTES_FILENAME = "translation_notes.json"
 JOB_SECRETS_FILENAME = ".job-secrets.json"
@@ -181,6 +279,7 @@ class WebConfig:
     default_jxl_quality: int
     default_thinking_budget_tokens: int
     default_vlm_base_url: str
+    default_vlm_model: str
     default_alt_placement_enabled: bool
     default_source_language: str
     default_ocr_engine: str
@@ -320,6 +419,187 @@ def parse_vlm_base_url_form(value: str, config: WebConfig) -> str:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def validate_vlm_model(value: str) -> str:
+    model = value.strip()
+    if not model:
+        raise ValueError("VLM model is required.")
+    if len(model) > 1_024:
+        raise ValueError("VLM model is too long.")
+    if any(character in model for character in ("\0", "\r", "\n")):
+        raise ValueError("VLM model contains an invalid character.")
+    return model
+
+
+def parse_vlm_model_form(value: str) -> str:
+    try:
+        return validate_vlm_model(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def validate_job_name(value: str) -> str:
+    name = value.strip()
+    if not name:
+        raise ValueError("Job name is required.")
+    if len(name) > JOB_NAME_MAX_LENGTH:
+        raise ValueError(f"Job name must be {JOB_NAME_MAX_LENGTH} characters or fewer.")
+    if name in {".", ".."}:
+        raise ValueError("Job name cannot be a dot path.")
+    if any(character in name for character in ("\0", "\r", "\n", "/", "\\")):
+        raise ValueError("Job name contains an invalid character.")
+    return name
+
+
+def parse_job_name_form(value: str) -> str:
+    try:
+        return validate_job_name(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def default_job_name(input_filename: Any, job_id: str) -> str:
+    value = str(input_filename or "").strip()
+    if not value:
+        return job_id
+    name = Path(value).name
+    if Path(name).suffix.lower() in UPLOAD_COMIC_ARCHIVE_EXTENSIONS | UPLOAD_PAGE_IMAGE_EXTENSIONS:
+        name = Path(name).stem
+    return name or job_id
+
+
+def safe_job_name(value: str, fallback: str) -> str:
+    """Make a metadata title safe for use as a download filename."""
+    name = re.sub(r"[\\/\x00-\x1f\x7f]+", " - ", value.strip())
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name:
+        return fallback
+    return name[:JOB_NAME_MAX_LENGTH].rstrip(" .") or fallback
+
+
+def comicinfo_title_from_archive(input_path: Path) -> str:
+    try:
+        with zipfile.ZipFile(input_path) as archive:
+            info = next(
+                (
+                    item
+                    for item in archive.infolist()
+                    if item.filename.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+                    == "comicinfo.xml"
+                ),
+                None,
+            )
+            if info is None:
+                return ""
+            root = ET.fromstring(archive.read(info))
+    except (OSError, ValueError, ET.ParseError, zipfile.BadZipFile):
+        return ""
+
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "Title":
+            title = str(element.text or "").strip()
+            if title:
+                return title
+    return ""
+
+
+def normalize_vlm_title_output(output: str) -> str:
+    title = " ".join(output.split()).strip()
+    for quote in ('"', "'", "`", "“", "”"):
+        if title.startswith(quote) and title.endswith(quote):
+            title = title[1:-1].strip()
+            break
+    if not title:
+        raise ValueError("The VLM returned an empty title.")
+    return title
+
+
+def job_name_from_status(status: dict[str, Any], job_id: str) -> str:
+    value = status.get("jobName")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default_job_name(status.get("inputFilename"), job_id)
+
+
+def translated_job_name_from_status(status: dict[str, Any]) -> str:
+    value = status.get("translatedJobName")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def vlm_probe_failure_detail(
+    endpoint: str,
+    error: Exception | None = None,
+    auth_token: str | None = None,
+) -> str:
+    error_chain: list[Exception] = []
+    current: Exception | None = error
+    while current is not None and current not in error_chain:
+        error_chain.append(current)
+        cause = current.__cause__ or current.__context__
+        current = cause if isinstance(cause, Exception) else None
+    status_code: int | None = None
+    for candidate in error_chain:
+        status_code = vlm_client.vlm_exception_status_code(candidate)
+        if status_code is not None:
+            break
+
+    if status_code in {401, 403}:
+        detail = "The VLM endpoint rejected the request.\n- Is your API key correct?"
+    elif status_code is not None:
+        detail = "The VLM endpoint returned an error."
+    else:
+        detail = "Could not connect to the VLM endpoint.\n- Is your API key correct?"
+
+    parsed_endpoint = urlsplit(endpoint)
+    host = parsed_endpoint.hostname
+    connection_refused = any(
+        "connection refused" in str(candidate).casefold()
+        for candidate in error_chain
+    )
+    guidance_lines: list[str] = []
+    if status_code is None and host is not None and host.lower() in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }:
+        guidance_lines.append(DOCKER_LOCALHOST_NOTE)
+
+    raw_ip = False
+    if host is not None:
+        try:
+            ipaddress.ip_address(host)
+            raw_ip = True
+        except ValueError:
+            raw_ip = False
+    if connection_refused and host is not None and (
+        raw_ip or host.casefold() == "host.docker.internal"
+    ):
+        guidance_lines.append("Did you forget to set the port?")
+
+    endpoint_path = parsed_endpoint.path.rstrip("/").casefold()
+    if error is not None and not endpoint_path.endswith("/v1"):
+        guidance_lines.append("Most API endpoints require http://address/v1.")
+
+    guidance = "".join(f"\n- {line}" for line in guidance_lines)
+
+    if status_code is not None:
+        try:
+            error_text = f"{status_code} {HTTPStatus(status_code).phrase}"
+        except ValueError:
+            error_text = str(status_code)
+    else:
+        error_text = ""
+        for candidate in reversed(error_chain):
+            candidate_text = str(candidate).strip()
+            if candidate_text:
+                error_text = candidate_text
+                break
+        if auth_token and error_text:
+            error_text = error_text.replace(auth_token, "[redacted API key]")
+
+    endpoint_error = f"\n\nEndpoint error: {error_text}" if error_text else ""
+    return f"{detail}{guidance}{endpoint_error}"
+
+
 def http_origin(value: str, label: str) -> str:
     try:
         parsed = urlsplit(value)
@@ -358,7 +638,7 @@ def parse_paddleocr_vl_server_url_form(
 
 
 def parse_checkbox(value: str | None) -> bool:
-    return value is not None and value.lower() in {"1", "true", "yes", "on"}
+    return isinstance(value, str) and value.lower() in {"1", "true", "yes", "on"}
 
 
 def parse_page_workers_form(value: str, label: str) -> int:
@@ -380,7 +660,7 @@ def thinking_budget_text(value: Any) -> str:
     return f"{budget} tokens"
 
 
-def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, str, str, str]:
+def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, str, bool, str, str, str, str]:
     try:
         data = json.loads(
             path.read_text(encoding="utf-8"),
@@ -391,6 +671,9 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, s
         raise RuntimeError(f"Invalid JSON in pipeline config {path}: {detail}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("Pipeline config root must be a JSON object.")
+    configured_vlm_model = data.get("model", "")
+    if configured_vlm_model is not None and not isinstance(configured_vlm_model, str):
+        raise RuntimeError("Pipeline config field model must be a string when provided.")
     output = data.get("output", {})
     if output is None:
         output = {}
@@ -440,6 +723,7 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, bool, str, s
                 "thinking_budget_tokens",
             ),
             validate_vlm_base_url(str(data.get("base_url", "")), ""),
+            (configured_vlm_model or "").strip(),
             default_alt_placement_enabled,
             default_source_language,
             DEFAULT_OCR_ENGINE,
@@ -529,6 +813,7 @@ def load_web_config(path: Path | None = None) -> WebConfig:
         default_jxl_quality,
         default_thinking_budget_tokens,
         default_vlm_base_url,
+        default_vlm_model,
         default_alt_placement_enabled,
         default_source_language,
         default_ocr_engine,
@@ -547,6 +832,7 @@ def load_web_config(path: Path | None = None) -> WebConfig:
         default_jxl_quality=default_jxl_quality,
         default_thinking_budget_tokens=default_thinking_budget_tokens,
         default_vlm_base_url=default_vlm_base_url,
+        default_vlm_model=default_vlm_model,
         default_alt_placement_enabled=default_alt_placement_enabled,
         default_source_language=default_source_language,
         default_ocr_engine=default_ocr_engine,
@@ -718,6 +1004,55 @@ async def write_uploaded_file_to_path(
     if written == 0:
         raise HTTPException(status_code=400, detail=f"{size_label} was empty.")
     return written
+
+
+def validate_uploaded_comic_archive(path: Path, filename: str) -> None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = translate_cbz.validate_cbz_members(archive)
+            image_members = [
+                info
+                for info in members
+                if not info.is_dir() and translate_cbz.is_image_member(info.filename)
+            ]
+            if not image_members:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Comic archive must contain at least one supported image page.",
+                )
+            total_pixels = 0
+            for info in image_members:
+                try:
+                    with archive.open(info) as source, Image.open(source) as image:
+                        page_pixels = image.width * image.height
+                        if page_pixels > translate_cbz.MAX_PAGE_PIXELS:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Archive page is too large: {info.filename}",
+                            )
+                        total_pixels += page_pixels
+                        if total_pixels > translate_cbz.MAX_TOTAL_PAGE_PIXELS:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Archive image pages contain too many pixels.",
+                            )
+                        image.verify()
+                except HTTPException:
+                    raise
+                except (OSError, RuntimeError, Image.DecompressionBombError) as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Archive page is not a readable image: {info.filename}",
+                    ) from exc
+    except HTTPException:
+        raise
+    except translate_cbz.PipelineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File is not a valid CBZ or ZIP archive: {filename}",
+        ) from exc
 
 
 def verify_output_png(path: Path, filename: str) -> None:
@@ -949,9 +1284,9 @@ def parse_page_selection(value: str, allow_empty: bool = False) -> list[int]:
     return sorted(pages)
 
 
-def parse_rerun_job_stages(values: list[str]) -> tuple[str | None, bool]:
+def parse_rerun_job_stages(values: list[str]) -> str:
     selected = {str(value).strip() for value in values if str(value).strip()}
-    allowed = set(RERUN_JOB_STAGE_ORDER) | {RERUN_JOB_PACKAGE_STAGE}
+    allowed = set(RERUN_JOB_STAGE_ORDER)
     unsupported = sorted(selected - allowed)
     if unsupported:
         raise HTTPException(
@@ -961,12 +1296,10 @@ def parse_rerun_job_stages(values: list[str]) -> tuple[str | None, bool]:
     if not selected:
         raise HTTPException(status_code=400, detail="Select at least one pass to rerun.")
 
-    resume_from = None
     for stage in RERUN_JOB_STAGE_ORDER:
         if stage in selected:
-            resume_from = RERUN_JOB_STAGE_RESUME[stage]
-            break
-    return resume_from, RERUN_JOB_PACKAGE_STAGE in selected
+            return RERUN_JOB_STAGE_RESUME[stage]
+    raise HTTPException(status_code=400, detail="Select at least one processing pass to rerun.")
 
 
 def optional_non_negative_int(value: Any, label: str) -> int | None:
@@ -1005,6 +1338,7 @@ class JobManager(EditorManagerMixin):
         self._instance_lock_kind = ""
 
     def start(self) -> None:
+        print(f"tetolate {VERSION} starting", file=sys.stderr, flush=True)
         self.config.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.acquire_instance_lock()
         try:
@@ -1121,6 +1455,7 @@ class JobManager(EditorManagerMixin):
 
     def initialize_web_state(self) -> None:
         path = self.web_state_path()
+        new_installation = not path.exists()
         state: dict[str, Any] = {}
         if path.exists():
             try:
@@ -1155,15 +1490,19 @@ class JobManager(EditorManagerMixin):
             category_names[folded] = category
             categories.add(category)
 
-        generated_password: str | None = None
-        if not password_hash:
-            generated_password = web_security.generate_password()
-            password_hash = web_security.hash_password(generated_password)
+        if new_installation:
+            categories.add(DEFAULT_CATEGORY)
 
-        if generated_password is not None:
+        default_password: str | None = None
+        if not password_hash:
+            default_password = DEFAULT_ADMIN_PASSWORD
+            password_hash = web_security.hash_password(default_password)
+
+        if default_password is not None:
             print(
-                "tetolate generated admin password (shown once): "
-                + generated_password,
+                "tetolate default admin password is: "
+                + default_password
+                + ". Change it after login.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -1171,6 +1510,8 @@ class JobManager(EditorManagerMixin):
         with self._lock:
             self._password_hash = password_hash
             self._categories = categories
+            if new_installation:
+                self.category_dir(DEFAULT_CATEGORY).mkdir(parents=True, exist_ok=True)
             self.save_web_state()
 
     def password_matches_hash(self, password: str, password_hash: str) -> bool:
@@ -1306,6 +1647,60 @@ class JobManager(EditorManagerMixin):
                 path.rmdir()
                 raise
         return category
+
+    def rename_category(self, category: str, new_category: str) -> str:
+        category = self.validate_category(category)
+        new_category = new_category.strip()
+        if not CATEGORY_PATTERN.fullmatch(new_category):
+            raise HTTPException(
+                status_code=400,
+                detail="Category must be 1-64 characters using letters, numbers, '_' or '-'.",
+            )
+        if category == new_category:
+            return category
+        with self._lock:
+            if any(
+                existing.casefold() == new_category.casefold()
+                for existing in self._categories
+            ):
+                raise HTTPException(status_code=409, detail="That category already exists.")
+            if any(code == category for code, _job_id in self._active_processes):
+                raise HTTPException(status_code=409, detail="Stop active jobs before renaming this category.")
+            if any(code == category for code, _job_id in self._queued_jobs):
+                raise HTTPException(status_code=409, detail="Wait for queued jobs before renaming this category.")
+
+            source_path = self.category_dir(category)
+            target_path = self.category_dir(new_category)
+            if target_path.exists():
+                raise HTTPException(status_code=409, detail="That category directory already exists.")
+            if not source_path.exists():
+                raise HTTPException(status_code=404, detail="Category directory is missing.")
+
+            os.replace(source_path, target_path)
+            self._categories.remove(category)
+            self._categories.add(new_category)
+            previous_statuses: list[tuple[Path, dict[str, Any]]] = []
+            try:
+                for job_id in self.iter_job_ids(new_category):
+                    status_path = self.status_path(new_category, job_id)
+                    status = self.load_status(new_category, job_id)
+                    if status is None:
+                        continue
+                    previous_statuses.append((status_path, dict(status)))
+                    status["category"] = new_category
+                    write_json_atomic(status_path, status)
+                self.save_web_state()
+            except Exception:
+                for status_path, status in previous_statuses:
+                    try:
+                        write_json_atomic(status_path, status)
+                    except Exception:
+                        LOGGER.exception("Could not restore category in %s", status_path)
+                self._categories.remove(new_category)
+                self._categories.add(category)
+                os.replace(target_path, source_path)
+                raise
+        return new_category
 
     def category_job_counts(self, category: str) -> dict[str, int]:
         category = self.validate_category(category)
@@ -1561,6 +1956,7 @@ class JobManager(EditorManagerMixin):
                         "status": status.get("status", "running"),
                         "phase": status.get("phase"),
                         "page": status.get("page"),
+                        "jobName": job_name_from_status(status, job_id),
                         "inputFilename": status.get("inputFilename", ""),
                         "url": f"/job/{code}/{job_id}",
                     }
@@ -1607,6 +2003,8 @@ class JobManager(EditorManagerMixin):
             "translationNotes": "",
             "thinkingBudgetTokens": self.config.default_thinking_budget_tokens,
             "vlmBaseUrl": self.config.default_vlm_base_url,
+            "vlmModel": self.config.default_vlm_model,
+            "autoTranslateComicInfoTitle": DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
             "pauseAfterOcr": False,
             "proofreadTranslations": DEFAULT_PROOFREAD_TRANSLATIONS,
             "writeTranslationNotes": DEFAULT_WRITE_TRANSLATION_NOTES,
@@ -1642,7 +2040,14 @@ class JobManager(EditorManagerMixin):
             )
         except ValueError:
             pass
+        model = data.get("vlmModel")
+        if isinstance(model, str):
+            try:
+                normalized["vlmModel"] = validate_vlm_model(model)
+            except ValueError:
+                pass
         for key in (
+            "autoTranslateComicInfoTitle",
             "pauseAfterOcr",
             "proofreadTranslations",
             "writeTranslationNotes",
@@ -1695,6 +2100,7 @@ class JobManager(EditorManagerMixin):
         *,
         thinking_budget_tokens: int,
         vlm_base_url: str,
+        vlm_model: str,
         pause_after_ocr: bool,
         proofread_translations: bool,
         write_translation_notes: bool,
@@ -1707,6 +2113,7 @@ class JobManager(EditorManagerMixin):
         lama_workers: int = translate_cbz.DEFAULT_LAMA_WORKERS,
         imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         translation_notes: str | None = None,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         with self._lock:
             options = self.load_category_advanced_options(code)
@@ -1714,6 +2121,8 @@ class JobManager(EditorManagerMixin):
                 {
                     "thinkingBudgetTokens": thinking_budget_tokens,
                     "vlmBaseUrl": vlm_base_url,
+                    "vlmModel": vlm_model,
+                    "autoTranslateComicInfoTitle": bool(auto_translate_comicinfo_title),
                     "pauseAfterOcr": bool(pause_after_ocr),
                     "proofreadTranslations": bool(proofread_translations),
                     "writeTranslationNotes": bool(write_translation_notes),
@@ -1811,6 +2220,11 @@ class JobManager(EditorManagerMixin):
         if filename is None:
             raise HTTPException(status_code=404, detail="Unknown translated CBZ variant.")
         return self.output_dir(code, job_id) / filename
+
+    def translated_cbz_download_name(self, code: str, job_id: str) -> str:
+        status = self.load_status(code, job_id) or {}
+        name = translated_job_name_from_status(status) or job_name_from_status(status, job_id)
+        return f"{name}.cbz"
 
     def editor_meta_dir(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / EDITOR_META_DIRNAME
@@ -1910,10 +2324,18 @@ class JobManager(EditorManagerMixin):
     def download_info(self, code: str, job_id: str) -> dict[str, dict[str, Any]]:
         downloads: dict[str, dict[str, Any]] = {}
         for variant in TRANSLATED_CBZ_FILENAMES:
-            downloads[variant] = file_info(
+            info = file_info(
                 self.translated_cbz_variant_path(code, job_id, variant)
             )
+            info["variant"] = variant
+            info["generateUrl"] = f"/job/{code}/{job_id}/generate-download/{variant}"
+            downloads[variant] = info
         return downloads
+
+    def invalidate_translated_cbz_archives(self, code: str, job_id: str) -> None:
+        """Remove archives whose rendered page inputs are no longer current."""
+        for variant in TRANSLATED_CBZ_FILENAMES:
+            self.translated_cbz_variant_path(code, job_id, variant).unlink(missing_ok=True)
 
     def iter_job_ids(self, code: str) -> list[str]:
         jobs_path = self.jobs_dir(code)
@@ -1980,6 +2402,7 @@ class JobManager(EditorManagerMixin):
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
             return
@@ -2001,6 +2424,7 @@ class JobManager(EditorManagerMixin):
             )
         else:
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
 
@@ -2041,6 +2465,35 @@ class JobManager(EditorManagerMixin):
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def status_vlm_model(self, status: dict[str, Any]) -> str:
+        value = status.get("vlmModel", self.config.default_vlm_model)
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        try:
+            return validate_vlm_model(value)
+        except ValueError:
+            return ""
+
+    def required_status_vlm_model(self, status: dict[str, Any]) -> str:
+        model = self.status_vlm_model(status)
+        if not model:
+            raise HTTPException(
+                status_code=400,
+                detail="VLM model is required before running this job.",
+            )
+        return model
+
+    def probe_vlm_models(self, endpoint: str, auth_token: str | None) -> list[str]:
+        pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+        if pipeline.vlm is None:
+            raise translate_cbz.PipelineError("Pipeline VLM configuration is unavailable.")
+        config = replace(
+            pipeline.vlm,
+            base_url=endpoint,
+            api_key=auth_token or pipeline.vlm.api_key,
+        )
+        return vlm_client.list_vlm_model_ids(config)
 
     def status_pause_after_ocr(self, status: dict[str, Any]) -> bool:
         return bool(status.get("pauseAfterOcr"))
@@ -2171,6 +2624,7 @@ class JobManager(EditorManagerMixin):
         )
         thinking_budget_tokens = self.status_thinking_budget_tokens(status)
         vlm_base_url = self.status_vlm_base_url(status)
+        vlm_model = self.status_vlm_model(status)
         pause_after_ocr = self.status_pause_after_ocr(status)
         proofread_translations = self.status_proofread_translations(status)
         write_translation_notes = self.status_write_translation_notes(status)
@@ -2190,6 +2644,8 @@ class JobManager(EditorManagerMixin):
         payload = {
             "category": code,
             "jobId": job_id,
+            "jobName": job_name_from_status(status, job_id),
+            "translatedJobName": translated_job_name_from_status(status),
             "status": status_value,
             "phase": status.get("phase"),
             "page": status.get("page"),
@@ -2207,9 +2663,16 @@ class JobManager(EditorManagerMixin):
             "age": age_text(timing.age_seconds),
             "elapsedSeconds": timing.elapsed_seconds,
             "elapsed": duration_text(timing.elapsed_seconds),
-            "hasDownload": self.translated_cbz_path(code, job_id).is_file()
-            and status.get("status") == "complete",
+            "hasDownload": any(
+                item.get("available") for item in downloads.values()
+            ) and status.get("status") == "complete",
             "downloads": downloads if status.get("status") == "complete" else {},
+            "downloadGenerationUrls": {
+                variant: f"/job/{code}/{job_id}/generate-download/{variant}"
+                for variant in TRANSLATED_CBZ_FILENAMES
+            }
+            if status.get("status") == "complete"
+            else {},
             "hasOriginalDownload": bool(input_info["available"]),
             "originalDownloadUrl": f"/job/{code}/{job_id}/download-original",
             "canViewOriginal": original_page_count > 0,
@@ -2221,8 +2684,10 @@ class JobManager(EditorManagerMixin):
             "canDelete": can_delete,
             "canRestart": can_restart,
             "canTerminate": can_terminate,
+            "canRenameJob": status_value not in {"queued", "running"} and not is_active,
+            "canTranslateTitle": status_value not in {"queued", "running"} and not is_active,
             "canRerunPages": status.get("status") == "complete",
-            "canRegenerateDownloads": status.get("status") == "complete",
+            "canGenerateDownloads": status.get("status") == "complete",
             "canEdit": status.get("status") == "complete" or ocr_review_checkpoint,
             "ocrReviewCheckpoint": ocr_review_checkpoint,
             "webpQuality": webp_quality,
@@ -2234,6 +2699,18 @@ class JobManager(EditorManagerMixin):
             "defaultThinkingBudgetTokens": self.config.default_thinking_budget_tokens,
             "vlmBaseUrl": vlm_base_url,
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
+            "vlmModel": vlm_model,
+            "defaultVlmModel": self.config.default_vlm_model,
+            "autoTranslateComicInfoTitle": bool(
+                status.get(
+                    "autoTranslateComicInfoTitle",
+                    DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+                )
+            ),
+            "comicInfoTitle": str(status.get("comicInfoTitle") or ""),
+            "cbzTitleMode": str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL),
+            "cbzAltTitleInNotes": bool(status.get("cbzAltTitleInNotes")),
+            "titleTranslationWarning": str(status.get("titleTranslationWarning") or ""),
             "pauseAfterOcr": pause_after_ocr,
             "proofreadTranslations": proofread_translations,
             "writeTranslationNotes": write_translation_notes,
@@ -2259,7 +2736,10 @@ class JobManager(EditorManagerMixin):
             "defaultImagemagickWorkers": translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
             "generatedTranslationNotes": generated_translation_notes,
             "hasGeneratedTranslationNotes": bool(generated_translation_notes),
-            "canUpdateAdvancedOptions": status_value in {"failed", "cancelled"} or logical_pause,
+            "canUpdateAdvancedOptions": (
+                not is_active
+                and status_value not in {"queued", "running", "terminating"}
+            ),
             "restartResumeFrom": restart_target[0] if restart_target is not None else None,
             "restartResumePage": restart_target[1] if restart_target is not None else None,
             "url": f"/job/{code}/{job_id}",
@@ -2284,6 +2764,8 @@ class JobManager(EditorManagerMixin):
             "translationNotes": options["translationNotes"],
             "defaultThinkingBudgetTokens": options["thinkingBudgetTokens"],
             "defaultVlmBaseUrl": options["vlmBaseUrl"],
+            "defaultVlmModel": options["vlmModel"],
+            "autoTranslateComicInfoTitle": options["autoTranslateComicInfoTitle"],
             "pauseAfterOcr": options["pauseAfterOcr"],
             "proofreadTranslations": options["proofreadTranslations"],
             "writeTranslationNotes": options["writeTranslationNotes"],
@@ -2386,6 +2868,7 @@ class JobManager(EditorManagerMixin):
         translation_notes: str = "",
         thinking_budget_tokens: int | None = None,
         vlm_base_url: str | None = None,
+        vlm_model: str | None = None,
         pause_after_ocr: bool = False,
         proofread_translations: bool = DEFAULT_PROOFREAD_TRANSLATIONS,
         write_translation_notes: bool = DEFAULT_WRITE_TRANSLATION_NOTES,
@@ -2399,6 +2882,7 @@ class JobManager(EditorManagerMixin):
         imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         vlm_auth_token: str | None = None,
         paddleocr_vl_auth_token: str | None = None,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         created_at = now_utc()
         if thinking_budget_tokens is None:
@@ -2408,6 +2892,7 @@ class JobManager(EditorManagerMixin):
             vlm_base_url or "",
             self.config.default_vlm_base_url,
         )
+        vlm_model = validate_vlm_model(vlm_model or self.config.default_vlm_model)
         if source_language is None:
             source_language = self.config.default_source_language
         source_language = translate_cbz.normalize_source_language(source_language)
@@ -2423,6 +2908,8 @@ class JobManager(EditorManagerMixin):
         imagemagick_workers = translate_cbz.normalize_page_workers(
             imagemagick_workers, "ImageMagick workers"
         )
+        comicinfo_title = comicinfo_title_from_archive(self.input_path(code, job_id))
+        fallback_job_name = default_job_name(original_filename, job_id)
         status = {
             "category": code,
             "jobId": job_id,
@@ -2433,8 +2920,14 @@ class JobManager(EditorManagerMixin):
             "createdAt": created_at,
             "elapsedSeconds": 0.0,
             "inputFilename": original_filename,
+            "jobName": safe_job_name(comicinfo_title, fallback_job_name)
+            if comicinfo_title
+            else fallback_job_name,
+            "comicInfoTitle": comicinfo_title,
             "thinkingBudgetTokens": thinking_budget_tokens,
             "vlmBaseUrl": vlm_base_url,
+            "vlmModel": vlm_model,
+            "autoTranslateComicInfoTitle": bool(auto_translate_comicinfo_title),
             "pauseAfterOcr": bool(pause_after_ocr),
             "proofreadTranslations": bool(proofread_translations),
             "writeTranslationNotes": bool(write_translation_notes),
@@ -2461,6 +2954,7 @@ class JobManager(EditorManagerMixin):
             translation_notes=translation_notes,
             thinking_budget_tokens=thinking_budget_tokens,
             vlm_base_url=vlm_base_url,
+            vlm_model=vlm_model,
             pause_after_ocr=pause_after_ocr,
             proofread_translations=proofread_translations,
             write_translation_notes=write_translation_notes,
@@ -2472,6 +2966,7 @@ class JobManager(EditorManagerMixin):
             ocr_page_workers=ocr_page_workers,
             lama_workers=lama_workers,
             imagemagick_workers=imagemagick_workers,
+            auto_translate_comicinfo_title=auto_translate_comicinfo_title,
         )
         self.enqueue(code, job_id)
 
@@ -2481,6 +2976,7 @@ class JobManager(EditorManagerMixin):
         job_id: str,
         thinking_budget_tokens: int,
         vlm_base_url: str,
+        vlm_model: str,
         pause_after_ocr: bool,
         proofread_translations: bool,
         write_translation_notes: bool,
@@ -2496,6 +2992,7 @@ class JobManager(EditorManagerMixin):
         paddleocr_vl_auth_token: str | None,
         clear_vlm_auth_token: bool,
         clear_paddleocr_vl_auth_token: bool,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -2504,6 +3001,7 @@ class JobManager(EditorManagerMixin):
             vlm_base_url,
             self.config.default_vlm_base_url,
         )
+        vlm_model = validate_vlm_model(vlm_model)
         source_language = translate_cbz.normalize_source_language(source_language)
         ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
         ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")
@@ -2515,13 +3013,20 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if status.get("status") not in {"failed", "cancelled", "paused"}:
+            if (code, job_id) in self._active_processes or status.get("status") not in {
+                "failed",
+                "cancelled",
+                "paused",
+                "complete",
+            }:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only failed, cancelled, or paused jobs can update advanced options.",
+                    detail="Only completed, failed, cancelled, or paused jobs can update advanced options.",
                 )
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
+            status["vlmModel"] = vlm_model
+            status["autoTranslateComicInfoTitle"] = bool(auto_translate_comicinfo_title)
             status["pauseAfterOcr"] = bool(pause_after_ocr)
             status["proofreadTranslations"] = bool(proofread_translations)
             status["writeTranslationNotes"] = bool(write_translation_notes)
@@ -2547,6 +3052,7 @@ class JobManager(EditorManagerMixin):
                 code,
                 thinking_budget_tokens=thinking_budget_tokens,
                 vlm_base_url=vlm_base_url,
+                vlm_model=vlm_model,
                 pause_after_ocr=pause_after_ocr,
                 proofread_translations=proofread_translations,
                 write_translation_notes=write_translation_notes,
@@ -2558,6 +3064,7 @@ class JobManager(EditorManagerMixin):
                 ocr_page_workers=ocr_page_workers,
                 lama_workers=lama_workers,
                 imagemagick_workers=imagemagick_workers,
+                auto_translate_comicinfo_title=auto_translate_comicinfo_title,
             )
 
     def restart_failed_job(self, code: str, job_id: str) -> None:
@@ -2577,7 +3084,8 @@ class JobManager(EditorManagerMixin):
                     detail="Only failed, cancelled, or paused jobs can be restarted.",
                 )
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
+            self.required_status_vlm_model(status)
 
             pending_reruns = status.get("pendingPageReruns")
             first_pending = (
@@ -2636,6 +3144,8 @@ class JobManager(EditorManagerMixin):
                 status["pendingResumePage"] = restart_target[1]
                 if restart_target[0] == "package":
                     status["pendingPackageOnly"] = True
+                    if status.get("pendingPackageVariant") not in TRANSLATED_CBZ_FILENAMES:
+                        status["pendingPackageVariant"] = "png"
                     status["pendingWebpQuality"] = quality_for_display(
                         status.get("webpQuality"),
                         self.config.default_webp_quality,
@@ -2646,12 +3156,14 @@ class JobManager(EditorManagerMixin):
                     )
                 else:
                     status.pop("pendingPackageOnly", None)
+                    status.pop("pendingPackageVariant", None)
                     status.pop("pendingWebpQuality", None)
                     status.pop("pendingJxlQuality", None)
             else:
                 status.pop("pendingResumeFrom", None)
                 status.pop("pendingResumePage", None)
                 status.pop("pendingPackageOnly", None)
+                status.pop("pendingPackageVariant", None)
                 status.pop("pendingWebpQuality", None)
                 status.pop("pendingJxlQuality", None)
             self.save_status(code, job_id, status)
@@ -2663,8 +3175,6 @@ class JobManager(EditorManagerMixin):
         job_id: str,
         pages: list[int],
         resume_from: str = "ocr_raw",
-        webp_quality: int | None = None,
-        jxl_quality: int | None = None,
         translation_boxno: int | None = None,
         page_resume_from: dict[int, str] | None = None,
     ) -> None:
@@ -2673,12 +3183,6 @@ class JobManager(EditorManagerMixin):
         resume_from = RERUN_STAGE_MAP.get(resume_from, resume_from)
         if resume_from not in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             raise HTTPException(status_code=400, detail="Unsupported rerun stage.")
-        if webp_quality is not None:
-            webp_quality = validate_output_quality(webp_quality, "WebP quality")
-        if jxl_quality is not None:
-            jxl_quality = validate_output_quality(jxl_quality, "JXL quality")
-        if (webp_quality is None) != (jxl_quality is None):
-            raise HTTPException(status_code=400, detail="Both WebP and JXL quality must be provided together.")
         if translation_boxno is not None:
             if resume_from != "translations" or len(pages) != 1:
                 raise HTTPException(
@@ -2700,9 +3204,10 @@ class JobManager(EditorManagerMixin):
             if status.get("status") != "complete":
                 raise HTTPException(status_code=400, detail="Only complete jobs can rerun pages.")
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
+            self.required_status_vlm_model(status)
 
             page_count = len(self.original_page_files(code, job_id))
             if page_count <= 0:
@@ -2748,6 +3253,10 @@ class JobManager(EditorManagerMixin):
                 for page in pages:
                     self.materialize_editor_v2_page(code, job_id, manifest, page)
 
+            # Any page rerun changes the rendered source for every archive
+            # variant. Keep no stale translated archive available.
+            self.invalidate_translated_cbz_archives(code, job_id)
+
             try:
                 rerun_count = int(status.get("rerunCount", 0)) + 1
             except (TypeError, ValueError):
@@ -2772,14 +3281,11 @@ class JobManager(EditorManagerMixin):
                     "lastResumePage": first_rerun["page"],
                 }
             )
-            if webp_quality is not None and jxl_quality is not None:
-                status["pendingWebpQuality"] = webp_quality
-                status["pendingJxlQuality"] = jxl_quality
-            else:
-                status.pop("pendingWebpQuality", None)
-                status.pop("pendingJxlQuality", None)
+            status.pop("pendingWebpQuality", None)
+            status.pop("pendingJxlQuality", None)
             status.pop("pid", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             if translation_boxno is None:
                 status.pop("pendingTranslationBoxno", None)
             else:
@@ -2841,17 +3347,20 @@ class JobManager(EditorManagerMixin):
             daemon=True,
         ).start()
 
-    def regenerate_completed_job_downloads(
+    def generate_download(
         self,
         code: str,
         job_id: str,
-        webp_quality: int,
-        jxl_quality: int,
+        variant: str,
+        *,
+        title_mode: str = CBZ_TITLE_MODE_ORIGINAL,
+        alt_title_in_notes: bool = False,
+        regenerate: bool = False,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
-        webp_quality = validate_output_quality(webp_quality, "WebP quality")
-        jxl_quality = validate_output_quality(jxl_quality, "JXL quality")
+        if variant not in TRANSLATED_CBZ_FILENAMES:
+            raise HTTPException(status_code=404, detail="Unknown translated CBZ variant.")
         with self._lock:
             status = self.load_status(code, job_id)
             if status is None:
@@ -2861,15 +3370,25 @@ class JobManager(EditorManagerMixin):
             if status.get("status") != "complete":
                 raise HTTPException(
                     status_code=400,
-                    detail="Only complete jobs can regenerate downloads.",
+                    detail="Only complete jobs can generate downloads.",
                 )
             if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded CBZ is missing.")
+                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
+            if title_mode not in CBZ_TITLE_MODES:
+                raise HTTPException(status_code=400, detail="Unknown CBZ title mode.")
+            if (
+                self.translated_cbz_variant_path(code, job_id, variant).is_file()
+                and not regenerate
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="That CBZ already exists. Use the regenerate action to replace it.",
+                )
 
             try:
-                package_count = int(status.get("packageRegenerationCount", 0)) + 1
+                package_count = int(status.get("packageGenerationCount", 0)) + 1
             except (TypeError, ValueError):
                 package_count = 1
             status.update(
@@ -2878,25 +3397,187 @@ class JobManager(EditorManagerMixin):
                     "phase": "Queued",
                     "page": None,
                     "message": (
-                        "Queued to regenerate downloads "
-                        f"(WebP quality {webp_quality}, JXL quality {jxl_quality})."
+                        f"Queued to generate {variant.upper()} CBZ download."
                     ),
                     "finishedAt": None,
                     "returnCode": None,
-                    "packageRegenerationCount": package_count,
+                    "packageGenerationCount": package_count,
                     "pendingPackageOnly": True,
-                    "pendingWebpQuality": webp_quality,
-                    "pendingJxlQuality": jxl_quality,
+                    "pendingPackageVariant": variant,
+                    "pendingWebpQuality": quality_for_display(
+                        status.get("webpQuality"), self.config.default_webp_quality
+                    ),
+                    "pendingJxlQuality": quality_for_display(
+                        status.get("jxlQuality"), self.config.default_jxl_quality
+                    ),
                     "pendingResumeFrom": "package",
                     "pendingResumePage": 0,
                     "lastResumeFrom": "package",
                     "lastResumePage": 0,
+                    "cbzTitleMode": title_mode,
+                    "cbzAltTitleInNotes": bool(alt_title_in_notes),
                 }
             )
             status.pop("pid", None)
             status.pop("pendingPageReruns", None)
-            self.save_status(code, job_id, status)
-            self.enqueue(code, job_id)
+        self.save_status(code, job_id, status)
+        self.enqueue(code, job_id)
+
+    def request_vlm_title(
+        self,
+        code: str,
+        job_id: str,
+        source_title: str,
+        *,
+        instructions: str = "",
+        allow_refusal: bool = False,
+    ) -> tuple[str, bool]:
+        status = self.load_status(code, job_id) or {}
+        model = self.required_status_vlm_model(status)
+        endpoint = self.status_vlm_base_url(status)
+        secrets = self.load_job_secrets(code, job_id)
+        pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+        if pipeline.vlm is None:
+            raise HTTPException(status_code=400, detail="VLM configuration is unavailable.")
+        vlm_config = replace(
+            pipeline.vlm,
+            base_url=endpoint,
+            model=model,
+            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+        )
+        if allow_refusal:
+            prompt = (
+                "Translate this comic title into natural English. Return only the title. "
+                "If it is already English, only an ID/number/code, or does not need translation, "
+                "return exactly NO_TRANSLATION_NEEDED. Do not add quotes or explanations.\n\n"
+                f"Title: {source_title}"
+            )
+            system_prompt = (
+                "You translate manga and comic titles. Return one title only, or the exact "
+                "marker NO_TRANSLATION_NEEDED when translation is not needed."
+            )
+        else:
+            prompt = (
+                "Generate one natural English title for this comic. Return only the title, "
+                "without quotes, labels, explanations, or a trailing period.\n\n"
+                f"Current title: {source_title}\n"
+                f"User instructions: {instructions}"
+            )
+            system_prompt = "You generate concise manga and comic titles. Return only the requested title."
+        result = vlm_client.call_vlm(
+            vlm_config,
+            prompt,
+            None,
+            f"generating title for {code}/{job_id}",
+            system_prompt=system_prompt,
+        )
+        title = normalize_vlm_title_output(result.output)
+        if allow_refusal and title.casefold() == "no_translation_needed":
+            return "", True
+        return title, False
+
+    def record_title_warning(
+        self,
+        code: str,
+        job_id: str,
+        status: dict[str, Any],
+        warning: str,
+    ) -> None:
+        status["titleTranslationWarning"] = warning
+        self.save_status(code, job_id, status)
+
+    def maybe_auto_translate_comicinfo_title(
+        self,
+        code: str,
+        job_id: str,
+        status: dict[str, Any],
+    ) -> None:
+        source_title = str(status.get("comicInfoTitle") or "").strip()
+        if (
+            not source_title
+            or not bool(
+                status.get(
+                    "autoTranslateComicInfoTitle",
+                    DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+                )
+            )
+            or status.get("titleTranslationAttempted")
+            or status.get("translatedJobName")
+        ):
+            return
+        status["titleTranslationAttempted"] = True
+        self.save_status(code, job_id, status)
+        try:
+            translated, refused = self.request_vlm_title(
+                code,
+                job_id,
+                source_title,
+                allow_refusal=True,
+            )
+        except Exception as exc:
+            self.record_title_warning(
+                code,
+                job_id,
+                status,
+                f"ComicInfo title translation was unavailable: {exc}",
+            )
+            return
+        if refused:
+            status["titleTranslationSkipped"] = True
+        else:
+            status["translatedJobName"] = safe_job_name(translated, source_title)
+            status.pop("titleTranslationWarning", None)
+        self.save_status(code, job_id, status)
+
+    def resolve_cbz_export_titles(
+        self,
+        code: str,
+        job_id: str,
+        status: dict[str, Any],
+    ) -> tuple[str | None, str | None, str | None]:
+        source_title = str(status.get("comicInfoTitle") or "").strip()
+        if not source_title:
+            return None, None, None
+        mode = str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL)
+        if mode not in CBZ_TITLE_MODES:
+            mode = CBZ_TITLE_MODE_ORIGINAL
+        warning: str | None = None
+        translated = ""
+        if mode == CBZ_TITLE_MODE_TRANSLATED or (
+            mode == CBZ_TITLE_MODE_ORIGINAL and bool(status.get("cbzAltTitleInNotes"))
+        ):
+            if status.get("translatedJobName"):
+                translated = str(status["translatedJobName"]).strip()
+            elif not status.get("titleTranslationSkipped"):
+                try:
+                    translated, refused = self.request_vlm_title(
+                        code,
+                        job_id,
+                        source_title,
+                        allow_refusal=True,
+                    )
+                    status["titleTranslationAttempted"] = True
+                    if refused:
+                        status["titleTranslationSkipped"] = True
+                        translated = ""
+                    else:
+                        status["translatedJobName"] = safe_job_name(translated, source_title)
+                    self.save_status(code, job_id, status)
+                except Exception as exc:
+                    warning = f"Could not generate the translated title; using the original title: {exc}"
+
+        selected_title = source_title
+        if mode == CBZ_TITLE_MODE_TRANSLATED and translated:
+            selected_title = translated
+        alt_title: str | None = None
+        if bool(status.get("cbzAltTitleInNotes")):
+            if mode == CBZ_TITLE_MODE_TRANSLATED:
+                alt_title = source_title
+            elif mode == CBZ_TITLE_MODE_ORIGINAL:
+                alt_title = translated or None
+            elif selected_title != source_title:
+                alt_title = source_title
+        return selected_title, alt_title, warning
 
     def delete_job(self, code: str, job_id: str) -> None:
         code = self.validate_category(code)
@@ -2909,7 +3590,182 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=409, detail="Job is queued or running.")
             if status.get("status") not in TERMINAL_JOB_STATUSES:
                 raise HTTPException(status_code=400, detail="Only finished jobs can be deleted from the web UI.")
-            shutil.rmtree(self.job_dir(code, job_id), ignore_errors=True)
+            try:
+                shutil.rmtree(self.job_dir(code, job_id))
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Job directory is missing.",
+                ) from None
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not delete job.",
+                ) from exc
+
+    def rename_job(self, code: str, job_id: str, name: str) -> str:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        name = validate_job_name(name)
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the job to stop before renaming it.")
+            status["jobName"] = name
+            self.save_status(code, job_id, status)
+        return name
+
+    def set_translated_title(self, code: str, job_id: str, name: str) -> str:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        name = name.strip()
+        translated = validate_job_name(name) if name else ""
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Wait for the job to stop before changing its title.",
+                )
+            if translated:
+                status["translatedJobName"] = translated
+                status["titleTranslationAttempted"] = True
+                status.pop("titleTranslationSkipped", None)
+                status.pop("titleTranslationWarning", None)
+            else:
+                status.pop("translatedJobName", None)
+            self.save_status(code, job_id, status)
+        return translated
+
+    def translate_title(self, code: str, job_id: str) -> str:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the job to stop before translating its title.")
+            source_title = job_name_from_status(status, job_id)
+            model = self.required_status_vlm_model(status)
+            endpoint = self.status_vlm_base_url(status)
+            secrets = self.load_job_secrets(code, job_id)
+
+        pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+        if pipeline.vlm is None:
+            raise HTTPException(status_code=400, detail="VLM configuration is unavailable.")
+        vlm_config = replace(
+            pipeline.vlm,
+            base_url=endpoint,
+            model=model,
+            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+        )
+        prompt = (
+            "Translate this manga or comic title into natural English. "
+            "Return only the translated title. Do not add quotes, labels, "
+            "explanations, or a trailing period.\n\n"
+            f"Title: {source_title}"
+        )
+        result = vlm_client.call_vlm(
+            vlm_config,
+            prompt,
+            None,
+            f"translating title for {code}/{job_id}",
+            system_prompt=(
+                "You translate manga and comic titles. Return only the title "
+                "translation requested by the user."
+            ),
+        )
+        translated = " ".join(result.output.split()).strip()
+        for quote in ('"', "'", "`", "“", "”"):
+            if translated.startswith(quote) and translated.endswith(quote):
+                translated = translated[1:-1].strip()
+                break
+        translated = validate_job_name(translated)
+
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            status["translatedJobName"] = translated
+            status.pop("titleTranslationSkipped", None)
+            status.pop("titleTranslationWarning", None)
+            self.save_status(code, job_id, status)
+        return translated
+
+    def retry_title_translation(
+        self,
+        code: str,
+        job_id: str,
+        manual_title: str = "",
+    ) -> str | None:
+        code = self.validate_category(code)
+        job_id = self.validate_job_id(job_id)
+        manual_title = manual_title.strip()
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("status") in {"queued", "running", "terminating"} or (
+                code,
+                job_id,
+            ) in self._active_processes:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Wait for the job to stop before translating its title.",
+                )
+            source_title = str(status.get("comicInfoTitle") or "").strip()
+            if not source_title:
+                source_title = job_name_from_status(status, job_id)
+
+            if manual_title:
+                translated = validate_job_name(manual_title)
+                status["titleTranslationAttempted"] = True
+                status.pop("titleTranslationSkipped", None)
+                status["translatedJobName"] = translated
+                status.pop("titleTranslationWarning", None)
+                self.save_status(code, job_id, status)
+                return translated
+
+            status["titleTranslationAttempted"] = True
+            status.pop("titleTranslationSkipped", None)
+            self.save_status(code, job_id, status)
+
+        try:
+            translated, refused = self.request_vlm_title(
+                code,
+                job_id,
+                source_title,
+                allow_refusal=True,
+            )
+        except Exception as exc:
+            with self._lock:
+                status = self.load_status(code, job_id)
+                if status is not None:
+                    status["titleTranslationWarning"] = (
+                        f"ComicInfo title translation was unavailable: {exc}"
+                    )
+                    self.save_status(code, job_id, status)
+            raise
+
+        with self._lock:
+            status = self.load_status(code, job_id)
+            if status is None:
+                raise HTTPException(status_code=404, detail="Unknown job.")
+            if refused:
+                status["titleTranslationSkipped"] = True
+                status.pop("titleTranslationWarning", None)
+                self.save_status(code, job_id, status)
+                return None
+            translated = safe_job_name(translated, source_title)
+            status["translatedJobName"] = translated
+            status.pop("titleTranslationWarning", None)
+            self.save_status(code, job_id, status)
+            return translated
 
     def worker_loop(self) -> None:
         while True:
@@ -2987,6 +3843,7 @@ class JobManager(EditorManagerMixin):
         resume_page: int | None = None,
         single_page: bool = False,
         skip_package: bool = False,
+        package_variant: str | None = None,
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
         translation_boxno: int | None = None,
@@ -3030,6 +3887,12 @@ class JobManager(EditorManagerMixin):
                 ),
             ]
         )
+        if resume_from in {"render", "package"}:
+            model = self.status_vlm_model(status)
+            if model:
+                command.extend(["--vlm-model", model])
+        else:
+            command.extend(["--vlm-model", self.required_status_vlm_model(status)])
         ocr_engine = self.status_ocr_engine(status)
         command.extend(["--source-language", self.status_source_language(status)])
         command.extend(["--ocr-engine", ocr_engine])
@@ -3061,10 +3924,22 @@ class JobManager(EditorManagerMixin):
             command.extend(["--webp-quality", str(webp_quality)])
         if jxl_quality is not None:
             command.extend(["--jxl-quality", str(jxl_quality)])
+        if package_variant is not None:
+            if package_variant not in TRANSLATED_CBZ_FILENAMES:
+                raise HTTPException(status_code=400, detail="Unknown translated CBZ variant.")
+            command.extend(["--package-variant", package_variant])
+        if resume_from == "package" and status.get("pendingComicInfoTitle") is not None:
+            command.extend(["--comicinfo-title", str(status.get("pendingComicInfoTitle") or "")])
+            command.extend(
+                ["--comicinfo-alt-title", str(status.get("pendingComicInfoAltTitle") or "")]
+            )
         if resume_from is None:
             if self.status_pause_after_ocr(status):
                 command.extend(["--stop-after", "ocr_merged"])
             command.append("--overwrite")
+            # Web jobs keep rendered pages as the canonical result. Archives are
+            # generated only when a user requests a specific download.
+            command.append("--skip-package")
             return command
 
         command.extend(["--resume-from", resume_from])
@@ -3074,7 +3949,7 @@ class JobManager(EditorManagerMixin):
             command.append("--single-page")
         if translation_boxno is not None:
             command.extend(["--translation-boxno", str(translation_boxno)])
-        if skip_package:
+        if skip_package or resume_from != "package":
             command.append("--skip-package")
         return command
 
@@ -3158,12 +4033,24 @@ class JobManager(EditorManagerMixin):
 
         return return_code
 
-    def run_package_regeneration_job(
+    def run_package_generation_job(
         self,
         code: str,
         job_id: str,
         status: dict[str, Any],
     ) -> None:
+        variant = str(status.get("pendingPackageVariant") or "")
+        if variant not in TRANSLATED_CBZ_FILENAMES:
+            status.update(
+                {
+                    "status": "failed",
+                    "phase": "Failed",
+                    "message": "No valid CBZ variant was selected for generation.",
+                    "finishedAt": now_utc(),
+                }
+            )
+            self.save_status(code, job_id, status)
+            return
         webp_quality = quality_for_display(
             status.get("pendingWebpQuality"),
             self.config.default_webp_quality,
@@ -3172,6 +4059,18 @@ class JobManager(EditorManagerMixin):
             status.get("pendingJxlQuality"),
             self.config.default_jxl_quality,
         )
+        selected_title, alt_title, title_warning = self.resolve_cbz_export_titles(
+            code,
+            job_id,
+            status,
+        )
+        if selected_title is not None:
+            status["pendingComicInfoTitle"] = selected_title
+            status["pendingComicInfoAltTitle"] = alt_title or ""
+        if title_warning:
+            status["titleTranslationWarning"] = title_warning
+        else:
+            status.pop("titleTranslationWarning", None)
         start_active_runtime(status)
         status.update(
             {
@@ -3179,8 +4078,9 @@ class JobManager(EditorManagerMixin):
                 "phase": "Starting",
                 "page": None,
                 "message": (
-                    "Regenerating downloads "
-                    f"(WebP quality {webp_quality}, JXL quality {jxl_quality})."
+                    f"Generating {variant.upper()} CBZ download. {title_warning}"
+                    if title_warning
+                    else f"Generating {variant.upper()} CBZ download."
                 ),
                 "finishedAt": None,
                 "pendingResumeFrom": "package",
@@ -3201,8 +4101,9 @@ class JobManager(EditorManagerMixin):
                 0,
                 webp_quality=webp_quality,
                 jxl_quality=jxl_quality,
+                package_variant=variant,
             ),
-            "regenerate downloads",
+            f"generate {variant} download",
         )
 
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
@@ -3213,11 +4114,6 @@ class JobManager(EditorManagerMixin):
         status["webpQuality"] = webp_quality
         status["jxlQuality"] = jxl_quality
         status.pop("pid", None)
-        status.pop("pendingPackageOnly", None)
-        status.pop("pendingWebpQuality", None)
-        status.pop("pendingJxlQuality", None)
-        status.pop("pendingResumeFrom", None)
-        status.pop("pendingResumePage", None)
         status.pop("pendingTranslationBoxno", None)
         was_terminated = bool(status.pop("pendingTermination", None))
         status.pop("terminatingAt", None)
@@ -3230,26 +4126,38 @@ class JobManager(EditorManagerMixin):
                     "status": "cancelled",
                     "phase": "Cancelled",
                     "page": None,
-                    "message": "Download regeneration terminated.",
+                    "message": "Download generation terminated.",
                 }
             )
-        elif return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.translated_cbz_variant_path(code, job_id, variant).is_file():
             status.update(
                 {
                     "status": "complete",
                     "phase": "Complete",
                     "page": None,
-                    "message": "Download regeneration complete.",
+                    "message": f"{variant.upper()} CBZ download generation complete.",
                 }
             )
+            if title_warning:
+                status["message"] += f" Warning: {title_warning}"
+            status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
+            status.pop("pendingWebpQuality", None)
+            status.pop("pendingJxlQuality", None)
+            status.pop("pendingResumeFrom", None)
+            status.pop("pendingResumePage", None)
         else:
             status.update(
                 {
                     "status": "failed",
                     "phase": "Failed",
-                    "message": f"Download regeneration failed with exit code {return_code}.",
+                    "message": f"Download generation failed with exit code {return_code}.",
                 }
             )
+            status["pendingPackageOnly"] = True
+            status["pendingPackageVariant"] = variant
+            status["pendingResumeFrom"] = "package"
+            status["pendingResumePage"] = 0
         self.save_status(code, job_id, status)
 
     def run_page_rerun_batch_job(
@@ -3294,16 +4202,12 @@ class JobManager(EditorManagerMixin):
             self.save_status(code, job_id, status)
             return
 
+        # Also enforce this invariant for callers that invoke the worker
+        # directly (for example, a recovered queued job).
+        self.invalidate_translated_cbz_archives(code, job_id)
+
         final_return_code = 0
         pages = [item["page"] for item in page_reruns]
-        package_webp_quality = quality_for_display(
-            status.get("pendingWebpQuality"),
-            quality_for_display(status.get("webpQuality"), self.config.default_webp_quality),
-        )
-        package_jxl_quality = quality_for_display(
-            status.get("pendingJxlQuality"),
-            quality_for_display(status.get("jxlQuality"), self.config.default_jxl_quality),
-        )
         translation_boxno_value = status.get("pendingTranslationBoxno")
         try:
             translation_boxno = (
@@ -3352,36 +4256,6 @@ class JobManager(EditorManagerMixin):
                 break
 
         selected_translation_only = translation_boxno is not None
-        if final_return_code == 0 and not selected_translation_only:
-            status = self.load_status(code, job_id) or status
-            status.update(
-                {
-                    "status": "running",
-                    "phase": "Package",
-                    "page": None,
-                    "message": "Packaging rerun output.",
-                    "pendingResumeFrom": "package",
-                    "pendingResumePage": 0,
-                    "lastResumeFrom": "package",
-                    "lastResumePage": 0,
-                    "pendingPackageOnly": True,
-                }
-            )
-            status.pop("pendingPageReruns", None)
-            self.save_status(code, job_id, status)
-            final_return_code = self.run_pipeline_process(
-                code,
-                job_id,
-                self.build_command(
-                    code,
-                    job_id,
-                    "package",
-                    0,
-                    webp_quality=package_webp_quality,
-                    jxl_quality=package_jxl_quality,
-                ),
-                "package rerun output",
-            )
 
         status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
         finished_at = datetime.now(timezone.utc)
@@ -3394,9 +4268,10 @@ class JobManager(EditorManagerMixin):
         status.pop("isPaused", None)
         status.pop("pausedAt", None)
 
+        # Selected retranslation updates translation data only. The existing
+        # rendered pages remain the valid job result until typesetting reruns.
         completed = final_return_code == 0 and (
-            selected_translation_only
-            or self.translated_cbz_path(code, job_id).is_file()
+            selected_translation_only or bool(self.final_page_files(code, job_id))
         )
         if was_terminated:
             status.update(
@@ -3420,8 +4295,6 @@ class JobManager(EditorManagerMixin):
                         [page_rerun["page"]],
                         resume_from=page_rerun["resumeFrom"],
                     )
-            status["webpQuality"] = package_webp_quality
-            status["jxlQuality"] = package_jxl_quality
             status.update(
                 {
                     "status": "complete",
@@ -3449,6 +4322,7 @@ class JobManager(EditorManagerMixin):
             status.pop("pendingResumePage", None)
             status.pop("pendingPageReruns", None)
             status.pop("pendingPackageOnly", None)
+            status.pop("pendingPackageVariant", None)
             status.pop("pendingWebpQuality", None)
             status.pop("pendingJxlQuality", None)
             status.pop("pendingEditorChangedPages", None)
@@ -3475,7 +4349,7 @@ class JobManager(EditorManagerMixin):
             "createdAt": now_utc(),
         }
         if status.get("pendingPackageOnly"):
-            self.run_package_regeneration_job(code, job_id, status)
+            self.run_package_generation_job(code, job_id, status)
             return
 
         pending_page_reruns = status.get("pendingPageReruns")
@@ -3493,6 +4367,9 @@ class JobManager(EditorManagerMixin):
                 resume_page = int(resume_page or 0)
             except (TypeError, ValueError):
                 resume_page = 0
+        if resume_from is None:
+            self.maybe_auto_translate_comicinfo_title(code, job_id, status)
+            status = self.load_status(code, job_id) or status
         start_active_runtime(status)
         status.update(
             {
@@ -3542,7 +4419,7 @@ class JobManager(EditorManagerMixin):
                     "message": "Translation terminated.",
                 }
             )
-        elif return_code == 0 and self.status_pause_after_ocr(status) and not self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.status_pause_after_ocr(status) and not self.final_page_files(code, job_id):
             self.initialize_editor_v2(code, job_id)
             status.update(
                 {
@@ -3559,7 +4436,7 @@ class JobManager(EditorManagerMixin):
                     "lastResumePage": 0,
                 }
             )
-        elif return_code == 0 and self.translated_cbz_path(code, job_id).is_file():
+        elif return_code == 0 and self.final_page_files(code, job_id):
             had_editor = self.has_editor_v2(code, job_id)
             self.initialize_editor_v2(code, job_id)
             if had_editor and status.get("lastResumeFrom") == "ocr_structured":
@@ -3580,6 +4457,8 @@ class JobManager(EditorManagerMixin):
                     "message": "Translation complete.",
                 }
             )
+            if status.get("titleTranslationWarning"):
+                status["message"] += f" Warning: {status['titleTranslationWarning']}"
         else:
             status.update(
                 {
@@ -3654,6 +4533,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             manager.stop()
 
     app = FastAPI(lifespan=lifespan)
+    app.add_middleware(UploadSizeLimitMiddleware)
 
     @app.middleware("http")
     async def require_admin_session(request: Request, call_next: Any) -> Any:
@@ -3772,6 +4652,22 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         manager = require_admin(request)
         return category_delete_page(category, manager.category_job_counts(category))
 
+    @app.get("/admin/categories/{category}/rename", response_class=HTMLResponse)
+    async def confirm_rename_category(request: Request, category: str) -> HTMLResponse:
+        manager = require_admin(request)
+        manager.validate_category(category)
+        return category_rename_page(category)
+
+    @app.post("/admin/categories/{category}/rename")
+    async def rename_category(
+        request: Request,
+        category: str,
+        new_category: str = Form(...),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        renamed_category = manager.rename_category(category, new_category)
+        return RedirectResponse(f"/category/{renamed_category}", status_code=303)
+
     @app.post("/admin/categories/{category}/delete")
     async def delete_category(
         request: Request,
@@ -3812,6 +4708,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         translation_notes: str = Form(""),
         thinking_budget_tokens: str = Form(""),
         vlm_base_url: str = Form(""),
+        vlm_model: str = Form(""),
+        auto_translate_comicinfo_title: str | None = Form(None),
         pause_after_ocr: str | None = Form(None),
         enable_alt_placement: str | None = Form(None),
         enable_proofreading: str | None = Form(None),
@@ -3856,62 +4754,82 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         if has_cbz == has_images:
             raise HTTPException(
                 status_code=400,
-                detail="Upload either one CBZ file or one or more page image files.",
+                detail="Upload one CBZ or ZIP archive, or upload one or more page images.",
             )
 
         job_id = manager.create_job_id(code)
-        manager.job_dir(code, job_id).mkdir(parents=True, exist_ok=True)
+        job_path = manager.job_dir(code, job_id)
         input_path = manager.input_path(code, job_id)
         original_filename = cbz_filename
         try:
-            if has_cbz:
-                if not cbz_filename.lower().endswith(".cbz"):
-                    raise HTTPException(status_code=400, detail="Upload must be a .cbz file.")
-                if cbz is None:
-                    raise HTTPException(status_code=400, detail="Upload must include a CBZ file.")
-                await write_uploaded_file_to_path(
-                    cbz,
-                    input_path,
-                    manager.config.max_upload_bytes,
-                    "Uploaded CBZ",
-                )
-            else:
-                _, original_filename = await write_uploaded_images_as_cbz(
-                    image_uploads,
-                    input_path,
-                    manager.config.max_upload_bytes,
-                )
-        except HTTPException:
-            input_path.unlink(missing_ok=True)
-            shutil.rmtree(manager.job_dir(code, job_id), ignore_errors=True)
-            raise
-        finally:
-            if cbz is not None:
-                await cbz.close()
-            for upload in page_images or []:
-                await upload.close()
+            job_path.mkdir(parents=True, exist_ok=True)
+            try:
+                if has_cbz:
+                    if Path(cbz_filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Comic archive must use the .cbz or .zip extension.",
+                        )
+                    if cbz is None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Upload must include a CBZ or ZIP archive.",
+                        )
+                    await write_uploaded_file_to_path(
+                        cbz,
+                        input_path,
+                        manager.config.max_upload_bytes,
+                        "Uploaded archive",
+                    )
+                    await run_in_threadpool(
+                        validate_uploaded_comic_archive,
+                        input_path,
+                        cbz_filename,
+                    )
+                else:
+                    _, original_filename = await write_uploaded_images_as_cbz(
+                        image_uploads,
+                        input_path,
+                        manager.config.max_upload_bytes,
+                    )
+            finally:
+                if cbz is not None:
+                    await cbz.close()
+                for upload in page_images or []:
+                    await upload.close()
 
-        manager.submit_job(
-            code,
-            job_id,
-            original_filename,
-            translation_notes,
-            thinking_budget,
-            parsed_vlm_base_url,
-            parse_checkbox(pause_after_ocr),
-            parse_checkbox(enable_proofreading),
-            parse_checkbox(enable_translation_notes),
-            parse_checkbox(enable_alt_placement),
-            parsed_source_language,
-            parsed_ocr_engine,
-            parsed_paddleocr_vl_server_url,
-            parsed_paddleocr_vl_model,
-            parse_page_workers_form(ocr_page_workers, "OCR workers"),
-            parse_page_workers_form(lama_workers, "LaMa workers"),
-            parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
-            parse_auth_token_form(vlm_auth_token),
-            parse_auth_token_form(paddleocr_vl_auth_token),
-        )
+            manager.submit_job(
+                code,
+                job_id,
+                original_filename,
+                translation_notes,
+                thinking_budget,
+                parsed_vlm_base_url,
+                parse_vlm_model_form(vlm_model),
+                parse_checkbox(pause_after_ocr),
+                parse_checkbox(enable_proofreading),
+                parse_checkbox(enable_translation_notes),
+                parse_checkbox(enable_alt_placement),
+                parsed_source_language,
+                parsed_ocr_engine,
+                parsed_paddleocr_vl_server_url,
+                parsed_paddleocr_vl_model,
+                parse_page_workers_form(ocr_page_workers, "OCR workers"),
+                parse_page_workers_form(lama_workers, "LaMa workers"),
+                parse_page_workers_form(imagemagick_workers, "ImageMagick workers"),
+                parse_auth_token_form(vlm_auth_token),
+                parse_auth_token_form(paddleocr_vl_auth_token),
+                auto_translate_comicinfo_title=parse_checkbox(auto_translate_comicinfo_title),
+            )
+        except Exception:
+            try:
+                shutil.rmtree(job_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                LOGGER.exception("Could not clean up failed upload job %s", job_path)
+            raise
+
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
@@ -3997,6 +4915,84 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def job_status(request: Request, code: str, job_id: str) -> JSONResponse:
         manager = manager_from_request(request)
         return JSONResponse(manager.public_status(code, job_id))
+
+    @app.post("/api/vlm/test")
+    async def test_vlm_connection(request: Request) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+        endpoint_value = data.get("vlmBaseUrl")
+        if not isinstance(endpoint_value, str):
+            raise HTTPException(status_code=400, detail="vlmBaseUrl must be a string.")
+        try:
+            endpoint = validate_vlm_base_url(endpoint_value, "")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        token_value = data.get("vlmAuthToken", "")
+        if not isinstance(token_value, str):
+            raise HTTPException(status_code=400, detail="vlmAuthToken must be a string.")
+        supplied_token = parse_auth_token_form(token_value)
+
+        category_value = data.get("category")
+        job_id_value = data.get("jobId")
+        if category_value is None and job_id_value is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="jobId requires category.",
+            )
+        saved_token: str | None = None
+        if category_value is not None:
+            if not isinstance(category_value, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail="category must be a string.",
+                )
+            category = manager.validate_category(category_value)
+            if job_id_value is not None:
+                if not isinstance(job_id_value, str):
+                    raise HTTPException(status_code=400, detail="jobId must be a string.")
+                job_id = manager.validate_job_id(job_id_value)
+                if manager.load_status(category, job_id) is None:
+                    raise HTTPException(status_code=404, detail="Unknown job.")
+                if supplied_token is None:
+                    saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
+
+        if supplied_token is not None and category_value is not None and job_id_value is not None:
+            manager.update_job_auth_tokens(
+                category,
+                job_id,
+                vlm_auth_token=supplied_token,
+                paddleocr_vl_auth_token=None,
+            )
+
+        try:
+            models = await run_in_threadpool(
+                manager.probe_vlm_models,
+                endpoint,
+                supplied_token or saved_token,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=vlm_probe_failure_detail(
+                    endpoint,
+                    exc,
+                    supplied_token or saved_token,
+                ),
+            ) from None
+        return JSONResponse(
+            {
+                "ok": True,
+                "models": models,
+                "message": f"Connected. Found {len(models)} model(s).",
+            }
+        )
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
     async def editor_v2_data(
@@ -4212,6 +5208,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         job_id: str,
         thinking_budget_tokens: str = Form(""),
         vlm_base_url: str = Form(""),
+        vlm_model: str = Form(""),
+        auto_translate_comicinfo_title: str | None = Form(None),
         pause_after_ocr: str | None = Form(None),
         enable_alt_placement: str | None = Form(None),
         enable_proofreading: str | None = Form(None),
@@ -4237,6 +5235,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 manager.config.default_thinking_budget_tokens,
             ),
             parse_vlm_base_url_form(vlm_base_url, manager.config),
+            parse_vlm_model_form(vlm_model),
             parse_checkbox(pause_after_ocr),
             parse_checkbox(enable_proofreading),
             parse_checkbox(enable_translation_notes),
@@ -4261,6 +5260,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             parse_auth_token_form(paddleocr_vl_auth_token),
             parse_checkbox(clear_vlm_auth_token),
             parse_checkbox(clear_paddleocr_vl_auth_token),
+            auto_translate_comicinfo_title=parse_checkbox(auto_translate_comicinfo_title),
         )
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
@@ -4268,6 +5268,73 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def terminate_job(request: Request, code: str, job_id: str) -> RedirectResponse:
         manager = manager_from_request(request)
         manager.terminate_active_job(code, job_id)
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/rename")
+    async def rename_job(
+        request: Request,
+        code: str,
+        job_id: str,
+        name: str = Form(...),
+    ) -> RedirectResponse:
+        manager = manager_from_request(request)
+        manager.rename_job(code, job_id, parse_job_name_form(name))
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/set-translated-title")
+    async def set_translated_title(
+        request: Request,
+        code: str,
+        job_id: str,
+        translated_name: str = Form(""),
+    ) -> RedirectResponse:
+        manager = manager_from_request(request)
+        try:
+            manager.set_translated_title(code, job_id, translated_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/translate-title")
+    async def translate_title(request: Request, code: str, job_id: str) -> Any:
+        manager = manager_from_request(request)
+        try:
+            await run_in_threadpool(manager.translate_title, code, job_id)
+        except (HTTPException, ValueError) as exc:
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
+        except Exception as exc:
+            LOGGER.exception("Title translation failed for %s/%s", code, job_id)
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/retry-title-translation")
+    async def retry_title_translation(
+        request: Request,
+        code: str,
+        job_id: str,
+        manual_title: str = Form(""),
+    ) -> Any:
+        manager = manager_from_request(request)
+        try:
+            await run_in_threadpool(
+                manager.retry_title_translation,
+                code,
+                job_id,
+                manual_title,
+            )
+        except (HTTPException, ValueError) as exc:
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
+        except Exception as exc:
+            LOGGER.exception("Title translation retry failed for %s/%s", code, job_id)
+            status = manager.public_status(code, job_id)
+            status["message"] = f"Title translation failed: {exc}"
+            return job_page(code, job_id, status)
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.post("/job/{code}/{job_id}/rerun-pages")
@@ -4285,24 +5352,9 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     async def rerun_job(request: Request, code: str, job_id: str) -> RedirectResponse:
         manager = manager_from_request(request)
         form = await request.form()
-        resume_from, package_selected = parse_rerun_job_stages(
+        resume_from = parse_rerun_job_stages(
             [str(value) for value in form.getlist("rerun_stage")]
         )
-        webp_quality = parse_quality_form(
-            str(form.get("webp_quality") or ""),
-            "WebP quality",
-            manager.config.default_webp_quality,
-        )
-        jxl_quality = parse_quality_form(
-            str(form.get("jxl_quality") or ""),
-            "JXL quality",
-            manager.config.default_jxl_quality,
-        )
-        if resume_from is None:
-            if not package_selected:
-                raise HTTPException(status_code=400, detail="Select at least one pass to rerun.")
-            manager.regenerate_completed_job_downloads(code, job_id, webp_quality, jxl_quality)
-            return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
         page_spec = str(form.get("page_spec") or "")
         manager.rerun_completed_job_pages(
@@ -4310,34 +5362,39 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             job_id,
             parse_page_selection(page_spec, allow_empty=True),
             resume_from,
-            webp_quality if package_selected else None,
-            jxl_quality if package_selected else None,
         )
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
-    @app.post("/job/{code}/{job_id}/regenerate-downloads")
-    async def regenerate_downloads(
+    @app.post("/job/{code}/{job_id}/generate-download")
+    async def generate_download_with_options(
         request: Request,
         code: str,
         job_id: str,
-        webp_quality: str = Form(""),
-        jxl_quality: str = Form(""),
+        variant: str = Form(...),
+        title_mode: str = Form(CBZ_TITLE_MODE_ORIGINAL),
+        alt_title_in_notes: str | None = Form(None),
+        regenerate: str | None = Form(None),
     ) -> RedirectResponse:
         manager = manager_from_request(request)
-        manager.regenerate_completed_job_downloads(
+        manager.generate_download(
             code,
             job_id,
-            parse_quality_form(
-                webp_quality,
-                "WebP quality",
-                manager.config.default_webp_quality,
-            ),
-            parse_quality_form(
-                jxl_quality,
-                "JXL quality",
-                manager.config.default_jxl_quality,
-            ),
+            variant,
+            title_mode=title_mode,
+            alt_title_in_notes=parse_checkbox(alt_title_in_notes),
+            regenerate=parse_checkbox(regenerate),
         )
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/generate-download/{variant}")
+    async def generate_download(
+        request: Request,
+        code: str,
+        job_id: str,
+        variant: str,
+    ) -> RedirectResponse:
+        manager = manager_from_request(request)
+        manager.generate_download(code, job_id, variant)
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.post("/job/{code}/{job_id}/delete")
@@ -4358,11 +5415,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         status = manager.load_status(code, job_id)
         input_path = manager.input_path(code, job_id)
         if status is None or not input_path.is_file():
-            raise HTTPException(status_code=404, detail="Original input CBZ is not available.")
+            raise HTTPException(status_code=404, detail="Original input archive is not available.")
+        original_suffix = (
+            ".zip"
+            if str(status.get("inputFilename") or "").lower().endswith(".zip")
+            else ".cbz"
+        )
         return FileResponse(
             input_path,
-            media_type="application/vnd.comicbook+zip",
-            filename=f"{code}_{job_id}_original.cbz",
+            media_type=(
+                "application/zip"
+                if original_suffix == ".zip"
+                else "application/vnd.comicbook+zip"
+            ),
+            filename=f"{code}_{job_id}_original{original_suffix}",
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",
@@ -4389,7 +5455,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return FileResponse(
             cbz_path,
             media_type="application/vnd.comicbook+zip",
-            filename=f"{code}_{job_id}_translated_{variant}.cbz",
+            filename=manager.translated_cbz_download_name(code, job_id),
             headers={
                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
                 "Pragma": "no-cache",

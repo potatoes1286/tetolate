@@ -10,14 +10,14 @@ from fastapi.responses import HTMLResponse
 
 import paddle_ocr_image
 import translate_cbz
+from version import VERSION
 
 
-DEFAULT_WEBP_QUALITY = translate_cbz.TRANSLATED_WEBP_QUALITY
-DEFAULT_JXL_QUALITY = translate_cbz.TRANSLATED_JXL_QUALITY
 DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKENS
 DEFAULT_PROOFREAD_TRANSLATIONS = True
 DEFAULT_WRITE_TRANSLATION_NOTES = True
 DEFAULT_ALT_PLACEMENT_ENABLED = translate_cbz.DEFAULT_ALT_PLACEMENT_ENABLED
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = translate_cbz.DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE
 DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
@@ -25,8 +25,10 @@ DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
 DEFAULT_OCR_PAGE_WORKERS = translate_cbz.DEFAULT_OCR_PAGE_WORKERS
 DEFAULT_LAMA_WORKERS = translate_cbz.DEFAULT_LAMA_WORKERS
 DEFAULT_IMAGEMAGICK_WORKERS = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS
+UPLOAD_COMIC_ARCHIVE_ACCEPT = (
+    ".cbz,.zip,application/vnd.comicbook+zip,application/zip"
+)
 OCR_MERGE_EDITOR_STAGE = "ocr_merge"
-RERUN_JOB_PACKAGE_STAGE = "package"
 UPLOAD_PAGE_IMAGE_ACCEPT = (
     ".png,.jpg,.jpeg,.webp,.jxl,.bmp,.tif,.tiff,.avif,.gif,"
     "image/png,image/jpeg,image/webp,image/jxl,image/bmp,image/tiff,image/avif,image/gif"
@@ -35,10 +37,103 @@ DELETE_JOB_CONFIRM = "Delete this job and its generated files?"
 CATEGORY_DELETE_CONFIRM = (
     "Delete this category and every job, input, output, log, and download inside it?"
 )
+JOB_NAME_MAX_LENGTH = 256
+CBZ_TITLE_MODE_ORIGINAL = "original"
+CBZ_TITLE_MODE_TRANSLATED = "translated"
 TERMINATE_JOB_CONFIRM = (
     "Terminate this running job? The local VLM request stream will be closed, "
     "but external providers may handle cancellation differently."
 )
+VLM_CONNECTION_TEST_SCRIPT = """
+<script>
+let loadedVlmModels = [];
+function htmlEscape(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
+function vlmModelOptions(selected) {
+  const models = [...new Set([...loadedVlmModels, selected].filter((model) => typeof model === "string" && model))];
+  if (!models.length) return '<option value="" selected>Choose a model after testing</option>';
+  const placeholder = selected ? "" : '<option value="" selected>Choose a model</option>';
+  return placeholder + models.map((model) => `<option value="${htmlEscape(model)}"${model === selected ? " selected" : ""}>${htmlEscape(model)}</option>`).join("");
+}
+function vlmTestMessage(body, fallback) {
+  if (body && typeof body.message === "string") return body.message;
+  if (body && typeof body.detail === "string") return body.detail;
+  return fallback;
+}
+async function testVlmConnection(button) {
+  const form = button.closest("form");
+  if (!form) return;
+  const endpoint = form.elements.vlm_base_url;
+  const token = form.elements.vlm_auth_token;
+  const modelSelect = form.elements.vlm_model;
+  const status = form.querySelector("[data-vlm-test-status]");
+  if (!endpoint || !modelSelect || !status) return;
+  const payload = {vlmBaseUrl: endpoint.value};
+  if (token && token.value) payload.vlmAuthToken = token.value;
+  const category = button.dataset.vlmTestCategory || form.elements.category?.value;
+  const testJobId = button.dataset.vlmTestJobId;
+  if (category) payload.category = category;
+  if (testJobId) payload.jobId = testJobId;
+  status.textContent = "Testing connection...";
+  button.disabled = true;
+  try {
+    const response = await fetch("/api/vlm/test", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    let body = null;
+    try { body = await response.json(); } catch {}
+    if (!response.ok || !body || !body.ok) {
+      throw new Error(vlmTestMessage(body, `Connection test failed (${response.status}).`));
+    }
+    const selected = modelSelect.value;
+    loadedVlmModels = [...new Set((Array.isArray(body.models) ? body.models : [])
+      .filter((model) => typeof model === "string" && model))];
+    modelSelect.replaceChildren();
+    if (!selected) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Choose a model";
+      option.selected = true;
+      modelSelect.append(option);
+    }
+    for (const model of [...new Set([...loadedVlmModels, selected].filter(Boolean))]) {
+      const option = document.createElement("option");
+      option.value = model;
+      option.textContent = model;
+      option.selected = model === selected;
+      modelSelect.append(option);
+    }
+    if (!modelSelect.options.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Choose a model after testing";
+      option.selected = true;
+      modelSelect.append(option);
+    }
+    status.textContent = `Connected. Found ${loadedVlmModels.length} model(s).`;
+  } catch (error) {
+    status.textContent = error instanceof Error ? error.message : String(error);
+  } finally {
+    button.disabled = false;
+  }
+}
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".vlm-test-button");
+  if (!button) return;
+  event.preventDefault();
+  void testVlmConnection(button);
+});
+</script>
+"""
 
 
 def escape(value: Any) -> str:
@@ -72,10 +167,13 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
     input[type="text"], input[type="url"], input[type="password"] {{ width: min(32rem, 100%); box-sizing: border-box; }}
     textarea {{ width: min(40rem, 100%); }}
     button {{ cursor: pointer; }}
+    .title-setting-row {{ display: flex; align-items: flex-end; gap: 0.5rem; flex-wrap: wrap; }}
+    .title-setting-row label {{ flex: 0 1 32rem; min-width: 0; margin-bottom: 0; }}
     details > fieldset {{ margin: 1rem 0; padding: 1rem; }}
     details > fieldset > legend {{ font-weight: 700; }}
     .row {{ margin: 1rem 0; }}
     .muted {{ color: #555; }}
+    [data-vlm-test-status] {{ white-space: pre-line; }}
     .status {{ font-weight: 700; }}
     table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
     th, td {{ border-bottom: 1px solid #ddd; padding: 0.45rem; text-align: left; vertical-align: top; }}
@@ -86,6 +184,7 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
 </head>
 <body{body_class}>
 {body}
+<footer class="muted">tetolate {escape(VERSION)}</footer>
 </body>
 </html>"""
     )
@@ -132,7 +231,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         page = "" if item.get("page") is None else str(item.get("page"))
         active_rows.append(
             "<tr>"
-            f'<td><a href="{escape(item.get("url"))}">{escape(item.get("inputFilename") or item.get("jobId"))}</a></td>'
+            f'<td><a href="{escape(item.get("url"))}">{escape(item.get("jobName") or item.get("inputFilename") or item.get("jobId"))}</a></td>'
             f'<td>{escape(item.get("category"))}</td>'
             f'<td>{escape(item.get("status"))}</td>'
             f'<td>{escape(item.get("phase"))}</td>'
@@ -161,7 +260,8 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
             "<tr>"
             f'<td><a href="{escape(url)}">{escape(category)}</a></td>'
             f'<td>{escape(item.get("jobCount", 0))}</td>'
-            f'<td><a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
+            f'<td><a class="button" href="/admin/categories/{escape(category)}/rename">Rename...</a> '
+            f'<a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
             "</tr>"
         )
     categories_html = (
@@ -179,9 +279,9 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         else '<p class="muted">No job categories. Create one to submit a job.</p>'
     )
     return base_page(
-        "Admin",
+        "tetolate",
         f"""
-<h1>Admin</h1>
+<h1>tetolate</h1>
 {message_html}
 <dl>
   <dt>Worker State</dt><dd class="status">{escape(state)}</dd>
@@ -240,6 +340,23 @@ def category_delete_page(category: str, counts: dict[str, int], message: str = "
     )
 
 
+def category_rename_page(category: str, message: str = "") -> HTMLResponse:
+    message_html = f'<p class="status">{escape(message)}</p>' if message else ""
+    return base_page(
+        f"Rename {category}",
+        f"""
+<h1>Rename Category: {escape(category)}</h1>
+{message_html}
+<p>Renaming keeps all jobs and files in this category.</p>
+<form action="/admin/categories/{escape(category)}/rename" method="post">
+  <label>New category name<br><input name="new_category" type="text" required pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" value="{escape(category)}" autocomplete="off"></label>
+  <button type="submit">Rename category</button>
+</form>
+<p><a href="/admin">Cancel</a></p>
+""",
+    )
+
+
 def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
     downloads = status.get("downloads")
     if not isinstance(downloads, dict):
@@ -248,6 +365,11 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         "png": "Download PNG CBZ",
         "webp": "Download WebP CBZ",
         "jxl": "Download JXL CBZ",
+    }
+    generate_labels = {
+        "png": "Generate PNG CBZ",
+        "webp": "Generate WebP CBZ",
+        "jxl": "Generate JXL CBZ",
     }
     summary_parts: list[str] = []
     input_size = str(status.get("inputSize") or "")
@@ -272,8 +394,13 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         if token:
             href += f"?v={escape(token)}"
         suffix = f" ({input_size})" if input_size else ""
+        archive_type = (
+            "ZIP"
+            if str(status.get("inputFilename") or "").lower().endswith(".zip")
+            else "CBZ"
+        )
         original_links.append(
-            f'<a class="button" href="{escape(href)}">Download original CBZ{escape(suffix)}</a>'
+            f'<a class="button" href="{escape(href)}">Download original {archive_type}{escape(suffix)}</a>'
         )
     for variant, label in labels.items():
         item = downloads.get(variant)
@@ -285,15 +412,20 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
             available = bool(item)
             size = ""
             token = ""
-        if not available:
-            continue
-        summary_label = label.removeprefix("Download ")
-        summary_parts.append(f"{summary_label}: {size}" if size else summary_label)
-        href = f"/job/{escape(code)}/{escape(job_id)}/download/{escape(variant)}"
-        if token:
-            href += f"?v={escape(token)}"
-        suffix = f" ({size})" if size else ""
-        links.append(f'<a class="button" href="{href}">{escape(label + suffix)}</a>')
+        if available:
+            summary_label = label.removeprefix("Download ")
+            summary_parts.append(f"{summary_label}: {size}" if size else summary_label)
+            href = f"/job/{escape(code)}/{escape(job_id)}/download/{escape(variant)}"
+            if token:
+                href += f"?v={escape(token)}"
+            suffix = f" ({size})" if size else ""
+            links.append(f'<a class="button" href="{href}">{escape(label + suffix)}</a>')
+        elif status.get("status") == "complete":
+            action = f"/job/{escape(code)}/{escape(job_id)}/generate-download/{escape(variant)}"
+            links.append(
+                f'<form action="{action}" method="post">'
+                f'<button type="submit">{escape(generate_labels[variant])}</button></form>'
+            )
     if status.get("canView"):
         view_url = str(status.get("viewUrl") or f"/job/{code}/{job_id}/view")
         page_count = status.get("finalPageCount")
@@ -309,8 +441,38 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         else ""
     )
     if not links:
-        return summary_html
-    return summary_html + "<p>" + " ".join(links) + "</p>"
+        links_html = ""
+    else:
+        links_html = "<p>" + " ".join(links) + "</p>"
+    if status.get("status") != "complete":
+        return summary_html + links_html
+    mode = str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL)
+    if mode not in {CBZ_TITLE_MODE_ORIGINAL, CBZ_TITLE_MODE_TRANSLATED}:
+        mode = CBZ_TITLE_MODE_ORIGINAL
+    selected = " checked" if status.get("cbzAltTitleInNotes") else ""
+    export_buttons: list[str] = []
+    for variant, label in generate_labels.items():
+        item = downloads.get(variant)
+        available = bool(item.get("available")) if isinstance(item, dict) else bool(item)
+        action = f"Regenerate {label.removeprefix('Generate ')}" if available else label
+        regenerate_attribute = ' name="regenerate" value="1"' if available else ""
+        export_buttons.append(
+            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}>{escape(action)}</button>'
+        )
+    export_html = f"""
+<details>
+  <summary>CBZ export</summary>
+  <form action="/job/{escape(code)}/{escape(job_id)}/generate-download" method="post">
+    <label>Title in ComicInfo<br><select name="title_mode">
+      <option value="original"{" selected" if mode == CBZ_TITLE_MODE_ORIGINAL else ""}>Original title</option>
+      <option value="translated"{" selected" if mode == CBZ_TITLE_MODE_TRANSLATED else ""}>Translated title</option>
+    </select></label>
+    <label><input name="alt_title_in_notes" type="checkbox" value="1"{selected}> Add the alternate title to ComicInfo notes</label>
+    <p>{" ".join(export_buttons)}</p>
+  </form>
+</details>
+"""
+    return summary_html + links_html + export_html
 
 
 def input_display_html(status: dict[str, Any]) -> str:
@@ -409,6 +571,14 @@ def source_language_options(selected: str) -> str:
     return "\n".join(options)
 
 
+def vlm_model_options(selected: str) -> str:
+    """Return the current VLM model as the initial selectable option."""
+    if selected:
+        escaped = escape(selected)
+        return f'<option value="{escaped}" selected>{escaped}</option>'
+    return '<option value="" selected>Choose a model after testing</option>'
+
+
 def advanced_options_fields(
     thinking_budget_tokens: Any,
     vlm_base_url: str,
@@ -429,6 +599,11 @@ def advanced_options_fields(
     imagemagick_workers: int = DEFAULT_IMAGEMAGICK_WORKERS,
     has_vlm_auth_token: bool = False,
     has_paddleocr_vl_auth_token: bool = False,
+    vlm_model: str = "",
+    auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+    test_category: str = "",
+    test_job_id: str = "",
+    submit_label: str = "",
 ) -> str:
     try:
         budget = _thinking_budget(thinking_budget_tokens)
@@ -445,6 +620,7 @@ def advanced_options_fields(
     proofread_checked = " checked" if proofread_translations else ""
     write_notes_checked = " checked" if write_translation_notes else ""
     alt_placement_checked = " checked" if alt_placement_enabled else ""
+    auto_title_checked = " checked" if auto_translate_comicinfo_title else ""
     translation_notes_html = (
         '<label>Translation notes<br><textarea name="translation_notes" rows="4" '
         f'placeholder="Names, terms, tone, style guidance">{escape(translation_notes)}</textarea></label>'
@@ -471,6 +647,11 @@ def advanced_options_fields(
         if has_paddleocr_vl_auth_token
         else ""
     )
+    submit_button_html = (
+        f'<button type="submit">{escape(submit_label)}</button>'
+        if submit_label
+        else ""
+    )
     return f"""
 <details{open_attr}>
   <summary>{escape(summary)}</summary>
@@ -480,6 +661,7 @@ def advanced_options_fields(
     <label><input name="enable_alt_placement" type="checkbox" value="1"{alt_placement_checked}> Enable alt-placement</label>
     <label><input name="enable_proofreading" type="checkbox" value="1"{proofread_checked}> Enable proofreading</label>
     <label><input name="enable_translation_notes" type="checkbox" value="1"{write_notes_checked}> Enable translation notes</label>
+    <label><input name="auto_translate_comicinfo_title" type="checkbox" value="1"{auto_title_checked}> Automatically translate ComicInfo titles when available</label>
   </fieldset>
   <fieldset>
     <legend>OCR</legend>
@@ -511,9 +693,15 @@ def advanced_options_fields(
     <label>Auth token<br><input name="vlm_auth_token" type="password" value="" autocomplete="new-password"></label>
     <p class="muted">{escape(vlm_token_hint)}</p>
     {clear_vlm_html}
+    <label>Model<br><select name="vlm_model" required>
+      {vlm_model_options(vlm_model)}
+    </select></label>
+    <button class="vlm-test-button" type="button" data-vlm-test-category="{escape(test_category)}" data-vlm-test-job-id="{escape(test_job_id)}">Test connection and load models</button>
+    <p class="muted" data-vlm-test-status aria-live="polite"></p>
     <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="{escape(budget)}"></label>
     <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
-  </fieldset>
+</fieldset>
+  {submit_button_html}
 </details>
 """
 
@@ -526,6 +714,10 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         DEFAULT_THINKING_BUDGET_TOKENS,
     )
     default_vlm_base_url = str(data.get("defaultVlmBaseUrl") or "")
+    default_vlm_model = str(data.get("defaultVlmModel") or "")
+    auto_translate_comicinfo_title = bool(
+        data.get("autoTranslateComicInfoTitle", DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE)
+    )
     pause_after_ocr = bool(data.get("pauseAfterOcr", False))
     proofread_translations = bool(
         data.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -550,7 +742,13 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
     rows: list[str] = []
     for job in jobs:
         job_id = str(job.get("jobId", ""))
-        filename = str(job.get("inputFilename") or job_id)
+        job_name = str(job.get("jobName") or job.get("inputFilename") or job_id)
+        translated_job_name = str(job.get("translatedJobName") or "")
+        title_html = (
+            f'<br><span class="muted">{escape(translated_job_name)}</span>'
+            if translated_job_name
+            else ""
+        )
         page = "" if job.get("page") is None else str(job.get("page"))
         view_html = (
             f'<a class="button" href="/job/{escape(code)}/{escape(job_id)}/view">View</a>'
@@ -567,7 +765,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         actions_html = " ".join(item for item in (view_html, delete_html) if item)
         rows.append(
             "<tr>"
-            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(filename)}</a><br>'
+            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(job_name)}</a>{title_html}<br>'
             f'<span class="muted">{escape(job_id)}</span></td>'
             f'<td>{escape(job.get("status"))}</td>'
             f'<td>{escape(job.get("phase"))}</td>'
@@ -598,9 +796,9 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
 <p><a href="/admin">Admin</a></p>
 <form action="/upload" method="post" enctype="multipart/form-data">
   <input name="category" type="hidden" value="{escape(code)}">
-  <label>CBZ file<br><input name="cbz" type="file" accept=".cbz,application/zip"></label>
+  <label>CBZ or ZIP archive<br><input name="cbz" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}"></label>
   <label>Page image files<br><input name="page_images" type="file" accept="{UPLOAD_PAGE_IMAGE_ACCEPT}" multiple></label>
-  <p class="muted">Upload either one CBZ or multiple image pages. Images use the picker/upload order and are converted to PNG internally.</p>
+  <p class="muted">Upload one CBZ or ZIP archive, or upload multiple image pages. A ZIP archive must contain image pages and can contain metadata. Separate images use the picker order and are converted to PNG.</p>
   {advanced_options_fields(
       default_thinking_budget_tokens,
       default_vlm_base_url,
@@ -617,9 +815,13 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
       ocr_page_workers=default_ocr_page_workers,
       lama_workers=default_lama_workers,
       imagemagick_workers=default_imagemagick_workers,
+      vlm_model=default_vlm_model,
+      auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+      test_category=code,
   )}
   <button type="submit">Queue new job</button>
 </form>
+{VLM_CONNECTION_TEST_SCRIPT}
 <h2>Jobs</h2>
 {jobs_html}
 """,
@@ -640,8 +842,41 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     else:
         restart_target_text = f"from {restart_from} page {restart_page}"
     download_html = download_links_html(code, job_id, status)
-    webp_quality = status.get("webpQuality") or status.get("defaultWebpQuality") or DEFAULT_WEBP_QUALITY
-    jxl_quality = status.get("jxlQuality") or status.get("defaultJxlQuality") or DEFAULT_JXL_QUALITY
+    job_name = str(status.get("jobName") or status.get("inputFilename") or job_id)
+    translated_job_name = str(status.get("translatedJobName") or "")
+    translated_title_html = (
+        f'<h2 id="translated-title" class="translated-title">{escape(translated_job_name)}</h2>'
+        if translated_job_name
+        else '<h2 id="translated-title" class="translated-title" hidden></h2>'
+    )
+    title_warning = str(status.get("titleTranslationWarning") or "")
+    title_warning_html = (
+        f'<p class="warning"><strong>Title warning:</strong> {escape(title_warning)}</p>'
+        if title_warning
+        else ""
+    )
+    title_settings_html = (
+        f"""
+<details>
+  <summary>Title settings</summary>
+  <form action="/job/{escape(code)}/{escape(job_id)}/rename" method="post">
+    <div class="title-setting-row">
+      <label>Original name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(job_name)}"></label>
+      <button type="submit">Set</button>
+    </div>
+  </form>
+  <form action="/job/{escape(code)}/{escape(job_id)}/set-translated-title" method="post">
+    <div class="title-setting-row">
+      <label>Translated name<br><input name="translated_name" type="text" maxlength="{JOB_NAME_MAX_LENGTH}" value="{escape(translated_job_name)}"></label>
+      <button type="submit">Set</button>
+      <button formaction="/job/{escape(code)}/{escape(job_id)}/translate-title" type="submit">Translate with VLM</button>
+    </div>
+  </form>
+</details>
+"""
+        if status.get("canRenameJob")
+        else ""
+    )
     thinking_budget = status.get("thinkingBudgetTokens")
     if thinking_budget is None:
         thinking_budget = status.get(
@@ -652,6 +887,10 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
         status.get("vlmBaseUrl")
         or status.get("defaultVlmBaseUrl")
         or ""
+    )
+    vlm_model = str(status.get("vlmModel") or status.get("defaultVlmModel") or "")
+    auto_translate_comicinfo_title = bool(
+        status.get("autoTranslateComicInfoTitle", DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE)
     )
     pause_after_ocr = bool(status.get("pauseAfterOcr"))
     proofread_translations = bool(
@@ -688,7 +927,6 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
   {advanced_options_fields(
       thinking_budget,
       vlm_base_url,
-      open_details=True,
       pause_after_ocr=pause_after_ocr,
       proofread_translations=proofread_translations,
       write_translation_notes=write_translation_notes,
@@ -702,8 +940,12 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       imagemagick_workers=imagemagick_workers,
       has_vlm_auth_token=bool(status.get("hasVlmAuthToken")),
       has_paddleocr_vl_auth_token=bool(status.get("hasPaddleocrVlAuthToken")),
+      vlm_model=vlm_model,
+      auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+      test_category=code,
+      test_job_id=job_id,
+      submit_label="Save advanced options",
   )}
-  <button type="submit">Save advanced options</button>
 </form>
 """
         if status.get("canUpdateAdvancedOptions")
@@ -750,17 +992,14 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       <label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label>
       <label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label>
       <label><input name="rerun_stage" type="checkbox" value="render"> Render</label>
-      <label><input name="rerun_stage" type="checkbox" value="{RERUN_JOB_PACKAGE_STAGE}"> Package</label>
     </fieldset>
     <label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label>
-    <p class="muted">Leave pages empty to rerun every page. Package alone rebuilds download archives.</p>
-    <label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="{escape(webp_quality)}"></label>
-    <label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="{escape(jxl_quality)}"></label>
+    <p class="muted">Leave pages empty to rerun every page.</p>
     <button type="submit">Queue rerun</button>
   </form>
 </details>
 """
-        if status.get("canRerunPages") or status.get("canRegenerateDownloads")
+        if status.get("canRerunPages")
         else ""
     )
     edit_html = (
@@ -772,8 +1011,12 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     return base_page(
         f"Job {code} {job_id}",
         f"""
-<h1>Job {escape(job_id)}</h1>
+<h1>{escape(job_name)}</h1>
+{translated_title_html}
+{title_warning_html}
+<p class="muted">Job ID: {escape(job_id)}</p>
 <p><a href="/category/{escape(code)}">Back to category {escape(code)}</a></p>
+<div id="title-settings">{title_settings_html}</div>
 <dl>
   <dt>Category</dt><dd>{escape(code)}</dd>
   <dt>Input</dt><dd>{input_display_html(status)}</dd>
@@ -795,11 +1038,19 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 <div id="delete">{delete_html}</div>
 <h2>Recent Log</h2>
 <pre id="log" class="job-log">{escape(log_text)}</pre>
+{VLM_CONNECTION_TEST_SCRIPT}
 <script>
 const code = {json.dumps(code)};
 const jobId = {json.dumps(job_id)};
 const deleteJobConfirm = {json.dumps(DELETE_JOB_CONFIRM)};
 const terminateJobConfirm = {json.dumps(TERMINATE_JOB_CONFIRM)};
+function titleSettingsMarkup(data) {{
+  if (!data.canRenameJob) return "";
+  const originalName = htmlEscape(data.jobName || data.inputFilename || jobId);
+  const translatedName = htmlEscape(data.translatedJobName || "");
+  const baseUrl = `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}`;
+  return `<details><summary>Title settings</summary><form action="${{baseUrl}}/rename" method="post"><div class="title-setting-row"><label>Original name<br><input name="name" type="text" required maxlength="{JOB_NAME_MAX_LENGTH}" value="${{originalName}}"></label><button type="submit">Set</button></div></form><form action="${{baseUrl}}/set-translated-title" method="post"><div class="title-setting-row"><label>Translated name<br><input name="translated_name" type="text" maxlength="{JOB_NAME_MAX_LENGTH}" value="${{translatedName}}"></label><button type="submit">Set</button><button formaction="${{baseUrl}}/translate-title" type="submit">Translate with VLM</button></div></form></details>`;
+}}
 function htmlEscape(value) {{
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({{
     "&": "&amp;",
@@ -823,18 +1074,21 @@ function restartMarkup(data) {{
 }}
 function downloadMarkup(data) {{
   const labels = {{png: "Download PNG CBZ", webp: "Download WebP CBZ", jxl: "Download JXL CBZ"}};
+  const generateLabels = {{png: "Generate PNG CBZ", webp: "Generate WebP CBZ", jxl: "Generate JXL CBZ"}};
   const downloads = data.downloads || {{}};
   const summary = [];
   if (data.inputSize) {{
     summary.push(`Original: ${{data.inputSize}}`);
   }}
   const links = Object.keys(labels)
-    .filter((variant) => {{
-      const item = downloads[variant];
-      return item && (typeof item !== "object" || item.available);
-    }})
+    .filter((variant) => data.status === "complete")
     .map((variant) => {{
       const item = downloads[variant];
+      const available = item && (typeof item !== "object" || item.available);
+      if (!available) {{
+        const action = `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download/${{variant}}`;
+        return `<form action="${{action}}" method="post"><button type="submit">${{generateLabels[variant]}}</button></form>`;
+      }}
       const size = item && typeof item === "object" && item.size ? ` (${{item.size}})` : "";
       const summaryLabel = labels[variant].replace("Download ", "");
       summary.push(size ? `${{summaryLabel}}: ${{item.size}}` : summaryLabel);
@@ -851,7 +1105,8 @@ function downloadMarkup(data) {{
     const inputSize = data.inputSize ? ` (${{data.inputSize}})` : "";
     const token = data.inputDownloadToken ? `?v=${{encodeURIComponent(data.inputDownloadToken)}}` : "";
     const url = data.originalDownloadUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/download-original`;
-    links.unshift(`<a class="button" href="${{url}}${{token}}">Download original CBZ${{inputSize}}</a>`);
+    const archiveType = String(data.inputFilename || "").toLowerCase().endsWith(".zip") ? "ZIP" : "CBZ";
+    links.unshift(`<a class="button" href="${{url}}${{token}}">Download original ${{archiveType}}${{inputSize}}</a>`);
   }}
   if (data.canViewOriginal) {{
     const viewUrl = data.originalViewUrl || `/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/view-original`;
@@ -860,7 +1115,20 @@ function downloadMarkup(data) {{
   }}
   const summaryHtml = summary.length ? `<p class="muted">${{summary.join("; ")}}</p>` : "";
   const linksHtml = links.length ? `<p>${{links.join(" ")}}</p>` : "";
-  return summaryHtml + linksHtml;
+  if (data.status !== "complete") return summaryHtml + linksHtml;
+  const mode = ["original", "translated"].includes(data.cbzTitleMode) ? data.cbzTitleMode : "original";
+  const modeOptions = `<option value="original"${{mode === "original" ? " selected" : ""}}>Original title</option><option value="translated"${{mode === "translated" ? " selected" : ""}}>Translated title</option>`;
+  const altChecked = data.cbzAltTitleInNotes ? " checked" : "";
+  const regenerateLabels = {{png: "Regenerate PNG CBZ", webp: "Regenerate WebP CBZ", jxl: "Regenerate JXL CBZ"}};
+  const exportButtons = Object.keys(generateLabels).map((variant) => {{
+    const item = downloads[variant];
+    const available = item && (typeof item !== "object" || item.available);
+    const label = available ? regenerateLabels[variant] : generateLabels[variant];
+    const regenerateAttribute = available ? ' name="regenerate" value="1"' : "";
+    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}>${{label}}</button>`;
+  }}).join(" ");
+  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p></form></details>`;
+  return summaryHtml + linksHtml + exportHtml;
 }}
 function deleteMarkup(data) {{
   if (!data.canDelete) return "";
@@ -874,9 +1142,11 @@ function advancedOptionsMarkup(data) {{
   if (!data.canUpdateAdvancedOptions) return "";
   const thinkingBudget = data.thinkingBudgetTokens ?? data.defaultThinkingBudgetTokens ?? 2048;
   const vlmBaseUrl = htmlEscape(data.vlmBaseUrl || data.defaultVlmBaseUrl || "");
+  const vlmModel = data.vlmModel || data.defaultVlmModel || "";
   const pauseChecked = data.pauseAfterOcr ? " checked" : "";
   const proofreadChecked = data.proofreadTranslations ? " checked" : "";
   const notesChecked = data.writeTranslationNotes ? " checked" : "";
+  const autoTitleChecked = (data.autoTranslateComicInfoTitle ?? true) ? " checked" : "";
   const altPlacementChecked = (data.altPlacementEnabled ?? data.defaultAltPlacementEnabled ?? true) ? " checked" : "";
   const sourceLanguage = data.sourceLanguage || data.defaultSourceLanguage || "jp";
   const jpSelected = sourceLanguage === "jp" ? " selected" : "";
@@ -903,11 +1173,12 @@ function advancedOptionsMarkup(data) {{
     ? `<label><input name="clear_vlm_auth_token" type="checkbox" value="1"> Remove saved translation VLM token</label>`
     : "";
   return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post">
-    <details open><summary>Advanced options</summary>
+    <details><summary>Advanced options</summary>
       <fieldset><legend>Workflow</legend>
         <label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label>
         <label><input name="enable_proofreading" type="checkbox" value="1"${{proofreadChecked}}> Enable proofreading</label>
         <label><input name="enable_translation_notes" type="checkbox" value="1"${{notesChecked}}> Enable translation notes</label>
+        <label><input name="auto_translate_comicinfo_title" type="checkbox" value="1"${{autoTitleChecked}}> Automatically translate ComicInfo titles when available</label>
       </fieldset>
       <fieldset><legend>OCR</legend>
         <label>Source language<br><select name="source_language"><option value="jp"${{jpSelected}}>Japanese</option><option value="kr"${{krSelected}}>Korean</option><option value="cn"${{cnSelected}}>Chinese</option></select></label>
@@ -929,16 +1200,18 @@ function advancedOptionsMarkup(data) {{
         <label>Endpoint<br><input name="vlm_base_url" type="url" value="${{vlmBaseUrl}}" required></label>
         <label>Auth token<br><input name="vlm_auth_token" type="password" value="" autocomplete="new-password"></label>
         <p class="muted">${{vlmTokenHint}}</p>${{clearVlm}}
+        <label>Model<br><select name="vlm_model" required>${{vlmModelOptions(vlmModel)}}</select></label>
+        <button class="vlm-test-button" type="button" data-vlm-test-category="${{htmlEscape(code)}}" data-vlm-test-job-id="${{htmlEscape(jobId)}}">Test connection and load models</button>
+        <p class="muted" data-vlm-test-status aria-live="polite"></p>
         <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label>
         <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
       </fieldset>
-    </details><button type="submit">Save advanced options</button></form>`;
+      <button type="submit">Save advanced options</button>
+    </details></form>`;
 }}
 function rerunJobMarkup(data) {{
-  if (!data.canRerunPages && !data.canRegenerateDownloads) return "";
-  const webpQuality = data.webpQuality ?? data.defaultWebpQuality ?? 90;
-  const jxlQuality = data.jxlQuality ?? data.defaultJxlQuality ?? 90;
-  return `<details><summary>Rerun job</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/rerun-job" method="post"><fieldset><legend>Passes</legend><label><input name="rerun_stage" type="checkbox" value="ocr_merge"> OCR &amp; Merge</label><label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structure</label><label><input name="rerun_stage" type="checkbox" value="alt_placement"> Erase &amp; Alternate Placement</label><label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label><label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label><label><input name="rerun_stage" type="checkbox" value="render"> Render</label><label><input name="rerun_stage" type="checkbox" value="package"> Package</label></fieldset><label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label><p class="muted">Leave pages empty to rerun every page. Package alone rebuilds download archives.</p><label>WebP quality<br><input name="webp_quality" type="number" min="1" max="100" value="${{webpQuality}}"></label><label>JXL quality<br><input name="jxl_quality" type="number" min="1" max="100" value="${{jxlQuality}}"></label><button type="submit">Queue rerun</button></form></details>`;
+  if (!data.canRerunPages) return "";
+  return `<details><summary>Rerun job</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/rerun-job" method="post"><fieldset><legend>Passes</legend><label><input name="rerun_stage" type="checkbox" value="ocr_merge"> OCR &amp; Merge</label><label><input name="rerun_stage" type="checkbox" value="ocr_structured"> Structure</label><label><input name="rerun_stage" type="checkbox" value="alt_placement"> Erase &amp; Alternate Placement</label><label><input name="rerun_stage" type="checkbox" value="translations"> Translation</label><label><input name="rerun_stage" type="checkbox" value="placements"> Typesetting</label><label><input name="rerun_stage" type="checkbox" value="render"> Render</label></fieldset><label>Pages<br><input name="page_spec" type="text" placeholder="0-3,6,8"></label><p class="muted">Leave pages empty to rerun every page.</p><button type="submit">Queue rerun</button></form></details>`;
 }}
 function editMarkup(data) {{
   if (!data.canEdit) return "";
@@ -961,14 +1234,24 @@ async function refreshStatus() {{
   document.getElementById("elapsed").textContent = data.elapsed || "";
   document.getElementById("thinking-budget").textContent = data.thinkingBudget || "";
   document.getElementById("message").textContent = data.message || "";
+  const translatedTitle = document.getElementById("translated-title");
+  const translatedName = String(data.translatedJobName || "");
+  translatedTitle.textContent = translatedName;
+  translatedTitle.hidden = !translatedName;
   const log = document.getElementById("log");
   const keepAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
   log.textContent = (data.recentLog || []).join("\\n");
   if (keepAtBottom) log.scrollTop = log.scrollHeight;
   document.getElementById("download").innerHTML = downloadMarkup(data);
+  document.getElementById("title-settings").innerHTML = titleSettingsMarkup(data);
   document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
   if (!(previousStatus === "complete" && data.status === "complete")) {{
-    document.getElementById("advanced-options").innerHTML = advancedOptionsMarkup(data);
+    const advancedOptions = document.getElementById("advanced-options");
+    if (!data.canUpdateAdvancedOptions) {{
+      advancedOptions.innerHTML = "";
+    }} else if (!advancedOptions.querySelector("form")) {{
+      advancedOptions.innerHTML = advancedOptionsMarkup(data);
+    }}
     document.getElementById("restart").innerHTML = restartMarkup(data);
     document.getElementById("terminate").innerHTML = terminateMarkup(data);
     document.getElementById("edit").innerHTML = editMarkup(data);
@@ -1041,7 +1324,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <button id="freeze-stage" type="button" data-tooltip="Protect all current values in this stage on this page. Later reruns keep them until you unprotect the stage.">Protect stage</button>
     <button id="freeze-page" type="button" data-tooltip="Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page."{complete_only}>Protect page</button>
     <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the stages after the current stage for this page. The current stage is used as input and is not regenerated."{complete_only}>Regenerate downstream</button>
-    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rebuild the downloads."{complete_only}>Regenerate all changes</button>
+    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rendered pages."{complete_only}>Regenerate all changes</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>
   </div>

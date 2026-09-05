@@ -1,23 +1,116 @@
 # tetolate
 
-This is a program for locally and automatically translating comic archives (`.cbz`) and sets of images from Japanese/Korean/Chinese to English using an AI pipeline consisting of OCR, Vision-Large Language Model (VLM), and cleaning.
+[Changelog](CHANGELOG.md)
 
-It is intended to run on local machines. The software itself is relatively light and should run on any semi-decent computer, the VLM is the bulk of the compute requirements.
+tetolate is a self-hosted program to run a total end-to-end translation of mangas / comic archives. Which means, put manga in (japanese/korean/chinese), get manga out english.
 
-For a VLM, I would recommend at minimum Gemma 4 12B, and I personally run with Gemma 4 31B for high-quality translations and Gemma 4 26B-A4B for faster medium-quality translations. I would not recommend running any of the Qwen 3.x models as they produce sub-par translations compared to Gemma 4.
+It runs entirely on your computer. It is up to you (end user) to run the vision-language model (VLM) for tetolate to use.
 
-THIS IS NOT REAL TIME TRANSLATION SOFTWARE. With a 3090, Gemma 4 31B, I see about 5-10 min PER PAGE. This is a send, come back later, and pick up.
+Recommended models:
+- Gemma 4 12B -- Good, on par with 26B-A4B
+- Gemma 4 26B-A4B -- Good, on par with 12B
+- Gemma 4 31B -- Best
+
+NOT recommended models:
+- Qwen 3.x -- Translation is too stiff and less accurate.
+
+Please note that tetolate is designed for max quality over speed. This is NOT a real time translation software. With 40 tps on Gemma 4 31B, I see ~1 min/page for low text mangas an ~2m30/page for high text mangas.
+
+## Example
+
+original image genn'd by chatgpt because i don't exactly have redist permission on mangas. let me know if there's a better example!
+
+| Original | Translated |
+| --- | --- |
+| ![Original example](meta/example.webp) | ![Translated example](meta/example_tl.webp) |
 
 ## Features
 
-Translates a .cbz or a collection of images to an English .cbz.
+Accepts `cbz`, `zip` full of images, or a direct collection of images.
 
-Web UI to upload, view jobs, and download from.
+View translated pages in the browser. Generate an optional PNG, WebP, or JXL CBZ download when needed.
 
-png, webp, jxl cbz output options, or view in browser.
+Web UI + password to upload, view jobs, and download.
 
-Versioned job editor for OCR grouping, structure, erase safety, translation,
-placement, and rendered previews. Protected edits survive later model passes.
+Editor to fix minor errors, primarily OCR misses.
+
+## Requirements
+
+- Docker or Podman
+- An OpenAI-compatible vision-language model endpoint -- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
+- If using PaddleOCR-VL 1.6 (recommended) 10+ gb of free RAM
+- Optional professional comic fonts. Tetolate includes open stand-in fonts when no user fonts are installed.
+
+Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
+
+## Install
+
+Docker/Podman is the recommended installation path. For source builds and native development, see [BUILDING.md](BUILDING.md).
+
+Internet is required for a first run to download the necessary models off Huggingface and Paddle.
+
+Start an OpenAI-compatible vision-language model endpoint.
+
+NOTE: For Gemma 4, the default tokens dedicated per image is relatively low which can cause poor performance. To max tokens per image, if running via llama.cpp add `--image-min-tokens 1120`, or with ExLlamaV3 go to your model's `processor_config.json` and set
+
+```json
+"image_processor": {
+    ...
+    "max_soft_tokens": 1120,
+    ...
+}
+```
+
+Grab the compose yaml and run the image.
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/potatoes1286/tetolate/v1.0.0/compose.yaml
+docker compose up -d
+docker compose logs tetolate
+```
+
+(If using podman, simply swap out docker for podman here.)
+
+Default password is `changeme`. Navigate to `http://127.0.0.1:8088` and log in. After logging in, change it.
+
+
+### Configuration
+
+#### OCR Service
+
+There are two options for OCR. The built in PaddleOCR is quick, cheap, and not the best. For maximum quality, use PaddleOCR-VL 1.6. PaddleOCR-VL is the recommended path.
+
+To use PaddleOCR-VL, download the two GGUF files and chat template listed in the [model guide](https://github.com/potatoes1286/tetolate/blob/main/data/models/README.md) into `data/models`, and run
+
+```bash
+docker compose down
+docker compose --profile paddleocr-vl up -d
+```
+
+and select PaddleOCR-VL in the job's advanced options.
+
+#### Expose to Network
+
+The container only listens to localhost on `127.0.0.1`. To listen to the network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. Exposing to WAN is VERY MUCH not advised.
+
+#### Fonts
+
+tetolate bundles some open fonts. If you have your own, better, private fonts, put your files in `data/fonts` and create `font_use.txt` as described in [the font configuration guide](https://github.com/potatoes1286/tetolate/blob/main/data/fonts/README.md).
+
+#### Prompts
+
+VLM prompts are plain text files in `data/prompts/`. They are read for each request, so edits apply to the next pass without restarting. See `data/prompts/README.md` for placeholder and custom-directory details.
+
+#### Updating
+
+Download the Compose file for the new version, pull its image, and recreate the
+container. Replace `v1.0.0` with the version that you want to install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/potatoes1286/tetolate/v1.0.0/compose.yaml -o compose.yaml
+docker compose pull
+docker compose up -d
+```
 
 ## Pipeline
 
@@ -32,93 +125,10 @@ placement, and rendered previews. Protected edits survive later model passes.
 9. render -- clean text with LaMa and draw translated text with ImageMagick
 10. package -- generate PNG, WebP, and JXL CBZ downloads
 
-## Requirements
-
-- Docker or Podman
-- An OpenAI-compatible vision-language model endpoint -- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
-- If using PaddleOCR-VL 1.6 (recommended) 1+ gb of free RAM
-- font files for text -- recommended ones are listed in [the font config's readme](data/fonts/README.md), but it is up to you to obtain them or get alternatives from google fonts or wherever
-
-Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
-
-## Install
-
-Installing with self-built docker is recommended.
-
-For detailed building / native install see [BUILDING.md](BUILDING.md).
-
-1. Go start up a llama.cpp instance running the vision-language model.
-
-2. The main image includes standard PaddleOCR and the PaddleOCR-VL client. For OCR, you may choose to either:
-
-- Run standard PaddleOCR directly in the main container (not recommended, faster, frequently misses text in my tests)
-- Run PaddleOCR-VL 1.6 in the bundled CPU llama.cpp container (recommended, slower, FAR higher quality)
-
-3. Clone the repository, then prepare the configuration before first startup:
-
-```bash
-cp data/config/vlm_config.example.json data/config/vlm_config.json
-cp data/config/web_config.example.json data/config/web_config.json
-```
-
-4. Set the translation endpoint in `data/config/vlm_config.json` -- please note for docker, 127.0.0.1 does not usually work and to access ports on the host machine you will have to use `host.docker.internal`.
-
-5. Put your font files into `data/fonts` and make a `font_use.txt` file from the example and readme. A suggested list of fonts are provided in `data/fonts/README.md`, though it is up to you to get them.
-
-6. For PaddleOCR-VL 1.6, download the two GGUF files and chat template listed in `data/models/README.md` into `data/models/`, then run. The main container performs layout detection and the profile adds only the CPU llama.cpp endpoint:
-```bash
-docker compose --profile paddleocr-vl up -d
-```
-
-For standard PaddleOCR:
-```bash
-docker compose up -d
-```
-
-7. When you submit a job to translate, select the matching OCR engine in a job's advanced options.
-
-8. On first startup there will be an auto-generated password in the docker logs. If you already detached, use `docker compose logs tetolate | grep password`. You can change it after logging in the webui.
-
-The container only listens to localhost on `127.0.0.1`. To listen to the network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. Exposing to WAN is VERY MUCH not advised.
-
-Persistent data is stored in:
-
-- `data/config/`: private runtime configuration
-- `data/fonts/`: user-provided font files and font-use guidance
-- `data/models/`: local PaddleOCR-VL model files
-- `data/prompts/`: editable VLM prompt templates
-- `data/jobs/`: source files, intermediate stages, logs, and results
-- `data/cache/`: PaddleOCR, Hugging Face, Torch, and LaMa model caches
-
-The first OCR and rendering job downloads model data and therefore takes longer.
-Stopping the containers does not delete jobs or caches.
-
-## Usage
-
-- Log in with admin password.
-- Change the password from the auto-generated one once inside.
-- Create a new category (no relation between jobs in the same category, they are just there to organize).
-- Choose a cbz or list of images.
-- Under advanced options, set translation notes, optional passes, source language, OCR engine, endpoints, thinking tokens, and page worker counts, then submit the job.
-- Wait. (models will be downloaded on your first run, be warned!)
-- Download your cbz archive or view in browser.
-
-VLM prompts are plain text files in `data/prompts/`. They are read for each request, so edits apply to the next pass without restarting. See `data/prompts/README.md` for placeholder and custom-directory details.
-
-NOTE: For Gemma 4, the default tokens dedicated per image is relatively low which can cause poor performance. To max tokens per image, if running via llama.cpp add `--image-min-tokens 1120`, or with ExLlamaV3 go to your model's `processor_config.json` and set
-
-```json
-"image_processor": {
-    ...
-    "max_soft_tokens": 1120,
-    ...
-}
-```
-
 ## Extra
 
 Third-party software and models keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 For legal reasons, be aware that copyright exists
 
-I vibed this with mr. codex for my own personal use. Uploaded to share. This software is experimental. Do not expose it to WAN, etc.
+I vibed this with mr. codex for my own personal use. Uploaded to share. Do not expose it to WAN, etc.

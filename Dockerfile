@@ -3,9 +3,11 @@
 ARG PYTHON_VERSION=3.11
 ARG UV_VERSION=0.11.24
 ARG IMAGEMAGICK_VERSION=7.1.2-13
+ARG IMAGEMAGICK_SHA256=3617bffe497690ffe5b731227d026db1150e138ddb129481a1e202442e558512
 
 FROM python:${PYTHON_VERSION}-slim-bookworm AS imagemagick-builder
 ARG IMAGEMAGICK_VERSION
+ARG IMAGEMAGICK_SHA256
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -31,6 +33,7 @@ WORKDIR /tmp/imagemagick
 RUN curl -fsSL \
         "https://github.com/ImageMagick/ImageMagick/archive/refs/tags/${IMAGEMAGICK_VERSION}.tar.gz" \
         -o source.tar.gz \
+    && echo "${IMAGEMAGICK_SHA256}  source.tar.gz" | sha256sum -c - \
     && tar -xzf source.tar.gz --strip-components=1 \
     && ./configure \
         --prefix=/opt/imagemagick \
@@ -136,10 +139,12 @@ WORKDIR /app
 COPY *.py ./
 COPY web_editor/ ./web_editor/
 COPY data/config /app/data/config
+COPY data/bundled_fonts /app/data/bundled_fonts
 COPY data/prompts /app/data/prompts
 COPY docker ./docker
 
 RUN magick -version \
+    && magick -background none -font /app/data/bundled_fonts/ComicNeue-Bold.ttf label:Tetolate null: \
     && magick identify -list format | grep -Eq '^ *JXL.*rw' \
     && magick identify -list format | grep -Eq '^ *WEBP.*rw' \
     && /app/.venv/bin/python -c "import translate_cbz, web_app" \
@@ -148,7 +153,10 @@ RUN magick -version \
 
 FROM runtime-base AS tests
 COPY tests ./tests
-RUN python -m unittest tests.test_regressions \
+# The runtime entrypoint copies prompts into /data; use the bundled files here
+# because the build-time test stage does not run that entrypoint.
+RUN TETOLATE_PROMPTS_DIR=/app/data/prompts \
+    python -m unittest tests.test_regressions \
     && touch /tmp/tests-passed
 
 FROM runtime-base AS runtime

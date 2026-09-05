@@ -343,11 +343,7 @@ def finalize_vlm_config(config: PipelineConfig) -> PipelineConfig:
     if config.vlm is None or config.vlm.model:
         return config
 
-    client = openai_client(config.vlm)
-    try:
-        model = resolve_vlm_model(client, config.vlm)
-    finally:
-        close_openai_client(client)
+    model = resolve_vlm_model(config.vlm)
     return replace(config, vlm=replace(config.vlm, model=model))
 
 
@@ -419,30 +415,46 @@ def call_vlm(
     raise PipelineError(f"VLM request failed for {label}: exhausted model-loading retries")
 
 
-def resolve_vlm_model(client: Any, config: VLMConfig) -> str:
-    if config.model:
-        return config.model
-
+def list_vlm_model_ids(config: VLMConfig) -> list[str]:
+    """List usable VLM model IDs in the endpoint's reported order."""
+    client = openai_client(config)
     try:
-        models = client.models.list()
-    except PipelineCancelled:
-        raise
-    except Exception as exc:
-        raise PipelineError(
-            f"Config model is empty and model discovery failed at {config.base_url}: {exc}"
-        ) from exc
+        try:
+            models = client.models.list()
+        except PipelineCancelled:
+            raise
+        except Exception as exc:
+            raise PipelineError(
+                f"Could not list VLM models from {config.base_url}."
+            ) from exc
+    finally:
+        close_openai_client(client)
 
     data = getattr(models, "data", None)
     if not data:
-        raise PipelineError(
-            f"Config model is empty and no models were returned by {config.base_url}."
-        )
+        raise PipelineError(f"No VLM models were returned by {config.base_url}.")
 
-    first = data[0]
-    model_id = getattr(first, "id", None)
-    if not isinstance(model_id, str) or not model_id:
-        raise PipelineError(
-            f"Config model is empty and the first discovered model has no string id: {first!r}"
-        )
+    model_ids: list[str] = []
+    seen: set[str] = set()
+    for model in data:
+        model_id = object_field(model, "id")
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        model_ids.append(model_id)
+
+    if not model_ids:
+        raise PipelineError(f"No usable VLM model IDs were returned by {config.base_url}.")
+    return model_ids
+
+
+def resolve_vlm_model(config: VLMConfig) -> str:
+    if config.model:
+        return config.model
+
+    model_id = list_vlm_model_ids(config)[0]
     print(f"Using discovered VLM model: {model_id}", file=sys.stderr)
     return model_id

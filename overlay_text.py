@@ -19,7 +19,9 @@ from typing import Any
 from PIL import ImageFont
 
 
-DEFAULT_FONT = "Helvetica"
+DEFAULT_FONT = str(
+    Path(__file__).resolve().parent / "data" / "bundled_fonts" / "ComicNeue-Bold.ttf"
+)
 DEFAULT_FILL = "white"
 DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3

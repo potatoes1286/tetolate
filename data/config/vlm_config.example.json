@@ -7,7 +7,7 @@
   "thinking_budget_tokens": 2048,
   "timeout": 1000,
   "backup_font": {
-    "font": "DejaVu-Sans",
+    "font": "ComicNeue-Bold.ttf",
     "fill": "black",
     "gravity": "center"
   },
