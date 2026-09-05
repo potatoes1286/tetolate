@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -75,11 +76,13 @@ DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKEN
 DEFAULT_PROOFREAD_TRANSLATIONS = True
 DEFAULT_WRITE_TRANSLATION_NOTES = True
 DEFAULT_ALT_PLACEMENT_ENABLED = translate_cbz.DEFAULT_ALT_PLACEMENT_ENABLED
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = translate_cbz.DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE
 DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
 DEFAULT_SOURCE_LANGUAGE = translate_cbz.DEFAULT_SOURCE_LANGUAGE
 DEFAULT_ADMIN_PASSWORD = "changeme"
+DEFAULT_CATEGORY = "default"
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
 CBZ_TITLE_MODES = {
@@ -546,14 +549,37 @@ def vlm_probe_failure_detail(
     else:
         detail = "Could not connect to the VLM endpoint.\n- Is your API key correct?"
 
-    host = urlsplit(endpoint).hostname
-    guidance = ""
+    parsed_endpoint = urlsplit(endpoint)
+    host = parsed_endpoint.hostname
+    connection_refused = any(
+        "connection refused" in str(candidate).casefold()
+        for candidate in error_chain
+    )
+    guidance_lines: list[str] = []
     if status_code is None and host is not None and host.lower() in {
         "localhost",
         "127.0.0.1",
         "::1",
     }:
-        guidance = f"\n- {DOCKER_LOCALHOST_NOTE}"
+        guidance_lines.append(DOCKER_LOCALHOST_NOTE)
+
+    raw_ip = False
+    if host is not None:
+        try:
+            ipaddress.ip_address(host)
+            raw_ip = True
+        except ValueError:
+            raw_ip = False
+    if connection_refused and host is not None and (
+        raw_ip or host.casefold() == "host.docker.internal"
+    ):
+        guidance_lines.append("Did you forget to set the port?")
+
+    endpoint_path = parsed_endpoint.path.rstrip("/").casefold()
+    if error is not None and not endpoint_path.endswith("/v1"):
+        guidance_lines.append("Most API endpoints require http://address/v1.")
+
+    guidance = "".join(f"\n- {line}" for line in guidance_lines)
 
     if status_code is not None:
         try:
@@ -1429,6 +1455,7 @@ class JobManager(EditorManagerMixin):
 
     def initialize_web_state(self) -> None:
         path = self.web_state_path()
+        new_installation = not path.exists()
         state: dict[str, Any] = {}
         if path.exists():
             try:
@@ -1463,6 +1490,9 @@ class JobManager(EditorManagerMixin):
             category_names[folded] = category
             categories.add(category)
 
+        if new_installation:
+            categories.add(DEFAULT_CATEGORY)
+
         default_password: str | None = None
         if not password_hash:
             default_password = DEFAULT_ADMIN_PASSWORD
@@ -1480,6 +1510,8 @@ class JobManager(EditorManagerMixin):
         with self._lock:
             self._password_hash = password_hash
             self._categories = categories
+            if new_installation:
+                self.category_dir(DEFAULT_CATEGORY).mkdir(parents=True, exist_ok=True)
             self.save_web_state()
 
     def password_matches_hash(self, password: str, password_hash: str) -> bool:
@@ -1972,7 +2004,7 @@ class JobManager(EditorManagerMixin):
             "thinkingBudgetTokens": self.config.default_thinking_budget_tokens,
             "vlmBaseUrl": self.config.default_vlm_base_url,
             "vlmModel": self.config.default_vlm_model,
-            "autoTranslateComicInfoTitle": False,
+            "autoTranslateComicInfoTitle": DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
             "pauseAfterOcr": False,
             "proofreadTranslations": DEFAULT_PROOFREAD_TRANSLATIONS,
             "writeTranslationNotes": DEFAULT_WRITE_TRANSLATION_NOTES,
@@ -2081,7 +2113,7 @@ class JobManager(EditorManagerMixin):
         lama_workers: int = translate_cbz.DEFAULT_LAMA_WORKERS,
         imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         translation_notes: str | None = None,
-        auto_translate_comicinfo_title: bool = False,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         with self._lock:
             options = self.load_category_advanced_options(code)
@@ -2669,7 +2701,12 @@ class JobManager(EditorManagerMixin):
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
             "vlmModel": vlm_model,
             "defaultVlmModel": self.config.default_vlm_model,
-            "autoTranslateComicInfoTitle": bool(status.get("autoTranslateComicInfoTitle")),
+            "autoTranslateComicInfoTitle": bool(
+                status.get(
+                    "autoTranslateComicInfoTitle",
+                    DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+                )
+            ),
             "comicInfoTitle": str(status.get("comicInfoTitle") or ""),
             "cbzTitleMode": str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL),
             "cbzAltTitleInNotes": bool(status.get("cbzAltTitleInNotes")),
@@ -2845,7 +2882,7 @@ class JobManager(EditorManagerMixin):
         imagemagick_workers: int = translate_cbz.DEFAULT_IMAGEMAGICK_WORKERS,
         vlm_auth_token: str | None = None,
         paddleocr_vl_auth_token: str | None = None,
-        auto_translate_comicinfo_title: bool = False,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         created_at = now_utc()
         if thinking_budget_tokens is None:
@@ -2955,7 +2992,7 @@ class JobManager(EditorManagerMixin):
         paddleocr_vl_auth_token: str | None,
         clear_vlm_auth_token: bool,
         clear_paddleocr_vl_auth_token: bool,
-        auto_translate_comicinfo_title: bool = False,
+        auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -3458,7 +3495,12 @@ class JobManager(EditorManagerMixin):
         source_title = str(status.get("comicInfoTitle") or "").strip()
         if (
             not source_title
-            or not bool(status.get("autoTranslateComicInfoTitle"))
+            or not bool(
+                status.get(
+                    "autoTranslateComicInfoTitle",
+                    DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+                )
+            )
             or status.get("titleTranslationAttempted")
             or status.get("translatedJobName")
         ):

@@ -720,6 +720,13 @@ class WebAuthenticationTests(unittest.TestCase):
             )
             self.assertIn("default admin password is: changeme", output.getvalue())
             self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(manager.categories(), (web_app.DEFAULT_CATEGORY,))
+            self.assertTrue(manager.category_dir(web_app.DEFAULT_CATEGORY).is_dir())
+            self.assertTrue(
+                manager.load_category_advanced_options(web_app.DEFAULT_CATEGORY)[
+                    "autoTranslateComicInfoTitle"
+                ]
+            )
 
     def test_default_password_is_printed_before_state_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -953,6 +960,7 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertIn('<option value="example-vlm" selected>example-vlm</option>', category_body)
         self.assertIn('data-vlm-test-category="manga"', category_body)
         self.assertIn('fetch("/api/vlm/test"', category_body)
+        self.assertIn("[data-vlm-test-status] { white-space: pre-line; }", category_body)
 
         job_body = web_pages.job_page(
             "manga",
@@ -1491,6 +1499,22 @@ class WebAuthenticationTests(unittest.TestCase):
             "The VLM endpoint returned an error.\n\n"
             "Endpoint error: 500 Internal Server Error",
         )
+
+    def test_vlm_probe_failure_adds_connection_guidance(self) -> None:
+        error = ConnectionError("[Errno 111] Connection refused")
+        detail = web_app.vlm_probe_failure_detail(
+            "http://host.docker.internal",
+            error,
+        )
+        self.assertIn("- Did you forget to set the port?", detail)
+        self.assertIn("- Most API endpoints require http://address/v1.", detail)
+
+        detail = web_app.vlm_probe_failure_detail(
+            "http://192.168.1.25:5001/v1",
+            error,
+        )
+        self.assertIn("- Did you forget to set the port?", detail)
+        self.assertNotIn("Most API endpoints require", detail)
 
     def test_page_worker_limits_are_validated(self) -> None:
         self.assertEqual(web_app.parse_page_workers_form("1", "OCR workers"), 1)

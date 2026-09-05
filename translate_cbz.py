@@ -170,6 +170,7 @@ DEFAULT_VLM_TIMEOUT = 1000.0
 
 # Default for the VLM erase-safety pass that decides whether text needs alternate placement.
 DEFAULT_ALT_PLACEMENT_ENABLED = True
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = True
 
 # Default llama.cpp/Gemma thinking budget. Negative means omit the field and
 # leave reasoning unlimited/server-defined.

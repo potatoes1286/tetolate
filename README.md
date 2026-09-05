@@ -16,7 +16,13 @@ NOT recommended models:
 
 Please note that tetolate is designed for max quality over speed. This is NOT a real time translation software. With 40 tps on Gemma 4 31B, I see ~1 min/page for low text mangas an ~2m30/page for high text mangas.
 
-Example images coming soon.
+## Example
+
+original image genn'd by chatgpt because i don't exactly have redist permission on mangas. let me know if there's a better example!
+
+| Original | Translated |
+| --- | --- |
+| ![Original example](meta/example.webp) | ![Translated example](meta/example_tl.webp) |
 
 ## Features
 
@@ -39,8 +45,9 @@ Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not c
 
 ## Install
 
-Docker is the recommended installation path. For source builds and native development, see [BUILDING.md](BUILDING.md).
+Docker/Podman is the recommended installation path. For source builds and native development, see [BUILDING.md](BUILDING.md).
 
+Internet is required for a first run to download the necessary models off Huggingface and Paddle.
 
 Start an OpenAI-compatible vision-language model endpoint.
 
@@ -62,6 +69,8 @@ docker compose up -d
 docker compose logs tetolate
 ```
 
+(If using podman, simply swap out docker for podman here.)
+
 Default password is `changeme`. Navigate to `http://127.0.0.1:8088` and log in. After logging in, change it.
 
 
@@ -71,9 +80,10 @@ Default password is `changeme`. Navigate to `http://127.0.0.1:8088` and log in. 
 
 There are two options for OCR. The built in PaddleOCR is quick, cheap, and not the best. For maximum quality, use PaddleOCR-VL 1.6. PaddleOCR-VL is the recommended path.
 
-To use PaddleOCR-VL, download the two GGUF files and chat template listed in the [model guide](https://github.com/potatoes1286/tetolate/blob/main/data/models/README.md) into `data/models`, then run
+To use PaddleOCR-VL, download the two GGUF files and chat template listed in the [model guide](https://github.com/potatoes1286/tetolate/blob/main/data/models/README.md) into `data/models`, and run
 
 ```bash
+docker compose down
 docker compose --profile paddleocr-vl up -d
 ```
 

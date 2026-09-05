@@ -17,6 +17,7 @@ DEFAULT_THINKING_BUDGET_TOKENS = translate_cbz.DEFAULT_VLM_THINKING_BUDGET_TOKEN
 DEFAULT_PROOFREAD_TRANSLATIONS = True
 DEFAULT_WRITE_TRANSLATION_NOTES = True
 DEFAULT_ALT_PLACEMENT_ENABLED = translate_cbz.DEFAULT_ALT_PLACEMENT_ENABLED
+DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE = translate_cbz.DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE
 DEFAULT_OCR_ENGINE = paddle_ocr_image.DEFAULT_OCR_ENGINE
 DEFAULT_PADDLEOCR_VL_SERVER_URL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL
 DEFAULT_PADDLEOCR_VL_MODEL = paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL
@@ -172,6 +173,7 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
     details > fieldset > legend {{ font-weight: 700; }}
     .row {{ margin: 1rem 0; }}
     .muted {{ color: #555; }}
+    [data-vlm-test-status] {{ white-space: pre-line; }}
     .status {{ font-weight: 700; }}
     table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
     th, td {{ border-bottom: 1px solid #ddd; padding: 0.45rem; text-align: left; vertical-align: top; }}
@@ -598,7 +600,7 @@ def advanced_options_fields(
     has_vlm_auth_token: bool = False,
     has_paddleocr_vl_auth_token: bool = False,
     vlm_model: str = "",
-    auto_translate_comicinfo_title: bool = False,
+    auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
     test_category: str = "",
     test_job_id: str = "",
     submit_label: str = "",
@@ -713,7 +715,9 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
     )
     default_vlm_base_url = str(data.get("defaultVlmBaseUrl") or "")
     default_vlm_model = str(data.get("defaultVlmModel") or "")
-    auto_translate_comicinfo_title = bool(data.get("autoTranslateComicInfoTitle", False))
+    auto_translate_comicinfo_title = bool(
+        data.get("autoTranslateComicInfoTitle", DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE)
+    )
     pause_after_ocr = bool(data.get("pauseAfterOcr", False))
     proofread_translations = bool(
         data.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -885,7 +889,9 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
         or ""
     )
     vlm_model = str(status.get("vlmModel") or status.get("defaultVlmModel") or "")
-    auto_translate_comicinfo_title = bool(status.get("autoTranslateComicInfoTitle", False))
+    auto_translate_comicinfo_title = bool(
+        status.get("autoTranslateComicInfoTitle", DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE)
+    )
     pause_after_ocr = bool(status.get("pauseAfterOcr"))
     proofread_translations = bool(
         status.get("proofreadTranslations", DEFAULT_PROOFREAD_TRANSLATIONS)
@@ -1140,7 +1146,7 @@ function advancedOptionsMarkup(data) {{
   const pauseChecked = data.pauseAfterOcr ? " checked" : "";
   const proofreadChecked = data.proofreadTranslations ? " checked" : "";
   const notesChecked = data.writeTranslationNotes ? " checked" : "";
-  const autoTitleChecked = data.autoTranslateComicInfoTitle ? " checked" : "";
+  const autoTitleChecked = (data.autoTranslateComicInfoTitle ?? true) ? " checked" : "";
   const altPlacementChecked = (data.altPlacementEnabled ?? data.defaultAltPlacementEnabled ?? true) ? " checked" : "";
   const sourceLanguage = data.sourceLanguage || data.defaultSourceLanguage || "jp";
   const jpSelected = sourceLanguage === "jp" ? " selected" : "";

@@ -2,6 +2,14 @@
 
 ## 1.0.0 - 2026-09-04
 
+Devnote:
+
+Big update. At this point tetolate feels almost entirely feature complete to me. Save for incorporating new models, fixing edge bugs, I don't think there's much more to add.
+
+If you have any ideas, let me know via the issues.
+
+TL;DR lots of housecleaning + no more image building needed anymore, now pushed via github and you can just run a docker compose.
+
 ### Added
 
 - Added GHCR images, public Compose installation, local builds, and bundled fonts.

@@ -153,7 +153,10 @@ RUN magick -version \
 
 FROM runtime-base AS tests
 COPY tests ./tests
-RUN python -m unittest tests.test_regressions \
+# The runtime entrypoint copies prompts into /data; use the bundled files here
+# because the build-time test stage does not run that entrypoint.
+RUN TETOLATE_PROMPTS_DIR=/app/data/prompts \
+    python -m unittest tests.test_regressions \
     && touch /tmp/tests-passed
 
 FROM runtime-base AS runtime
