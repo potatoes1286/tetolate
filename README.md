@@ -20,6 +20,8 @@ Please note that tetolate is designed for max quality over speed. This is NOT a 
 
 original image genn'd by chatgpt because i don't exactly have redist permission on mangas. let me know if there's a better example!
 
+Model: Gemma 4 31B 4bpw via ExLlamaV3, Font: Wild Words
+
 | Original | Translated |
 | --- | --- |
 | ![Original example](meta/example.webp) | ![Translated example](meta/example_tl.webp) |
@@ -64,7 +66,7 @@ NOTE: For Gemma 4, the default tokens dedicated per image is relatively low whic
 Grab the compose yaml and run the image.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/potatoes1286/tetolate/v1.0.0/compose.yaml
+curl -fsSLO https://raw.githubusercontent.com/potatoes1286/tetolate/refs/heads/main/compose.yaml
 docker compose up -d
 docker compose logs tetolate
 ```
@@ -91,11 +93,21 @@ and select PaddleOCR-VL in the job's advanced options.
 
 #### Expose to Network
 
-The container only listens to localhost on `127.0.0.1`. To listen to the network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. Exposing to WAN is VERY MUCH not advised.
+By default, the docker container will only listen to local requests (same computer). To access the web UI from another computer within the same network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. It is highly NOT advised to expose it further to WAN requests.
 
 #### Fonts
 
-tetolate bundles some open fonts. If you have your own, better, private fonts, put your files in `data/fonts` and create `font_use.txt` as described in [the font configuration guide](https://github.com/potatoes1286/tetolate/blob/main/data/fonts/README.md).
+tetolate bundles some open fonts for quick setup. The default setup is
+
+```
+ComicNeue-Bold.ttf: talking, narrator, general text, fallback
+ComicNeue-BoldItalic.ttf: thinking, monologue, quiet internal speech
+IBMPlexMono-Medium.ttf: computer text, terminal text, electronic text
+ArchitectsDaughter-Regular.ttf: handwritten text, notes, letters
+Bangers-Regular.ttf: sfx, loud shout, explosive or emphatic text
+```
+
+If you have your own, better, private fonts, put your files in `data/fonts` and create `font_use.txt` as described in [the font configuration guide](https://github.com/potatoes1286/tetolate/blob/main/data/fonts/README.md). The most common "Manga font" you see (and is used in the example above) is Wild Words, which is not freely available.
 
 #### Prompts
 
@@ -103,11 +115,10 @@ VLM prompts are plain text files in `data/prompts/`. They are read for each requ
 
 #### Updating
 
-Download the Compose file for the new version, pull its image, and recreate the
-container. Replace `v1.0.0` with the version that you want to install:
+Download the Compose file for the new version, pull its image, and recreate the container.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/potatoes1286/tetolate/v1.0.0/compose.yaml -o compose.yaml
+curl -fsSL https://raw.githubusercontent.com/potatoes1286/tetolate/refs/heads/main/compose.yaml -o compose.yaml
 docker compose pull
 docker compose up -d
 ```
