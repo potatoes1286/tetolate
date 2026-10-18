@@ -24,6 +24,7 @@ import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -53,8 +54,10 @@ from web_pages import (
     editor_page,
     job_page,
     job_viewer_page,
+    series_page,
 )
 import web_security
+from web_series import SeriesManagerMixin, chapter_filename_key, chapter_order
 from web_storage import write_json_atomic
 
 
@@ -103,6 +106,7 @@ ADMIN_SESSION_SECONDS = 12 * 60 * 60
 ADMIN_LOGIN_FAILURE_LIMIT = 5
 ADMIN_LOGIN_FAILURE_WINDOW_SECONDS = 60
 WEB_STATE_FILENAME = ".tetolate-web-state.json"
+VLM_SECRETS_FILENAME = ".vlm-secrets.json"
 WEB_INSTANCE_LOCK_FILENAME = ".tetolate-web.lock"
 WEB_CONFIG_FIELDS = {
     "listen",
@@ -1316,7 +1320,7 @@ def optional_non_negative_int(value: Any, label: str) -> int | None:
     return parsed
 
 
-class JobManager(EditorManagerMixin):
+class JobManager(SeriesManagerMixin, EditorManagerMixin):
     def __init__(self, config: WebConfig) -> None:
         self.config = config
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -2155,6 +2159,28 @@ class JobManager(EditorManagerMixin):
     def job_secrets_path(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / JOB_SECRETS_FILENAME
 
+    def load_vlm_tokens(self) -> dict[str, str]:
+        path = self.config.jobs_dir / VLM_SECRETS_FILENAME
+        if not path.exists():
+            return {}
+        data = web_security.read_json_object(path)
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in data.items()):
+            raise ValueError("Saved VLM tokens must map endpoint URLs to strings.")
+        return data
+
+    def saved_vlm_token(self, endpoint: str) -> str | None:
+        return self.load_vlm_tokens().get(endpoint.rstrip("/"))
+
+    def remember_vlm_token(self, endpoint: str, token: str | None) -> None:
+        with self._lock:
+            tokens = self.load_vlm_tokens()
+            key = endpoint.rstrip("/")
+            if token is None:
+                tokens.pop(key, None)
+            else:
+                tokens[key] = token
+            write_json_atomic(self.config.jobs_dir / VLM_SECRETS_FILENAME, tokens, mode=0o600)
+
     def load_job_secrets(self, code: str, job_id: str) -> dict[str, str]:
         path = self.job_secrets_path(code, job_id)
         if not path.is_file():
@@ -2185,6 +2211,14 @@ class JobManager(EditorManagerMixin):
         preserve_existing: bool = True,
     ) -> None:
         secrets = self.load_job_secrets(code, job_id) if preserve_existing else {}
+        status = self.load_status(code, job_id) or {}
+        endpoint = self.status_vlm_base_url(status)
+        if clear_vlm_auth_token:
+            self.remember_vlm_token(endpoint, None)
+        elif vlm_auth_token is not None:
+            self.remember_vlm_token(endpoint, vlm_auth_token)
+        elif not secrets.get("vlmAuthToken"):
+            vlm_auth_token = self.saved_vlm_token(endpoint)
         for key, token, clear in (
             ("vlmAuthToken", vlm_auth_token, clear_vlm_auth_token),
             (
@@ -2701,6 +2735,11 @@ class JobManager(EditorManagerMixin):
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
             "vlmModel": vlm_model,
             "defaultVlmModel": self.config.default_vlm_model,
+            "seriesId": str(status.get("seriesId") or ""),
+            "chapterOrder": str(status.get("chapterOrder") or ""),
+            "series": self.public_series(code),
+            "seriesNotesWarning": str(status.get("seriesNotesWarning") or ""),
+            "seriesContextSaved": bool(status.get("seriesContextSaved")),
             "autoTranslateComicInfoTitle": bool(
                 status.get(
                     "autoTranslateComicInfoTitle",
@@ -2761,10 +2800,12 @@ class JobManager(EditorManagerMixin):
         return {
             "category": code,
             "jobs": jobs,
+            "series": self.public_series(code),
             "translationNotes": options["translationNotes"],
             "defaultThinkingBudgetTokens": options["thinkingBudgetTokens"],
             "defaultVlmBaseUrl": options["vlmBaseUrl"],
             "defaultVlmModel": options["vlmModel"],
+            "hasVlmAuthToken": bool(self.saved_vlm_token(options["vlmBaseUrl"])),
             "autoTranslateComicInfoTitle": options["autoTranslateComicInfoTitle"],
             "pauseAfterOcr": options["pauseAfterOcr"],
             "proofreadTranslations": options["proofreadTranslations"],
@@ -2848,6 +2889,8 @@ class JobManager(EditorManagerMixin):
                     self.apply_pending_resume_target(status, resume_target)
                 self.save_status(code, job_id, status)
                 self.enqueue(code, job_id)
+        self.recover_series_notes()
+        self.enqueue_ready_series_jobs()
         if saw_paused_job:
             with self._pause_condition:
                 self._paused = True
@@ -2856,6 +2899,12 @@ class JobManager(EditorManagerMixin):
         key = (code, job_id)
         with self._lock:
             if key in self._queued_jobs:
+                return
+            status = self.load_status(code, job_id) or {}
+            reason = self.series_wait_reason(code, status)
+            if reason:
+                status.update(phase="Waiting for series", message=reason)
+                self.save_status(code, job_id, status)
                 return
             self._queued_jobs.add(key)
             self._queue.put(key)
@@ -2883,8 +2932,14 @@ class JobManager(EditorManagerMixin):
         vlm_auth_token: str | None = None,
         paddleocr_vl_auth_token: str | None = None,
         auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+        series_id: str = "",
+        chapter: str = "",
+        enqueue_job: bool = True,
     ) -> None:
         created_at = now_utc()
+        chapter = self.validate_series_chapter(code, series_id, chapter, job_id)
+        if series_id:
+            write_translation_notes = True
         if thinking_budget_tokens is None:
             thinking_budget_tokens = self.config.default_thinking_budget_tokens
         thinking_budget_tokens = validate_thinking_budget_tokens(thinking_budget_tokens)
@@ -2913,6 +2968,8 @@ class JobManager(EditorManagerMixin):
         status = {
             "category": code,
             "jobId": job_id,
+            "seriesId": series_id,
+            "chapterOrder": chapter,
             "status": "queued",
             "phase": "Queued",
             "page": None,
@@ -2968,7 +3025,8 @@ class JobManager(EditorManagerMixin):
             imagemagick_workers=imagemagick_workers,
             auto_translate_comicinfo_title=auto_translate_comicinfo_title,
         )
-        self.enqueue(code, job_id)
+        if enqueue_job:
+            self.enqueue(code, job_id)
 
     def update_job_advanced_options(
         self,
@@ -3023,13 +3081,18 @@ class JobManager(EditorManagerMixin):
                     status_code=400,
                     detail="Only completed, failed, cancelled, or paused jobs can update advanced options.",
                 )
+            if self.status_vlm_base_url(status).rstrip("/") != vlm_base_url.rstrip("/"):
+                # A job's saved key belongs to its previous endpoint.
+                job_secrets = self.load_job_secrets(code, job_id)
+                job_secrets.pop("vlmAuthToken", None)
+                write_json_atomic(self.job_secrets_path(code, job_id), job_secrets, mode=0o600)
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
             status["vlmModel"] = vlm_model
             status["autoTranslateComicInfoTitle"] = bool(auto_translate_comicinfo_title)
             status["pauseAfterOcr"] = bool(pause_after_ocr)
             status["proofreadTranslations"] = bool(proofread_translations)
-            status["writeTranslationNotes"] = bool(write_translation_notes)
+            status["writeTranslationNotes"] = bool(write_translation_notes or status.get("seriesId"))
             status["altPlacementEnabled"] = bool(alt_placement_enabled)
             status["sourceLanguage"] = source_language
             status["ocrEngine"] = ocr_engine
@@ -3602,6 +3665,7 @@ class JobManager(EditorManagerMixin):
                     status_code=500,
                     detail="Could not delete job.",
                 ) from exc
+            self.enqueue_ready_series_jobs()
 
     def rename_job(self, code: str, job_id: str, name: str) -> str:
         code = self.validate_category(code)
@@ -3807,6 +3871,10 @@ class JobManager(EditorManagerMixin):
                     )
             finally:
                 self._queue.task_done()
+                try:
+                    self.enqueue_ready_series_jobs()
+                except Exception:
+                    LOGGER.exception("Could not schedule series chapters")
 
     def update_from_log_line(self, code: str, job_id: str, line: str) -> None:
         parsed = parse_progress_line(line)
@@ -4357,6 +4425,13 @@ class JobManager(EditorManagerMixin):
             self.run_page_rerun_batch_job(code, job_id, status, pending_page_reruns)
             return
 
+        reason = self.series_wait_reason(code, status)
+        if reason:
+            status.update(phase="Waiting for series", message=reason)
+            self.save_status(code, job_id, status)
+            return
+        self.prepare_series_context(code, job_id, status)
+
         resume_from = status.get("pendingResumeFrom")
         resume_page = status.get("pendingResumePage")
         if not isinstance(resume_from, str):
@@ -4468,6 +4543,8 @@ class JobManager(EditorManagerMixin):
                 }
             )
         self.save_status(code, job_id, status)
+        if status.get("status") == "complete":
+            self.publish_series_notes(code, job_id)
 
 
 def manager_from_request(request: Request) -> JobManager:
@@ -4723,6 +4800,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         imagemagick_workers: str = Form("1"),
         vlm_auth_token: str = Form(""),
         paddleocr_vl_auth_token: str = Form(""),
+        series_id: str = Form(""),
+        chapter: str = Form(""),
     ) -> Any:
         manager = manager_from_request(request)
         code = manager.validate_category(category)
@@ -4820,6 +4899,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 parse_auth_token_form(vlm_auth_token),
                 parse_auth_token_form(paddleocr_vl_auth_token),
                 auto_translate_comicinfo_title=parse_checkbox(auto_translate_comicinfo_title),
+                series_id=series_id,
+                chapter=chapter,
             )
         except Exception:
             try:
@@ -4831,6 +4912,114 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             raise
 
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/category/{code}/series")
+    async def create_series(request: Request, code: str, name: str = Form(...)) -> RedirectResponse:
+        manager = require_admin(request)
+        series_id = manager.create_series(code, name)
+        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
+
+    @app.get("/category/{code}/series/{series_id}", response_class=HTMLResponse)
+    async def view_series(request: Request, code: str, series_id: str) -> HTMLResponse:
+        manager = require_admin(request)
+        return series_page(code, series_id, manager.get_series(code, series_id),
+                           manager.series_chapters(code, series_id), manager.public_category_jobs(code))
+
+    @app.post("/category/{code}/series/{series_id}")
+    async def update_series(
+        request: Request, code: str, series_id: str, name: str = Form(...),
+        instructions: str = Form(""), notes: str = Form(""),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.update_series(code, series_id, name, instructions, notes)
+        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/series")
+    async def assign_series(
+        request: Request, code: str, job_id: str, series_id: str = Form(""), chapter: str = Form(""),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.assign_job_series(code, job_id, series_id, chapter)
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/publish-series-notes")
+    async def publish_series_notes(
+        request: Request, code: str, job_id: str, use_current: str | None = Form(None),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.publish_series_notes(code, job_id, explicit=True, use_current=parse_checkbox(use_current))
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/category/{code}/series/{series_id}/upload")
+    async def upload_series_chapters(
+        request: Request, code: str, series_id: str,
+        chapters: list[UploadFile] = File(...), first_chapter: str = Form("1"),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.get_series(code, series_id)
+        uploads = non_empty_uploads(chapters)
+        if not uploads or len(uploads) > 200:
+            raise HTTPException(400, "Select 1-200 CBZ or ZIP chapters.")
+        first = Decimal(chapter_order(first_chapter))
+        ordered = sorted(uploads, key=lambda item: chapter_filename_key(upload_filename(item)))
+        orders = [chapter_order(str(first + index)) for index in range(len(ordered))]
+        form = await request.form()
+        options = {
+            "translation_notes": str(form.get("translation_notes", "")),
+            "thinking_budget_tokens": parse_thinking_budget_form(str(form.get("thinking_budget_tokens", "")), manager.config.default_thinking_budget_tokens),
+            "vlm_base_url": parse_vlm_base_url_form(str(form.get("vlm_base_url", "")), manager.config),
+            "vlm_model": parse_vlm_model_form(str(form.get("vlm_model", ""))),
+            "vlm_auth_token": parse_auth_token_form(str(form.get("vlm_auth_token", ""))),
+            "paddleocr_vl_auth_token": parse_auth_token_form(str(form.get("paddleocr_vl_auth_token", ""))),
+            "source_language": parse_source_language_form(str(form.get("source_language", "")), manager.config.default_source_language),
+            "ocr_engine": parse_ocr_engine_form(str(form.get("ocr_engine", "")), manager.config.default_ocr_engine),
+            "paddleocr_vl_server_url": parse_paddleocr_vl_server_url_form(str(form.get("paddleocr_vl_server_url", "")), manager.config),
+            "paddleocr_vl_model": parse_optional_text_form(str(form.get("paddleocr_vl_model", "")), manager.config.default_paddleocr_vl_model),
+            "ocr_page_workers": parse_page_workers_form(str(form.get("ocr_page_workers", "1")), "OCR workers"),
+            "lama_workers": parse_page_workers_form(str(form.get("lama_workers", "1")), "LaMa workers"),
+            "imagemagick_workers": parse_page_workers_form(str(form.get("imagemagick_workers", "1")), "ImageMagick workers"),
+            "pause_after_ocr": parse_checkbox(form.get("pause_after_ocr")),
+            "proofread_translations": parse_checkbox(form.get("enable_proofreading")),
+            "write_translation_notes": True,
+            "alt_placement_enabled": parse_checkbox(form.get("enable_alt_placement")),
+            "auto_translate_comicinfo_title": parse_checkbox(form.get("auto_translate_comicinfo_title")),
+        }
+        prepared: list[tuple[str, str, str]] = []
+        try:
+            for item, order in zip(ordered, orders):
+                manager.validate_series_chapter(code, series_id, order)
+                filename = upload_filename(item)
+                if Path(filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
+                    raise HTTPException(400, "Chapters must use .cbz or .zip extensions.")
+                job_id = manager.create_job_id(code)
+                manager.job_dir(code, job_id).mkdir(parents=True)
+                prepared.append((job_id, filename, order))
+                await write_uploaded_file_to_path(item, manager.input_path(code, job_id),
+                                                  manager.config.max_upload_bytes, "Uploaded chapter")
+                await run_in_threadpool(validate_uploaded_comic_archive, manager.input_path(code, job_id), filename)
+            # Register the full batch before any chapter can run.
+            with manager._lock:
+                try:
+                    for job_id, filename, order in prepared:
+                        manager.submit_job(code, job_id, filename, **options, series_id=series_id,
+                                           chapter=order, enqueue_job=False)
+                except Exception:
+                    for job_id, _, _ in prepared:
+                        shutil.rmtree(manager.job_dir(code, job_id))
+                    prepared.clear()
+                    raise
+                # Jobs are now committed. A scheduling error must not remove
+                # files for work that may already have entered the queue.
+                prepared.clear()
+                manager.enqueue_ready_series_jobs()
+        except Exception:
+            for job_id, _, _ in prepared:
+                shutil.rmtree(manager.job_dir(code, job_id))
+            raise
+        finally:
+            for item in chapters:
+                await item.close()
+        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
     async def category_jobs(request: Request, code: str) -> HTMLResponse:
@@ -4947,6 +5136,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 detail="jobId requires category.",
             )
         saved_token: str | None = None
+        same_job_endpoint = False
         if category_value is not None:
             if not isinstance(category_value, str):
                 raise HTTPException(
@@ -4958,12 +5148,14 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 if not isinstance(job_id_value, str):
                     raise HTTPException(status_code=400, detail="jobId must be a string.")
                 job_id = manager.validate_job_id(job_id_value)
-                if manager.load_status(category, job_id) is None:
+                job_status = manager.load_status(category, job_id)
+                if job_status is None:
                     raise HTTPException(status_code=404, detail="Unknown job.")
-                if supplied_token is None:
+                same_job_endpoint = manager.status_vlm_base_url(job_status).rstrip("/") == endpoint.rstrip("/")
+                if supplied_token is None and same_job_endpoint:
                     saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
 
-        if supplied_token is not None and category_value is not None and job_id_value is not None:
+        if supplied_token is not None and same_job_endpoint:
             manager.update_job_auth_tokens(
                 category,
                 job_id,
@@ -4971,6 +5163,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 paddleocr_vl_auth_token=None,
             )
 
+        saved_token = saved_token or manager.saved_vlm_token(endpoint)
         try:
             models = await run_in_threadpool(
                 manager.probe_vlm_models,
@@ -4986,6 +5179,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                     supplied_token or saved_token,
                 ),
             ) from None
+        if supplied_token is not None:
+            manager.remember_vlm_token(endpoint, supplied_token)
         return JSONResponse(
             {
                 "ok": True,

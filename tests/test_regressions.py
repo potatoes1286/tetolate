@@ -917,6 +917,7 @@ class WebAuthenticationTests(unittest.TestCase):
             imagemagick_workers=4,
             has_vlm_auth_token=True,
             has_paddleocr_vl_auth_token=True,
+            test_job_id="12345678",
         )
 
         self.assertIn("<legend>Workflow</legend>", markup)
@@ -1337,7 +1338,9 @@ class WebAuthenticationTests(unittest.TestCase):
             manager = self.initialized_manager(root, ["default"])
             code, job_id = "default", "12345678"
             manager.job_dir(code, job_id).mkdir(parents=True)
-            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.save_status(code, job_id, {
+                "status": "failed", "vlmModel": "model", "vlmBaseUrl": "http://vlm.example/v1",
+            })
             manager.update_job_auth_tokens(
                 code,
                 job_id,
@@ -1402,7 +1405,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     probe.call_args_list,
                     [
                         mock.call("http://vlm.example/v1", "supplied-token"),
-                        mock.call("http://vlm.example/v1", None),
+                        mock.call("http://vlm.example/v1", "supplied-token"),
                     ],
                 )
 
@@ -1415,7 +1418,9 @@ class WebAuthenticationTests(unittest.TestCase):
             manager = self.initialized_manager(root, ["default"])
             code, job_id = "default", "12345678"
             manager.job_dir(code, job_id).mkdir(parents=True)
-            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.save_status(code, job_id, {
+                "status": "failed", "vlmModel": "model", "vlmBaseUrl": "http://vlm.example/v1",
+            })
             app = web_app.create_app(config_path)
             app.state.manager = manager
             session = manager.authenticate_admin(self.ADMIN_PASSWORD)
@@ -1458,6 +1463,128 @@ class WebAuthenticationTests(unittest.TestCase):
                 self.assertNotIn("supplied-token", response.text)
 
             asyncio.run(exercise())
+
+    def test_category_vlm_key_survives_restart_and_is_used_by_new_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            endpoint = manager.config.default_vlm_base_url
+            app = web_app.create_app(root / "web_config.json")
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with (
+                        mock.patch.object(manager, "probe_vlm_models", return_value=["model"]),
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "vlmBaseUrl": endpoint,
+                            "vlmAuthToken": "persistent-token",
+                        })
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotIn("persistent-token", response.text)
+
+                    restarted = web_app.JobManager(manager.config)
+                    restarted.initialize_web_state()
+                    app.state.manager = restarted
+                    session_after_restart = restarted.authenticate_admin(self.ADMIN_PASSWORD)
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session_after_restart)
+                    with (
+                        mock.patch.object(restarted, "probe_vlm_models", return_value=["model"]) as probe,
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "vlmBaseUrl": endpoint + "/",
+                        })
+                        probe.assert_called_once_with(endpoint, "persistent-token")
+                    self.assertEqual(response.status_code, 200)
+                    category = restarted.public_category_jobs("default")
+                    self.assertTrue(category["hasVlmAuthToken"])
+                    markup = web_pages.category_jobs_page("default", category).body.decode()
+                    self.assertIn("A saved token is set", markup)
+                    self.assertNotIn("persistent-token", markup)
+                    self.assertNotIn("persistent-token", json.dumps(category))
+                    job_id = restarted.create_job_id("default")
+                    restarted.job_dir("default", job_id).mkdir(parents=True)
+                    restarted.submit_job("default", job_id, "input.cbz")
+                    self.assertEqual(
+                        restarted.load_job_secrets("default", job_id)["vlmAuthToken"],
+                        "persistent-token",
+                    )
+                    self.assertNotIn("persistent-token", restarted.status_path("default", job_id).read_text())
+
+            asyncio.run(exercise())
+            path = manager.config.jobs_dir / web_app.VLM_SECRETS_FILENAME
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_saved_vlm_keys_are_scoped_to_endpoint_and_can_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            old_endpoint = manager.config.default_vlm_base_url
+            new_endpoint = "https://other.example/v1"
+            job_id = manager.create_job_id("default")
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.submit_job("default", job_id, "input.cbz", vlm_auth_token="old-token")
+            status = manager.load_status("default", job_id)
+            assert status is not None
+            status["status"] = "failed"
+            manager.save_status("default", job_id, status)
+            app = web_app.create_app(root / "web_config.json")
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with (
+                        mock.patch.object(manager, "probe_vlm_models", return_value=["model"]) as probe,
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "jobId": job_id, "vlmBaseUrl": new_endpoint,
+                        })
+                        self.assertEqual(response.status_code, 200)
+                        probe.assert_called_once_with(new_endpoint, None)
+                    response = await client.post(f"/job/default/{job_id}/advanced-options", data={
+                        "vlm_base_url": new_endpoint, "vlm_model": "model",
+                    })
+                    self.assertEqual(response.status_code, 303)
+                    self.assertNotIn("vlmAuthToken", manager.load_job_secrets("default", job_id))
+                    self.assertIsNone(manager.saved_vlm_token(new_endpoint))
+                    self.assertEqual(manager.saved_vlm_token(old_endpoint), "old-token")
+
+            asyncio.run(exercise())
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token="new-token", paddleocr_vl_auth_token=None,
+            )
+            self.assertEqual(manager.saved_vlm_token(new_endpoint), "new-token")
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token=None, paddleocr_vl_auth_token=None,
+            )
+            self.assertEqual(manager.load_job_secrets("default", job_id)["vlmAuthToken"], "new-token")
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token=None, paddleocr_vl_auth_token=None,
+                clear_vlm_auth_token=True,
+            )
+            self.assertIsNone(manager.saved_vlm_token(new_endpoint))
+            self.assertNotIn("vlmAuthToken", manager.load_job_secrets("default", job_id))
+            self.assertEqual(manager.saved_vlm_token(old_endpoint), "old-token")
 
     def test_vlm_probe_failure_adds_docker_note_only_for_localhost(self) -> None:
         self.assertEqual(

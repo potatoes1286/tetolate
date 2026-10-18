@@ -64,6 +64,8 @@ secrets.*
 /data/jobs/*
 !/data/jobs/.gitkeep
 **/.tetolate-web-state.json
+**/.vlm-secrets.json
+**/.series.json
 **/.tetolate-web.lock
 /web_jobs/
 

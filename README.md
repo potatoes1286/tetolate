@@ -39,8 +39,8 @@ Editor to fix minor errors, primarily OCR misses.
 ## Requirements
 
 - Docker or Podman
-- An OpenAI-compatible vision-language model endpoint -- If running the VLM locally (which is expected), at least 8 GB of free VRAM to run Gemma 4 12B, or for the truly desperate, offload that to RAM. By default tetolate assumes this is on `127.0.0.1:8080/v1`; change `vlm_config.json` if different.
-- If using PaddleOCR-VL 1.6 (recommended) 10+ gb of free RAM
+- An OpenAI-compatible vision-language model endpoint. Gemma 4 12B is considered the minimum which requires 8GB of VRAM, or offloaded to RAM which is slower. This is not a guide on running models locally; please look elsewhere for that.
+- If using PaddleOCR-VL 1.6 (recommended), 2.5GB of free RAM will be occupied, and will inference on CPU
 - Optional professional comic fonts. Tetolate includes open stand-in fonts when no user fonts are installed.
 
 Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
@@ -108,6 +108,18 @@ Bangers-Regular.ttf: sfx, loud shout, explosive or emphatic text
 ```
 
 If you have your own, better, private fonts, put your files in `data/fonts` and create `font_use.txt` as described in [the font configuration guide](https://github.com/potatoes1286/tetolate/blob/main/data/fonts/README.md). The most common "Manga font" you see (and is used in the example above) is Wild Words, which is not freely available.
+
+#### Series
+
+Create a series from a category's **Series** section. Set its translation instructions,
+then upload chapters from the series page and check their order before queuing.
+Chapters run in order and pass updated notes to the next chapter automatically.
+Failed chapters, OCR review, or missing notes hold later chapters.
+
+Each chapter keeps the notes it started with for retries. Edit shared notes on the
+series page. To replace them with notes from an older chapter, use **Series settings**
+on that job and select **Use this chapter's notes for the series**.
+You can also keep your current edited notes and continue from that chapter.
 
 #### Prompts
 

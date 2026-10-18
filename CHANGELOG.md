@@ -16,6 +16,7 @@ TL;DR lots of housecleaning + no more image building needed anymore, now pushed 
 - Added ZIP uploads, lazy CBZ downloads, and ComicInfo title controls.
 - Added category and job naming controls.
 - Added translation of titles and editing titles.
+- Added series with ordered chapter uploads and automatic translation-note sharing.
 
 ### Changed
 
@@ -25,6 +26,7 @@ TL;DR lots of housecleaning + no more image building needed anymore, now pushed 
 
 ### Fixed
 
+- Remember VLM API keys per endpoint across sessions and new jobs.
 - Improved VLM connection errors and missing-model handling.
 - Improved validation for image and archive inputs.
 - First startup now uses the documented default admin password 'changeme'.
