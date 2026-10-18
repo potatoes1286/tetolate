@@ -121,6 +121,45 @@ series page. To replace them with notes from an older chapter, use **Series sett
 on that job and select **Use this chapter's notes for the series**.
 You can also keep your current edited notes and continue from that chapter.
 
+#### Terminal access
+
+The CLI connects to the running web server. It needs only Python's standard library.
+Use `tetolate_cli.py` from the repository, or copy it from your container:
+
+```bash
+podman cp tetolate:/app/tetolate_cli.py ./tetolate_cli.py
+python3 tetolate_cli.py login
+python3 tetolate_cli.py status
+python3 tetolate_cli.py jobs list --json
+python3 tetolate_cli.py jobs submit chapter.cbz --set vlm_model=YOUR_MODEL
+python3 tetolate_cli.py jobs wait JOB_ID --timeout 3600
+python3 tetolate_cli.py jobs logs JOB_ID --follow
+python3 tetolate_cli.py jobs export JOB_ID --format webp --output chapter.cbz
+```
+
+The CLI also supports the non-editor web actions:
+
+```bash
+python3 tetolate_cli.py vlm test --category default
+python3 tetolate_cli.py jobs submit --images page1.png page2.png
+python3 tetolate_cli.py series upload SERIES_ID chapter1.cbz chapter2.cbz --first-chapter 1
+python3 tetolate_cli.py jobs set-translated-title JOB_ID "English title"
+python3 tetolate_cli.py jobs translate-title JOB_ID
+python3 tetolate_cli.py jobs retry-title-translation JOB_ID
+python3 tetolate_cli.py jobs page JOB_ID 0 --kind final --output page.png
+python3 tetolate_cli.py password
+```
+
+Login asks for the admin password and saves a separate control token in
+`~/.config/tetolate/cli.json` (or under `XDG_CONFIG_HOME`). Use `--server` for another
+server, `login --read-only` for read access, and `logout` to revoke the current token.
+Tokens can also be created and revoked under **Terminal access** on the admin page.
+
+For agents, use `--json`, `--help`, and `schema --json`. Credentials can come from
+`TETOLATE_SERVER_URL` and `TETOLATE_CONTROL_TOKEN`; environment values override saved
+credentials. Use `--settings-file` for VLM keys. The container also includes the
+client as `tetolate`.
+
 #### Prompts
 
 VLM prompts are plain text files in `data/prompts/`. They are read for each request, so edits apply to the next pass without restarting. See `data/prompts/README.md` for placeholder and custom-directory details.

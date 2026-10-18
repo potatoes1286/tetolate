@@ -59,6 +59,7 @@ from web_pages import (
 import web_security
 from web_series import SeriesManagerMixin, chapter_filename_key, chapter_order
 from web_storage import write_json_atomic
+from web_control_auth import ControlAuthMixin
 
 
 LOGGER = logging.getLogger(__name__)
@@ -134,8 +135,11 @@ UPLOAD_PAGE_IMAGE_ACCEPT = (
 )
 
 
-class UploadRequestTooLarge(Exception):
+class UploadRequestTooLarge(HTTPException):
     """Raised when an upload request exceeds the configured byte limit."""
+
+    def __init__(self) -> None:
+        super().__init__(413, "Upload request is too large.")
 
 
 class UploadSizeLimitMiddleware:
@@ -145,8 +149,9 @@ class UploadSizeLimitMiddleware:
         self.app = app
 
     @staticmethod
-    async def _send_too_large(send: Any) -> None:
-        body = b'{"detail":"Upload request is too large."}'
+    async def _send_too_large(send: Any, control: bool = False) -> None:
+        body = (b'{"error":{"code":"too_large","message":"Upload request is too large."}}'
+                if control else b'{"detail":"Upload request is too large."}')
         await send(
             {
                 "type": "http.response.start",
@@ -161,11 +166,14 @@ class UploadSizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("path") != "/upload" or scope.get("method") != "POST":
+        path = scope.get("path", "")
+        upload = path in {"/upload", "/api/v1/jobs"} or ("/series/" in path and path.endswith("/upload"))
+        if scope.get("type") != "http" or not upload or scope.get("method") != "POST":
             await self.app(scope, receive, send)
             return
 
-        manager = getattr(getattr(self.app, "state", None), "manager", None)
+        owner = scope.get("app", self.app)
+        manager = getattr(getattr(owner, "state", None), "manager", None)
         config = getattr(manager, "config", None)
         max_bytes = getattr(config, "max_upload_bytes", None)
         if not isinstance(max_bytes, int) or max_bytes <= 0:
@@ -179,7 +187,7 @@ class UploadSizeLimitMiddleware:
             except (TypeError, ValueError):
                 declared_length = None
             if declared_length is not None and declared_length > max_bytes:
-                await self._send_too_large(send)
+                await self._send_too_large(send, path.startswith("/api/v1/"))
                 return
 
         received = 0
@@ -205,7 +213,7 @@ class UploadSizeLimitMiddleware:
             await self.app(scope, limited_receive, tracking_send)
         except UploadRequestTooLarge:
             if not response_started:
-                await self._send_too_large(send)
+                await self._send_too_large(send, path.startswith("/api/v1/"))
             else:
                 raise
 CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -1173,6 +1181,87 @@ async def write_uploaded_images_as_cbz(
     return total_written, upload_names_summary(names)
 
 
+async def submit_uploaded_series(manager, code, series_id, chapters, first_chapter, options):
+    """Validate and register a whole chapter batch before queueing any chapter."""
+    prepared = []
+    committed = []
+    try:
+        manager.get_series(code, series_id)
+        uploads = non_empty_uploads(chapters)
+        if not uploads or len(uploads) > 200:
+            raise HTTPException(400, "Select 1-200 CBZ or ZIP chapters.")
+        first = Decimal(chapter_order(first_chapter))
+        ordered = sorted(uploads, key=lambda item: chapter_filename_key(upload_filename(item)))
+        orders = [chapter_order(str(first + index)) for index in range(len(ordered))]
+        for item, order in zip(ordered, orders):
+            manager.validate_series_chapter(code, series_id, order)
+            filename = upload_filename(item)
+            if Path(filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
+                raise HTTPException(400, "Chapters must use .cbz or .zip extensions.")
+            job_id = manager.create_job_id(code)
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            prepared.append((job_id, filename, order))
+            await write_uploaded_file_to_path(item, manager.input_path(code, job_id),
+                                              manager.config.max_upload_bytes, "Uploaded chapter")
+            await run_in_threadpool(validate_uploaded_comic_archive, manager.input_path(code, job_id), filename)
+        with manager._lock:
+            try:
+                for job_id, filename, order in prepared:
+                    manager.submit_job(code, job_id, filename, **options, series_id=series_id,
+                                       chapter=order, enqueue_job=False)
+            except Exception:
+                for job_id, _, _ in prepared:
+                    shutil.rmtree(manager.job_dir(code, job_id))
+                prepared.clear()
+                raise
+            committed = [job_id for job_id, _, _ in prepared]
+            # A scheduling failure must not remove work that can already be queued.
+            prepared.clear()
+            manager.enqueue_ready_series_jobs()
+        return committed
+    except Exception:
+        for job_id, _, _ in prepared:
+            shutil.rmtree(manager.job_dir(code, job_id))
+        raise
+    finally:
+        for item in chapters:
+            await item.close()
+
+
+async def probe_vlm_connection(manager, endpoint_value, token_value="", category=None, job_id=None):
+    """Use the same credential selection, persistence, and errors for both APIs."""
+    try:
+        endpoint = validate_vlm_base_url(endpoint_value, "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    supplied_token = parse_auth_token_form(token_value)
+    if category is None and job_id is not None:
+        raise HTTPException(400, "jobId requires category.")
+    saved_token = None
+    same_job_endpoint = False
+    if category is not None:
+        category = manager.validate_category(category)
+        if job_id is not None:
+            job_id = manager.validate_job_id(job_id)
+            status = manager.load_status(category, job_id)
+            if status is None:
+                raise HTTPException(404, "Unknown job.")
+            same_job_endpoint = manager.status_vlm_base_url(status).rstrip("/") == endpoint.rstrip("/")
+            if supplied_token is None and same_job_endpoint:
+                saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
+    if supplied_token is not None and same_job_endpoint:
+        manager.update_job_auth_tokens(category, job_id, vlm_auth_token=supplied_token,
+                                       paddleocr_vl_auth_token=None)
+    saved_token = saved_token or manager.saved_vlm_token(endpoint)
+    try:
+        models = await run_in_threadpool(manager.probe_vlm_models, endpoint, supplied_token or saved_token)
+    except Exception as exc:
+        raise HTTPException(502, vlm_probe_failure_detail(endpoint, exc, supplied_token or saved_token)) from None
+    if supplied_token is not None:
+        manager.remember_vlm_token(endpoint, supplied_token)
+    return {"ok": True, "models": models, "message": f"Connected. Found {len(models)} model(s)."}
+
+
 def quality_for_display(value: Any, default: int) -> int:
     try:
         return validate_output_quality(value, "quality")
@@ -1320,7 +1409,7 @@ def optional_non_negative_int(value: Any, label: str) -> int | None:
     return parsed
 
 
-class JobManager(SeriesManagerMixin, EditorManagerMixin):
+class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
     def __init__(self, config: WebConfig) -> None:
         self.config = config
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
@@ -2750,6 +2839,8 @@ class JobManager(SeriesManagerMixin, EditorManagerMixin):
             "cbzTitleMode": str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL),
             "cbzAltTitleInNotes": bool(status.get("cbzAltTitleInNotes")),
             "titleTranslationWarning": str(status.get("titleTranslationWarning") or ""),
+            "titleTranslationAttempted": bool(status.get("titleTranslationAttempted")),
+            "titleTranslationSkipped": bool(status.get("titleTranslationSkipped")),
             "pauseAfterOcr": pause_after_ocr,
             "proofreadTranslations": proofread_translations,
             "writeTranslationNotes": write_translation_notes,
@@ -4559,6 +4650,39 @@ def admin_is_authenticated(request: Request, manager: JobManager) -> bool:
     return manager.admin_session_is_valid(token)
 
 
+CONTROL_OPTION_FIELDS = {
+    "thinking_budget_tokens": "thinkingBudgetTokens", "vlm_base_url": "vlmBaseUrl",
+    "vlm_model": "vlmModel", "pause_after_ocr": "pauseAfterOcr",
+    "proofread_translations": "proofreadTranslations", "write_translation_notes": "writeTranslationNotes",
+    "alt_placement_enabled": "altPlacementEnabled", "source_language": "sourceLanguage",
+    "ocr_engine": "ocrEngine", "paddleocr_vl_server_url": "paddleocrVlServerUrl",
+    "paddleocr_vl_model": "paddleocrVlModel", "ocr_page_workers": "ocrPageWorkers",
+    "lama_workers": "lamaWorkers", "imagemagick_workers": "imagemagickWorkers",
+    "auto_translate_comicinfo_title": "autoTranslateComicInfoTitle",
+}
+
+
+def resolve_control_settings(manager: JobManager, code: str, data: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
+    defaults = manager.load_category_advanced_options(code)
+    if job_id is not None:
+        defaults.update(manager.load_status(code, job_id) or {})
+    options = {key: data.get(key, defaults[field]) for key, field in CONTROL_OPTION_FIELDS.items()}
+    options["thinking_budget_tokens"] = parse_thinking_budget_form(
+        str(options["thinking_budget_tokens"]), manager.config.default_thinking_budget_tokens,
+    )
+    options["vlm_base_url"] = parse_vlm_base_url_form(options["vlm_base_url"], manager.config)
+    options["vlm_model"] = parse_vlm_model_form(options["vlm_model"])
+    options["source_language"] = parse_source_language_form(options["source_language"], manager.config.default_source_language)
+    options["ocr_engine"] = parse_ocr_engine_form(options["ocr_engine"], manager.config.default_ocr_engine)
+    options["paddleocr_vl_server_url"] = parse_paddleocr_vl_server_url_form(options["paddleocr_vl_server_url"], manager.config)
+    options["paddleocr_vl_model"] = parse_optional_text_form(options["paddleocr_vl_model"], manager.config.default_paddleocr_vl_model)
+    for key, label in (("ocr_page_workers", "OCR workers"), ("lama_workers", "LaMa workers"), ("imagemagick_workers", "ImageMagick workers")):
+        options[key] = parse_page_workers_form(str(options[key]), label)
+    for key in ("vlm_auth_token", "paddleocr_vl_auth_token"):
+        options[key] = parse_auth_token_form(data.get(key, ""))
+    return options
+
+
 def require_admin(request: Request) -> JobManager:
     manager = manager_from_request(request)
     if not admin_is_authenticated(request, manager):
@@ -4614,19 +4738,39 @@ def create_app(config_path: Path | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def require_admin_session(request: Request, call_next: Any) -> Any:
+        from web_control_api import error_response
         public_login = (
             request.url.path == "/admin" and request.method == "GET"
         ) or (
             request.url.path == "/admin/login" and request.method == "POST"
+        ) or (
+            request.url.path == "/api/v1/auth/login" and request.method == "POST"
         )
+        if request.url.path == "/api/v1/auth/login" and not mutation_request_is_same_origin(request):
+            return error_response(403, "Cross-origin mutation rejected.")
         if not public_login:
             manager = getattr(request.app.state, "manager", None)
             authenticated = isinstance(manager, JobManager) and admin_is_authenticated(
                 request,
                 manager,
             )
+            authorization = request.headers.get("authorization", "")
+            if request.url.path.startswith("/api/v1/") and authorization:
+                scheme, _, token = authorization.partition(" ")
+                record = manager.authenticate_control_token(token) if (
+                    isinstance(manager, JobManager) and scheme.lower() == "bearer" and len(token) <= 256
+                ) else None
+                if record is None:
+                    return error_response(401, "Invalid or revoked control token.")
+                self_revoke = request.method == "DELETE" and request.url.path == f'/api/v1/tokens/{record["id"]}'
+                if record["readOnly"] and request.method not in {"GET", "HEAD", "OPTIONS"} and not self_revoke:
+                    return error_response(403, "This control token is read-only.")
+                request.state.control_auth = record
+                authenticated = True
             if not authenticated:
                 if request.url.path.startswith("/api/"):
+                    if request.url.path.startswith("/api/v1/"):
+                        return error_response(401, "Control token or admin login required.")
                     return JSONResponse(
                         {"detail": "Admin login required."},
                         status_code=401,
@@ -4637,6 +4781,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 request
             ):
                 if request.url.path.startswith("/api/"):
+                    if request.url.path.startswith("/api/v1/"):
+                        return error_response(403, "Cross-origin mutation rejected.")
                     return JSONResponse(
                         {"detail": "Cross-origin mutation rejected."},
                         status_code=403,
@@ -4650,6 +4796,19 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         response = await call_next(request)
         response.headers.setdefault("Cache-Control", "no-store")
         return response
+
+    @app.post("/admin/control-tokens")
+    async def create_control_token(request: Request, name: str = Form(...), read_only: str | None = Form(None)) -> HTMLResponse:
+        manager = require_admin(request)
+        record = manager.create_control_token(name, parse_checkbox(read_only))
+        from web_pages import base_page, escape
+        return base_page("Control token", f'<h1>Control token</h1><p>Copy this token now. It is only shown once.</p><pre>{escape(record["token"])}</pre><p><a href="/admin">Back to admin</a></p>')
+
+    @app.post("/admin/control-tokens/{token_id}/revoke")
+    async def revoke_control_token(request: Request, token_id: str) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.revoke_control_token(token_id)
+        return RedirectResponse("/admin", status_code=303)
 
     @app.get("/")
     async def index() -> RedirectResponse:
@@ -4957,12 +5116,6 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     ) -> RedirectResponse:
         manager = require_admin(request)
         manager.get_series(code, series_id)
-        uploads = non_empty_uploads(chapters)
-        if not uploads or len(uploads) > 200:
-            raise HTTPException(400, "Select 1-200 CBZ or ZIP chapters.")
-        first = Decimal(chapter_order(first_chapter))
-        ordered = sorted(uploads, key=lambda item: chapter_filename_key(upload_filename(item)))
-        orders = [chapter_order(str(first + index)) for index in range(len(ordered))]
         form = await request.form()
         options = {
             "translation_notes": str(form.get("translation_notes", "")),
@@ -4984,41 +5137,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             "alt_placement_enabled": parse_checkbox(form.get("enable_alt_placement")),
             "auto_translate_comicinfo_title": parse_checkbox(form.get("auto_translate_comicinfo_title")),
         }
-        prepared: list[tuple[str, str, str]] = []
-        try:
-            for item, order in zip(ordered, orders):
-                manager.validate_series_chapter(code, series_id, order)
-                filename = upload_filename(item)
-                if Path(filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
-                    raise HTTPException(400, "Chapters must use .cbz or .zip extensions.")
-                job_id = manager.create_job_id(code)
-                manager.job_dir(code, job_id).mkdir(parents=True)
-                prepared.append((job_id, filename, order))
-                await write_uploaded_file_to_path(item, manager.input_path(code, job_id),
-                                                  manager.config.max_upload_bytes, "Uploaded chapter")
-                await run_in_threadpool(validate_uploaded_comic_archive, manager.input_path(code, job_id), filename)
-            # Register the full batch before any chapter can run.
-            with manager._lock:
-                try:
-                    for job_id, filename, order in prepared:
-                        manager.submit_job(code, job_id, filename, **options, series_id=series_id,
-                                           chapter=order, enqueue_job=False)
-                except Exception:
-                    for job_id, _, _ in prepared:
-                        shutil.rmtree(manager.job_dir(code, job_id))
-                    prepared.clear()
-                    raise
-                # Jobs are now committed. A scheduling error must not remove
-                # files for work that may already have entered the queue.
-                prepared.clear()
-                manager.enqueue_ready_series_jobs()
-        except Exception:
-            for job_id, _, _ in prepared:
-                shutil.rmtree(manager.job_dir(code, job_id))
-            raise
-        finally:
-            for item in chapters:
-                await item.close()
+        await submit_uploaded_series(manager, code, series_id, chapters, first_chapter, options)
         return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
@@ -5118,76 +5237,16 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         endpoint_value = data.get("vlmBaseUrl")
         if not isinstance(endpoint_value, str):
             raise HTTPException(status_code=400, detail="vlmBaseUrl must be a string.")
-        try:
-            endpoint = validate_vlm_base_url(endpoint_value, "")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
         token_value = data.get("vlmAuthToken", "")
         if not isinstance(token_value, str):
             raise HTTPException(status_code=400, detail="vlmAuthToken must be a string.")
-        supplied_token = parse_auth_token_form(token_value)
-
         category_value = data.get("category")
         job_id_value = data.get("jobId")
-        if category_value is None and job_id_value is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="jobId requires category.",
-            )
-        saved_token: str | None = None
-        same_job_endpoint = False
-        if category_value is not None:
-            if not isinstance(category_value, str):
-                raise HTTPException(
-                    status_code=400,
-                    detail="category must be a string.",
-                )
-            category = manager.validate_category(category_value)
-            if job_id_value is not None:
-                if not isinstance(job_id_value, str):
-                    raise HTTPException(status_code=400, detail="jobId must be a string.")
-                job_id = manager.validate_job_id(job_id_value)
-                job_status = manager.load_status(category, job_id)
-                if job_status is None:
-                    raise HTTPException(status_code=404, detail="Unknown job.")
-                same_job_endpoint = manager.status_vlm_base_url(job_status).rstrip("/") == endpoint.rstrip("/")
-                if supplied_token is None and same_job_endpoint:
-                    saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
-
-        if supplied_token is not None and same_job_endpoint:
-            manager.update_job_auth_tokens(
-                category,
-                job_id,
-                vlm_auth_token=supplied_token,
-                paddleocr_vl_auth_token=None,
-            )
-
-        saved_token = saved_token or manager.saved_vlm_token(endpoint)
-        try:
-            models = await run_in_threadpool(
-                manager.probe_vlm_models,
-                endpoint,
-                supplied_token or saved_token,
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=vlm_probe_failure_detail(
-                    endpoint,
-                    exc,
-                    supplied_token or saved_token,
-                ),
-            ) from None
-        if supplied_token is not None:
-            manager.remember_vlm_token(endpoint, supplied_token)
-        return JSONResponse(
-            {
-                "ok": True,
-                "models": models,
-                "message": f"Connected. Found {len(models)} model(s).",
-            }
-        )
+        for key, value in (("category", category_value), ("jobId", job_id_value)):
+            if value is not None and not isinstance(value, str):
+                raise HTTPException(400, f"{key} must be a string.")
+        return JSONResponse(await probe_vlm_connection(manager, endpoint_value, token_value,
+                                                        category_value, job_id_value))
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
     async def editor_v2_data(
@@ -5658,6 +5717,10 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             },
         )
 
+    from web_control_api import install_control_api
+    install_control_api(app, manager_from_request, resolve_control_settings,
+                        write_uploaded_file_to_path, validate_uploaded_comic_archive,
+                        write_uploaded_images_as_cbz, submit_uploaded_series, probe_vlm_connection)
     return app
 
 

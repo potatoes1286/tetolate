@@ -17,6 +17,7 @@ TL;DR lots of housecleaning + no more image building needed anymore, now pushed 
 - Added category and job naming controls.
 - Added translation of titles and editing titles.
 - Added series with ordered chapter uploads and automatic translation-note sharing.
+- Added CLI and JSON API access to non-editor web actions, with revocable tokens.
 
 ### Changed
 

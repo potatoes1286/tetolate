@@ -137,6 +137,8 @@ COPY --from=app-dependency-builder /app/.venv /app/.venv
 
 WORKDIR /app
 COPY *.py ./
+COPY tetolate_cli.py /usr/local/bin/tetolate
+RUN chmod 0755 /usr/local/bin/tetolate
 COPY web_editor/ ./web_editor/
 COPY data/config /app/data/config
 COPY data/bundled_fonts /app/data/bundled_fonts

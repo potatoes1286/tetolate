@@ -66,6 +66,7 @@ secrets.*
 **/.tetolate-web-state.json
 **/.vlm-secrets.json
 **/.series.json
+**/.control-tokens.json
 **/.tetolate-web.lock
 /web_jobs/
 

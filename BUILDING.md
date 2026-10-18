@@ -58,6 +58,69 @@ extra as well as the smaller default LaMa environment.
 The first render downloads the SHA-256-verified `big-lama.pt` model to the Torch
 cache. LaMa uses the bundled runner's fixed settings and needs no configuration.
 
+## Control API and CLI
+
+`python tetolate_cli.py` controls an existing server; `run.sh` runs a separate local
+translation. The CLI has no third-party dependencies. It does not read or edit the
+server's job files.
+
+The JSON API is under `/api/v1/`. It accepts browser admin sessions or
+`Authorization: Bearer <control-token>`. Control tokens apply only to this API;
+VLM API keys are separate. Tokens survive restarts until revoked. The server stores
+token hashes; the CLI stores its token in a mode-0600 configuration file.
+
+Use `schema --json` for endpoint and settings schemas. Settings use snake_case
+names, such as `vlm_model`, `pause_after_ocr`, and `ocr_page_workers`. Partial updates
+keep other settings. For example:
+
+```bash
+python tetolate_cli.py categories settings default --set vlm_model=YOUR_MODEL
+python tetolate_cli.py jobs settings JOB_ID --set thinking_budget_tokens=2048
+python tetolate_cli.py jobs submit chapter.cbz --series SERIES_ID --chapter 2
+python tetolate_cli.py series notes SERIES_ID --file notes.txt
+```
+
+`--json` writes results to stdout and errors to stderr. `logs --follow --json`
+writes one JSON event per log chunk, with a cursor for continued reads. `wait`
+and `export` accept `--timeout` and `--interval`; `--request-timeout` limits each
+HTTP request. A paused job returns an error so an agent can request OCR review or
+resume. Export reuses an existing archive; use `--regenerate` to replace it and
+apply new title options.
+
+Non-editor web actions are available through the CLI. `jobs submit --images`
+keeps file order and converts pages to PNG. `series upload` validates the whole
+batch, sorts filenames naturally (2 before 10), and assigns chapter orders from
+`--first-chapter`, adding 1 per file. It accepts 1-200 CBZ/ZIP files and the same
+`--set`, `--settings-file`, and `--notes-file` options as job submission.
+
+`vlm test` returns the endpoint's model list. It uses `--job`, `--category`, or
+the server default; `--endpoint` overrides the address. Supply a key through
+`--settings-file` with `vlm_auth_token`. Saved keys are reused only for the same
+endpoint. A successful test remembers the key. Select a model with `settings`.
+
+`jobs set-translated-title JOB_ID ""` clears the translation. `translate-title`
+translates the job name; `retry-title-translation` uses ComicInfo's title when
+present and permits the VLM to decline translation. Its `--manual-title` option
+does not call the VLM. `jobs pages` lists pages; `jobs page` downloads one.
+Both support `--kind original|final`. `rerun --pages` accepts ranges such as
+`0-3,6,8`; `--from ocr_merge` matches the web OCR & Merge pass.
+
+`tokens create NAME` asks for the admin password and shows a new token once
+without replacing the saved login. It supports `--read-only` and
+`--password-stdin`. `password` changes the admin password and signs out browser
+sessions; control tokens remain valid until revoked. For non-interactive use,
+`password --password-stdin` reads current, new, and confirmation passwords as
+three lines. Passwords and keys are not command-line arguments.
+
+These actions use `/api/v1/auth/password`, `/vlm/test`, job title and page
+routes, and `/categories/{code}/series/{series_id}/upload`. Read-only tokens
+cannot change passwords, probe endpoints, or submit work. Page-editor actions
+are not exposed through the control API or CLI.
+
+Exit codes: 0 success, 1 server/job error or paused job, 2 invalid arguments or
+local files, 3 authentication/permission error, 4 wait/follow timeout, 5 connection
+error. Non-interactive login requires `--password-stdin`.
+
 ## Container Image
 
 Build the complete web application, ImageMagick, LaMa, and PaddleOCR runtime:

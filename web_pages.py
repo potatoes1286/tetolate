@@ -306,6 +306,15 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
 {categories_html}
 <h2>Active Job</h2>
 {active_html}
+<details><summary>Terminal access</summary>
+<p>Control tokens are separate from VLM API keys and stay valid until revoked.</p>
+<form action="/admin/control-tokens" method="post">
+  <label>Token name<br><input name="name" type="text" maxlength="100" required></label>
+  <label><input name="read_only" type="checkbox" value="1"> Read-only</label>
+  <button type="submit">Create control token</button>
+</form>
+<ul>{''.join(f'<li>{escape(item["name"])} ({"read-only" if item["readOnly"] else "read/write"}) <form action="/admin/control-tokens/{escape(item["id"])}/revoke" method="post"><button type="submit">Revoke</button></form></li>' for item in manager.list_control_tokens())}</ul>
+</details>
 <h2>Change Admin Password</h2>
 <form action="/admin/password" method="post">
   <label>Current password<br><input name="current_password" type="password" required autocomplete="current-password"></label>
