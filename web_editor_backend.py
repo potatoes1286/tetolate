@@ -1009,6 +1009,110 @@ class EditorManagerMixin:
         )
         return pages, resume_by_page
 
+    def regenerate_editor_v2_stage(self, code: str, job_id: str, stage: str, page: int) -> str:
+        if stage not in editor_v2.EDITOR_STAGE_ORDER:
+            raise HTTPException(404, "Unknown editor stage.")
+        with self._lock:
+            self.require_editable_job(code, job_id, stage)
+            self.original_page_path(code, job_id, page)
+            phase = {"ocr": "ocr_raw", "text": "ocr_structured", "placement": "placements"}[stage]
+            self.rerun_completed_job_pages(code, job_id, [page], phase, editor_stage_only=stage)
+            return phase
+
+    def mark_editor_stage_complete(self, code: str, job_id: str, page: int, stage: str, before: list[str] | None = None) -> None:
+        with self._lock:
+            manifest = self.load_editor_v2_manifest(code, job_id)
+            if stage == "placement":
+                editor_v2.mark_regenerated(manifest, page, "placements")
+            else:
+                value = manifest.setdefault("pages", {}).setdefault(str(page), {})
+                last = "ocr" if stage == "ocr" else "translation"
+                cutoff = editor_v2.STAGE_ORDER.index(last)
+                pending = set(value.get("pendingStages", [])) - set(editor_v2.STAGE_ORDER[:cutoff + 1])
+                pending.add(last)
+                value["pendingStages"] = [item for item in editor_v2.STAGE_ORDER if item in pending]
+                value["pendingBases"] = {key: val for key, val in value.get("pendingBases", {}).items() if key in pending and key != last}
+                value["pendingBases"][last] = before or self.editor_v2_snapshot(code, job_id, manifest, page, (last,))[last]
+                value["stale"] = list(editor_v2.STAGE_ORDER[cutoff + 1:])
+            manifest["revision"] += 1
+            manifest["updatedAt"] = editor_v2.utc_now()
+            self.save_editor_v2_manifest(code, job_id, manifest)
+
+    def queue_finish_editor_edits(self, code: str, job_id: str) -> list[int]:
+        with self._lock:
+            status = self.require_editable_job(code, job_id, "placement")
+            manifest = self.load_editor_v2_manifest(code, job_id)
+            pending = editor_v2.pending_changes(manifest)
+            pages = [index for index, original in enumerate(self.original_page_files(code, job_id))
+                     if index in pending or not (self.final_pages_dir(code, job_id) / f"{original.stem}.png").is_file()]
+            snapshots = []
+            for page in pages:
+                records = self.editor_v2_payload(code, job_id, "placement", page)["recordsByArtifact"]
+                text = {item["boxno"]: item.get("englishText", "") for item in records["translations"]}
+                snapshots.append({"page": page, "records": records,
+                    "entries": self.editor_v2_render_entries(code, job_id, page, records["placements"], text)})
+            self.invalidate_translated_cbz_archives(code, job_id)
+            if not pages:
+                return []
+            write_json_atomic(self.editor_meta_dir(code, job_id) / "finish_edits.json", snapshots)
+            status.update(status="queued", phase="Queued", page=None, finishedAt=None,
+                          pendingFinishEdits=True, message="Queued to apply editor results without VLM calls.")
+            self.save_status(code, job_id, status)
+            self.enqueue(code, job_id)
+            return pages
+
+    def run_finish_editor_edits(self, code: str, job_id: str) -> None:
+        status = self.load_status(code, job_id)
+        status.update(status="running", phase="Applying edits", message="Rendering saved edits without VLM calls.")
+        self.save_status(code, job_id, status)
+        try:
+            snapshots = json.loads((self.editor_meta_dir(code, job_id) / "finish_edits.json").read_text())
+            self.invalidate_translated_cbz_archives(code, job_id)
+            final_dir = self.final_pages_dir(code, job_id)
+            final_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".finish-", dir=final_dir) as directory:
+                prepared = []
+                for snapshot in snapshots:
+                    page, records = snapshot["page"], snapshot["records"]
+                    source, _ = self.current_editor_clean_source(code, job_id, page,
+                        [*records["ocr_structured"], *records["clean_boxes"]])
+                    original = self.original_page_path(code, job_id, page)
+                    rendered = Path(directory) / f"{original.stem}.png"
+                    overlay_text.overlay_text(snapshot["entries"], source, rendered)
+                    prepared.append((rendered, final_dir / rendered.name, source))
+                for rendered, destination, source in prepared:
+                    rendered.replace(destination)
+                    cleaned = self.output_dir(code, job_id) / "pages/cleaned" / destination.name
+                    cleaned.parent.mkdir(parents=True, exist_ok=True)
+                    if source != cleaned:
+                        shutil.copyfile(source, cleaned)
+                        mask = source.with_suffix(".mask.png")
+                        if mask.is_file():
+                            saved_mask = self.output_dir(code, job_id) / "debug/masks" / destination.name
+                            saved_mask.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(mask, saved_mask)
+            with self._lock:
+                manifest = self.load_editor_v2_manifest(code, job_id)
+                for snapshot in snapshots:
+                    page = snapshot["page"]
+                    for artifact, values in snapshot["records"].items():
+                        write_json_atomic(self.output_dir(code, job_id) / "data" / artifact / f"page_{page:04d}.json", values)
+                    write_json_atomic(self.output_dir(code, job_id) / "data/render_entries" / f"page_{page:04d}.json", snapshot["entries"])
+                    manifest["pages"].setdefault(str(page), {}).update(pendingStages=[], pendingBases={}, stale=[])
+                manifest["revision"] += 1
+                manifest["updatedAt"] = editor_v2.utc_now()
+                self.save_editor_v2_manifest(code, job_id, manifest)
+            status.update(status="complete", phase="Complete", page=None, returnCode=0,
+                          message="Editor results applied. No OCR or VLM calls were made.")
+            status.pop("pendingFinishEdits", None)
+        except Exception:
+            status.update(status="failed", phase="Failed", returnCode=1,
+                          message="Could not apply editor results. Check the server log and retry.")
+            raise
+        finally:
+            status["finishedAt"] = editor_v2.utc_now()
+            self.save_status(code, job_id, status)
+
     def rerun_editor_v2_page(self, code: str, job_id: str, stage: str, page: int) -> str:
         try:
             editor_v2.editor_stage_members(stage)

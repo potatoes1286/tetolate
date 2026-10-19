@@ -451,6 +451,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--editor-stage-only", choices=("ocr", "text", "placement"), help=argparse.SUPPRESS)
     parser.add_argument(
         "--thinking-budget-tokens",
         type=int,
@@ -4772,6 +4773,9 @@ def run_single_page_resume_pipeline(
 
     other_pages = pages_except(pages, target_page)
     selected_pages = pages_in_range(pages, target_page, target_page)
+    stage_only = getattr(args, "editor_stage_only", None)
+    if stage_only is not None and phase != {"ocr": "ocr_raw", "text": "ocr_structured", "placement": "placements"}.get(stage_only):
+        raise PipelineError("Editor stage-only reruns require that stage's first pipeline pass.")
 
     if phase == "ocr_raw":
         raw_existing = load_phase_records(
@@ -4790,6 +4794,11 @@ def run_single_page_resume_pipeline(
         )
     else:
         raw_by_page = load_phase_records(args.output_dir, "ocr_raw", pages, "OCR records")
+
+    if stage_only == "ocr":
+        run_ocr_merge_phase(pages, raw_by_page, args.output_dir, config,
+                            start_page=target_page, end_page=target_page)
+        return
 
     if phase in {"ocr_raw", "ocr_structured"}:
         structured_existing = load_structured_records(args.output_dir, other_pages)
@@ -4840,7 +4849,7 @@ def run_single_page_resume_pipeline(
     else:
         attach_translations(selected_pages, args.output_dir, structured_by_page)
 
-    if args.translation_boxno is not None:
+    if args.translation_boxno is not None or stage_only == "text":
         return
 
     if phase in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements"}:
@@ -5205,6 +5214,8 @@ def needs_vlm(args: argparse.Namespace) -> bool:
         return False
     if args.stop_after == "ocr_merged":
         return False
+    if getattr(args, "editor_stage_only", None) == "ocr":
+        return False
     return args.resume_from not in {"render", "package"}
 
 
@@ -5225,6 +5236,8 @@ def main() -> int:
             raise PipelineError("--resume-page requires --resume-from.")
         if args.resume_from is None and args.single_page:
             raise PipelineError("--single-page requires --resume-from.")
+        if getattr(args, "editor_stage_only", None) and not args.single_page:
+            raise PipelineError("--editor-stage-only requires --single-page.")
         if args.translation_boxno is not None:
             if args.translation_boxno < 0:
                 raise PipelineError("--translation-boxno must be zero or greater.")

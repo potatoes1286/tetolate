@@ -3242,7 +3242,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 )
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
-            self.required_status_vlm_model(status)
+            if not status.get("pendingFinishEdits"):
+                self.required_status_vlm_model(status)
 
             pending_reruns = status.get("pendingPageReruns")
             first_pending = (
@@ -3334,10 +3335,13 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         resume_from: str = "ocr_raw",
         translation_boxno: int | None = None,
         page_resume_from: dict[int, str] | None = None,
+        editor_stage_only: str | None = None,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
         resume_from = RERUN_STAGE_MAP.get(resume_from, resume_from)
+        if editor_stage_only not in {None, "ocr", "text", "placement"}:
+            raise HTTPException(400, "Unknown editor stage.")
         if resume_from not in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             raise HTTPException(status_code=400, detail="Unsupported rerun stage.")
         if translation_boxno is not None:
@@ -3402,7 +3406,13 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                         detail=f"Unsupported rerun stage for page {page}: {page_stage}.",
                     )
                 page_reruns.append({"page": page, "resumeFrom": page_stage})
-            if any(item["resumeFrom"] != "render" for item in page_reruns):
+                if editor_stage_only:
+                    page_reruns[-1]["editorStageOnly"] = editor_stage_only
+                    last = "ocr" if editor_stage_only == "ocr" else "translation"
+                    manifest = self.load_editor_v2_manifest(code, job_id)
+                    previous_base = manifest.get("pages", {}).get(str(page), {}).get("pendingBases", {}).get(last)
+                    page_reruns[-1]["editorStageBase"] = previous_base or self.editor_v2_snapshot(code, job_id, manifest, page, (last,))[last]
+            if editor_stage_only != "ocr" and any(item["resumeFrom"] != "render" for item in page_reruns):
                 self.required_status_vlm_model(status)
             first_rerun = page_reruns[0]
 
@@ -3549,6 +3559,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 package_count = int(status.get("packageGenerationCount", 0)) + 1
             except (TypeError, ValueError):
                 package_count = 1
+
+            self.invalidate_translated_cbz_archives(code, job_id)
             status.update(
                 {
                     "status": "queued",
@@ -4010,6 +4022,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
         translation_boxno: int | None = None,
+        editor_stage_only: str | None = None,
     ) -> list[str]:
         command = [
             sys.executable,
@@ -4050,7 +4063,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 ),
             ]
         )
-        if resume_from in {"render", "package"}:
+        if resume_from in {"render", "package"} or editor_stage_only == "ocr":
             model = self.status_vlm_model(status)
             if model:
                 command.extend(["--vlm-model", model])
@@ -4110,6 +4123,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             command.extend(["--resume-page", str(resume_page or 0)])
         if single_page and resume_from in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             command.append("--single-page")
+        if editor_stage_only:
+            command.extend(["--editor-stage-only", editor_stage_only])
         if translation_boxno is not None:
             command.extend(["--translation-boxno", str(translation_boxno)])
         if skip_package or resume_from != "package":
@@ -4352,6 +4367,10 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             }:
                 continue
             page_reruns.append({"page": page, "resumeFrom": resume_from})
+            stage_only = item.get("editorStageOnly")
+            if stage_only in {"ocr", "text", "placement"}:
+                page_reruns[-1]["editorStageOnly"] = stage_only
+                page_reruns[-1]["editorStageBase"] = item.get("editorStageBase")
         if not page_reruns:
             status.update(
                 {
@@ -4412,6 +4431,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                     single_page=True,
                     skip_package=True,
                     translation_boxno=translation_boxno,
+                    **({"editor_stage_only": page_rerun["editorStageOnly"]} if "editorStageOnly" in page_rerun else {}),
                 ),
                 f"rerun page {page}",
             )
@@ -4452,6 +4472,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 )
             else:
                 for page_rerun in page_reruns:
+                    if "editorStageOnly" in page_rerun:
+                        self.mark_editor_stage_complete(code, job_id, page_rerun["page"], page_rerun["editorStageOnly"], page_rerun.get("editorStageBase"))
+                        continue
                     self.clear_editor_changes_for_pages(
                         code,
                         job_id,
@@ -4511,6 +4534,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             "jobId": job_id,
             "createdAt": now_utc(),
         }
+        if status.get("pendingFinishEdits"):
+            self.run_finish_editor_edits(code, job_id)
+            return
         if status.get("pendingPackageOnly"):
             self.run_package_generation_job(code, job_id, status)
             return
@@ -5315,12 +5341,24 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         request: Request, code: str, job_id: str, stage: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
-        resume_from = manager.rerun_editor_v2_page(code, job_id, stage, page)
+        resume_from = manager.regenerate_editor_v2_stage(code, job_id, stage, page)
         return JSONResponse(
             {"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": resume_from}
         )
 
-    @app.post("/api/job/{code}/{job_id}/editor/v2/regenerate-changes")
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/regenerate")
+    async def regenerate_editor_page(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        phase = manager.rerun_editor_v2_page(code, job_id, "placement", page)
+        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": phase})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/finish-edits")
+    async def finish_editor_edits(request: Request, code: str, job_id: str) -> JSONResponse:
+        manager = manager_from_request(request)
+        pages = manager.queue_finish_editor_edits(code, job_id)
+        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}", "pages": pages})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/regenerate-all-pages")
     async def regenerate_editor_v2_changes(
         request: Request, code: str, job_id: str
     ) -> JSONResponse:

@@ -55,15 +55,14 @@ function setOcrAreaRunning(running) {
 
 function setQueuedAction(action, message = "") {
   queuedAction = action;
-  const regenerateButton = byId("regenerate");
-  const regenerateAllButton = byId("regenerate-all");
   const busy = !!action;
-  regenerateButton.disabled = busy;
-  regenerateAllButton.disabled = busy;
-  regenerateButton.setAttribute("aria-busy", String(busy));
-  regenerateAllButton.setAttribute("aria-busy", String(busy));
-  regenerateButton.textContent = action === "downstream" ? "Queueing regeneration..." : "Regenerate downstream";
-  regenerateAllButton.textContent = action === "all" ? "Queueing regeneration..." : "Regenerate all changes";
+  for (const [key, label] of [["stage", "Regenerate stage"], ["page", "Regenerate page"],
+    ["all-pages", "Regenerate all pages"], ["finish-edits", "Finish Edits"]]) {
+    const button = byId(key === "finish-edits" ? key : `regenerate-${key}`);
+    button.disabled = busy;
+    button.setAttribute("aria-busy", String(busy));
+    button.textContent = action === key ? "Queueing..." : label;
+  }
   renderTools();
   if (message) setStatus(message);
 }
@@ -219,17 +218,6 @@ function imageUrl(kind = "original") {
 
 function currentStageState() {
   return store.document?.stageStates?.[store.stage] || {};
-}
-
-function downstreamRegenerationTooltip() {
-  if (store.stage === "text") return "Save this page, then rerun only the pipeline steps required by its changed fields. Unchanged steps are kept.";
-  const definitions = store.document?.stageDefinitions || [];
-  const labels = new Map(definitions.map((item) => [item.key, item.label]));
-  const current = definitions.find((item) => item.key === store.stage);
-  const later = (current?.invalidates || []).map((stage) => labels.get(stage) || stage);
-  if (!later.includes("Render")) later.push("Render");
-  const passList = later.length ? later.join(", ") : "later stages";
-  return `Save this page, then rerun ${passList} for this page. ${current?.label || "The current stage"} is used as input and is not regenerated.`;
 }
 
 async function loadTypesettingView() {
@@ -781,7 +769,7 @@ async function resetStage() {
     await loadRevisions();
     setStatus(config.reviewCheckpoint === "ocr"
       ? "Stage reset. Continue processing when the OCR review is complete."
-      : document.rerunFrom ? "Stage reset. Regenerate downstream to update the output."
+      : document.rerunFrom ? "Stage reset. Regenerate page to update the output."
         : "Stage reset. No changes need regeneration.");
   } catch (error) {
     setStatus(error.message, true);
@@ -813,26 +801,21 @@ async function toggleFreeze(scope) {
   } catch (error) { setStatus(error.message, true); }
 }
 
-async function regenerate() {
-  if (queuedAction) return;
-  if (store.dirty) await save();
-  if (store.dirty) return;
-  setQueuedAction("downstream", "Adding this page regeneration to the job queue...");
+async function regenerate(action) {
+  if (queuedAction || loading || resetting || ocrAreaRunning) return;
+  if (action === "stage" && !confirm("Regenerate this stage on this page? Unprotected generated values can be replaced. Later stages stay out of date.")) return;
+  if (action === "finish-edits" && !confirm("Apply all saved edits as the job output? This uses LaMa and ImageMagick only. No OCR or VLM calls are made; untranslated boxes stay untranslated. Old CBZ exports will be deleted.")) return;
+  setQueuedAction(action, "Saving edits and queueing the action...");
+  byId("editor-app").inert = true;
   try {
-    const result = await api.regenerate(store.stage, store.page);
+    if (store.dirty) await save();
+    if (store.dirty) { setQueuedAction(""); return; }
+    const result = action === "stage" ? await api.regenerate(store.stage, store.page)
+      : action === "page" ? await api.regeneratePage(store.page)
+        : action === "all-pages" ? await api.regenerateAllPages() : await api.finishEdits();
     window.location.href = result.url;
   } catch (error) { setQueuedAction(""); setStatus(error.message, true); }
-}
-
-async function regenerateAll() {
-  if (queuedAction) return;
-  if (store.dirty) await save();
-  if (store.dirty) return;
-  setQueuedAction("all", "Adding all changed pages to the job queue...");
-  try {
-    const result = await api.regenerateChanges();
-    window.location.href = result.url;
-  } catch (error) { setQueuedAction(""); setStatus(error.message, true); }
+  finally { byId("editor-app").inert = false; }
 }
 
 async function continueProcessing() {
@@ -960,7 +943,6 @@ function render() {
   byId("freeze-page").dataset.tooltip = pageFrozen
     ? "Allow later reruns to replace values on this page. Individual protected edits remain protected."
     : "Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page.";
-  byId("regenerate").dataset.tooltip = downstreamRegenerationTooltip();
 }
 
 store.addEventListener("change", render);
@@ -975,8 +957,9 @@ byId("save").addEventListener("click", save);
 byId("reset-stage").addEventListener("click", resetStage);
 byId("freeze-stage").addEventListener("click", () => toggleFreeze("stage"));
 byId("freeze-page").addEventListener("click", () => toggleFreeze("page"));
-byId("regenerate").addEventListener("click", regenerate);
-byId("regenerate-all").addEventListener("click", regenerateAll);
+for (const action of ["stage", "page", "all-pages", "finish-edits"]) {
+  byId(action === "finish-edits" ? action : `regenerate-${action}`).addEventListener("click", () => regenerate(action));
+}
 byId("continue-processing").addEventListener("click", continueProcessing);
 for (const id of ["job-notes", "page-notes"]) byId(id).addEventListener("input", () => {
   store.document.translationNotes = {

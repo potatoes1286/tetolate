@@ -1715,8 +1715,10 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <button id="reset-stage" type="button" data-tooltip="Restore the generated records for this stage on this page. Remove saved and unsaved edits and protection flags. Other stages, pages, and saved translation notes are kept.">Reset stage</button>
     <button id="freeze-stage" type="button" data-tooltip="Protect all current values in this stage on this page. Later reruns keep them until you unprotect the stage.">Protect stage</button>
     <button id="freeze-page" type="button" data-tooltip="Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page."{complete_only}>Protect page</button>
-    <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the pipeline steps required by its changed fields."{complete_only}>Regenerate downstream</button>
-    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rendered pages."{complete_only}>Regenerate all changes</button>
+    <button id="regenerate-stage" type="button" data-tooltip="Rebuild only this tab on this page. Protected edits are kept; later stages remain out of date."{complete_only}>Regenerate stage</button>
+    <button id="regenerate-page" type="button" data-tooltip="Save this page and rerun only the steps required by its saved edits, through final rendering."{complete_only}>Regenerate page</button>
+    <button id="regenerate-all-pages" type="button" data-tooltip="Rerun only the required steps on all pages with saved edits."{complete_only}>Regenerate all pages</button>
+    <button id="finish-edits" type="button" data-tooltip="Apply saved edits to final output using only LaMa and ImageMagick. No OCR or VLM calls. Deletes old CBZ exports."{complete_only}>Finish Edits</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>
   </div>

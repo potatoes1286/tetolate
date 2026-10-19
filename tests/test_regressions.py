@@ -4653,11 +4653,11 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('id="record-resizer"', body)
             self.assertIn('id="inspector-resizer"', body)
             self.assertIn(
-                "rerun only the pipeline steps required by its changed fields.",
+                "rerun only the steps required by its saved edits",
                 body,
             )
             self.assertIn(
-                "Rerun every page with saved editor changes",
+                "Rerun only the required steps on all pages with saved edits",
                 body,
             )
             self.assertIn('id="editor-tooltip"', body)
@@ -4672,7 +4672,7 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('let typesettingView = localStorage.getItem(typesettingViewKey) || "current"', editor_script)
             self.assertIn('"Retranslate page"', editor_script)
             self.assertIn('"Retranslate selected"', editor_script)
-            self.assertIn('"Queueing regeneration..."', editor_script)
+            self.assertIn('"Queueing..."', editor_script)
 
     def test_ocr_review_checkpoint_exposes_only_ocr_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

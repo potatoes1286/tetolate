@@ -78,7 +78,7 @@ test("reset clears the current draft and undo history, then loads generated reco
 test("reset still reports regeneration when other pending changes remain", async () => {
   const page = setup({rerunFrom: "placements"});
   await page.context.resetStage();
-  assert.match(page.calls.at(-1)[1], /Regenerate downstream/);
+  assert.match(page.calls.at(-1)[1], /Regenerate page/);
 });
 
 test("cancel keeps all edits without a request", async () => {

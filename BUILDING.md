@@ -190,12 +190,19 @@ Preview refreshes cleaning automatically after clean-box edits, undo/redo, and
 reset. Navigation does not wait for LaMa; late results from another page are
 ignored. Current prepares an exact view when selected. Last Render shows the
 last pipeline output. These views do not save edits or update final pages/exports;
-use Save and Regenerate downstream for those. Press Delete to remove a selected clean box.
+use Save and Regenerate page for those. Press Delete to remove a selected clean box.
 Use Add clean box in Typesetting to draw an area for LaMa to clean without
 adding text. Move, resize, or delete the box; Preview refreshes automatically.
-Save and Regenerate downstream apply it to final pages
+Save and Regenerate page apply it to final pages
 and CBZ exports without OCR or VLM calls. Undo/redo includes clean boxes;
 Reset stage removes them on that page. Cleaning can alter artwork in the area.
+Regenerate stage rebuilds only the selected tab on this page, keeping
+protected edits. Regenerate page and Regenerate all pages run only the steps
+required by saved edits. Finish Edits renders the current saved values with
+LaMa and ImageMagick, without OCR or VLM calls, and marks them as final output.
+It does not translate unfinished text. These actions and export generation
+delete old CBZ exports; generate a new archive afterward.
+
 Typesetting also has manual rotation (±180°) and horizontal/vertical skew
 (±60°). Set them to zero to remove the effect. Positive rotation is clockwise;
 horizontal skew, vertical skew, then rotation are applied about the box center.

@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Editor actions now regenerate one stage, one changed page, all changed pages, or finish edits without VLM calls; regeneration and export generation remove old CBZ exports.
 - Preview reuses saved cleaned pages, shows text before LaMa finishes, and refreshes clean-box edits without blocking navigation.
 - Renamed Render to Last Render, removed duplicate clean-box controls, and moved status below the editor actions.
 - Local CLI access no longer needs login; remote access still requires a token.

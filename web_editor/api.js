@@ -53,8 +53,16 @@ export class EditorApi {
     return request(`${this.root}/pages/${page}/stages/${stage}/regenerate`, { method: "POST" });
   }
 
-  regenerateChanges() {
-    return request(`${this.root}/regenerate-changes`, { method: "POST" });
+  regeneratePage(page) {
+    return request(`${this.root}/pages/${page}/regenerate`, {method: "POST"});
+  }
+
+  regenerateAllPages() {
+    return request(`${this.root}/regenerate-all-pages`, {method: "POST"});
+  }
+
+  finishEdits() {
+    return request(`${this.root}/finish-edits`, {method: "POST"});
   }
 
   continueProcessing() {
