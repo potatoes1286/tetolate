@@ -88,6 +88,42 @@ class EditorTransformTests(unittest.TestCase):
         self.assertEqual({field: restored["recordsByArtifact"]["placements"][0][field]
                           for field in self.transform}, self.transform)
 
+    def test_zero_angles_replace_previously_saved_transforms(self):
+        self.save(self.transform)
+        zeros = dict.fromkeys(self.transform, 0)
+        self.save(zeros)
+        restarted = web_app.JobManager(self.manager.config)
+        restarted.initialize_web_state()
+        record = restarted.editor_v2_payload(self.code, self.job_id, "placement", 0)["recordsByArtifact"]["placements"][0]
+        self.assertEqual({field: record[field] for field in zeros}, zeros)
+        entry = restarted.editor_v2_render_entries(self.code, self.job_id, 0, [record])[0]
+        self.assertEqual(overlay_text.text_transform_args(entry, 96, 116), [])
+
+    def test_cleared_font_size_stays_automatic_after_save_reload_and_render_input(self):
+        original = self.manager.load_editor_v2_baseline(self.code, self.job_id, "placements", 0)
+        for generated_size in (None, 2.75):
+            with self.subTest(generated_size=generated_size):
+                baseline = copy.deepcopy(original)
+                if generated_size is not None:
+                    baseline[0]["fontSizeWidthPercent"] = generated_size
+                write_json_atomic(self.manager.editor_v2_generated_path(self.code, self.job_id, "placements", 0), baseline)
+                self.save({"fontSizeWidthPercent": 1.65})
+                payload = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
+                records = copy.deepcopy(payload["recordsByArtifact"]["placements"])
+                records[0].pop("fontSizeWidthPercent")
+                self.manager.save_editor_v2_update(self.code, self.job_id, 0, "placement", {
+                    "baseRevision": payload["revision"], "recordsByArtifact": {"placements": records},
+                })
+                restarted = web_app.JobManager(self.manager.config)
+                restarted.initialize_web_state()
+                record = restarted.editor_v2_payload(self.code, self.job_id, "placement", 0)["recordsByArtifact"]["placements"][0]
+                self.assertNotIn("fontSizeWidthPercent", record)
+                self.assertNotIn("fontSizeWidthPercent", restarted.editor_v2_render_entries(self.code, self.job_id, 0, [record])[0])
+                self.assertGreater(record["_autoFontSizeWidthPercent"], 0)
+                protected = editor_v2.effective_records(restarted.load_editor_v2_manifest(self.code, self.job_id),
+                    0, "placements", baseline, protected_only=True)
+                self.assertNotIn("fontSizeWidthPercent", protected[0])
+
     def test_manual_overrides_reach_final_renderer_but_model_values_are_not_accepted(self):
         original = self.manager.original_page_path(self.code, self.job_id, 0)
         page = translate_cbz.Page(0, original)

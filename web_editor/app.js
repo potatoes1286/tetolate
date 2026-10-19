@@ -10,7 +10,8 @@ const AVAILABLE_STAGES = Array.isArray(config.availableStages)
 const api = new EditorApi(config.category, config.jobId);
 const store = new EditorStore(config);
 const byId = (id) => document.getElementById(id);
-const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus, (page, records) => api.textLayers(page, records));
+const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus, (page, records) => api.textLayers(page, records),
+  {select: selectOcrBoxes, has: ocrBoxesChecked});
 const mergeSelection = new Set();
 let loading = false;
 let resetting = false;
@@ -230,8 +231,13 @@ async function loadTypesettingView() {
     canvas.load(imageUrl("original"), { showPlacementText: false });
     setStatus("Original page loaded.");
   } else if (typesettingView === "preview") {
-    canvas.load(imageUrl("cleaned"));
-    setStatus("Typesetting Preview uses cached ImageMagick text layers.");
+    try {
+      setStatus("Checking the cleaning mask for Preview...");
+      const result = await api.preview("placement", store.page, [],
+        store.records.ocr_structured || [], store.records.clean_boxes || []);
+      canvas.load(result.url);
+      setStatus("Preview uses the current cleaning mask and cached ImageMagick text layers.");
+    } catch (error) { setStatus(error.message, true); }
   } else if (typesettingView === "render") {
     canvas.load(imageUrl("final"), { showPlacementText: false });
     setStatus("Last saved render loaded.");
@@ -287,6 +293,26 @@ function recordsForList() {
   return result;
 }
 
+function rawBoxesFor(artifact, record) {
+  if (artifact === "ocr_raw") return [record];
+  const sources = new Set(record.sourceBoxnos || []);
+  return (store.records.ocr_raw || []).filter((raw) => sources.has(raw.boxno));
+}
+
+function ocrBoxesChecked(artifact, record) {
+  const raw = rawBoxesFor(artifact, record);
+  return raw.length > 0 && raw.every((item) => mergeSelection.has(item.recordId));
+}
+
+function selectOcrBoxes(hit, extend = false) {
+  if (!extend) mergeSelection.clear();
+  if (!hit) { store.select(null, null); return; }
+  const raw = rawBoxesFor(hit.artifact, hit.record);
+  const remove = extend && raw.length > 0 && raw.every((item) => mergeSelection.has(item.recordId));
+  for (const item of raw) remove ? mergeSelection.delete(item.recordId) : mergeSelection.add(item.recordId);
+  store.select(hit.artifact, hit.record.recordId);
+}
+
 function renderStageTabs() {
   for (const button of document.querySelectorAll(".stage-tab")) {
     const stage = button.dataset.stage;
@@ -301,39 +327,50 @@ function renderStageTabs() {
 
 function renderRecordList() {
   const target = byId("record-list");
+  const focused = document.activeElement;
+  const focusedId = focused?.dataset?.recordId;
   const filter = byId("record-filter").value.trim().toLowerCase();
   target.replaceChildren();
   for (const { artifact, record } of recordsForList()) {
     const displayRecord = ["placements", "ocr_structured"].includes(artifact)
       ? { ...record, englishText: (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "" }
       : record;
-    const label = recordLabel(store.stage, displayRecord);
+    const label = recordLabel(store.stage, displayRecord, artifact);
     if (filter && !label.toLowerCase().includes(filter)) continue;
-    const row = document.createElement("button");
-    row.type = "button";
+    const row = document.createElement("div");
     row.className = "record-row";
-    row.classList.toggle("active", store.selection?.recordId === record.recordId);
-    row.textContent = label;
+    row.classList.toggle("active", store.selection?.recordId === record.recordId ||
+      (store.stage === "ocr" && ocrBoxesChecked(artifact, record)));
+    const select = document.createElement("button"); select.type = "button";
+    select.dataset.recordId = record.recordId;
+    select.className = "record-select"; select.textContent = label;
     const meta = document.createElement("span");
     meta.className = "record-meta";
     const protection = store.document?.protection?.recordStates?.[record.recordId];
     meta.textContent = `${artifact.replace("ocr_", "").replace("placements", "placement")}${protection ? ` · ${protection.protected ? "protected" : "unprotected"} ${protection.kind}` : ""}`;
-    row.append(meta);
+    select.append(meta);
     if (store.stage === "ocr" && artifact === "ocr_raw") {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
+      checkbox.dataset.recordId = record.recordId;
       checkbox.checked = mergeSelection.has(record.recordId);
       checkbox.title = "Select raw box for grouping";
       checkbox.addEventListener("click", (event) => {
         event.stopPropagation();
         checkbox.checked ? mergeSelection.add(record.recordId) : mergeSelection.delete(record.recordId);
+        store.select(artifact, record.recordId);
       });
       row.prepend(checkbox);
     }
-    row.addEventListener("click", () => store.select(artifact, record.recordId));
+    select.addEventListener("click", (event) => store.stage === "ocr"
+      ? selectOcrBoxes({artifact, record}, event.ctrlKey || event.metaKey || event.shiftKey)
+      : store.select(artifact, record.recordId));
+    row.append(select);
     target.append(row);
   }
   if (!target.childElementCount) target.textContent = "No records.";
+  if (focusedId) [...target.querySelectorAll("button, input")]
+    .find((element) => element.dataset.recordId === focusedId && element.type === focused.type)?.focus({preventScroll: true});
 }
 
 function sourceRecord(record) {
@@ -348,7 +385,8 @@ function renderInspector() {
   const form = byId("record-form");
   form.replaceChildren();
   const record = store.selectedRecord();
-  byId("selection-label").textContent = record ? `Box ${record.boxno ?? "?"}` : "No selection";
+  const cleanOnly = store.selection?.artifact === "clean_boxes";
+  byId("selection-label").textContent = record ? `${cleanOnly ? "Clean box" : "Box"} ${record.boxno ?? "?"}` : "No selection";
   byId("notes-panel").hidden = store.stage !== "text";
   if (store.document) {
     byId("job-notes").value = store.document.translationNotes?.job || "";
@@ -357,7 +395,7 @@ function renderInspector() {
   if (!record) return;
   const formTarget = { ...store.selection, stage: store.stage };
 
-  if (store.stage === "placement") {
+  if (store.stage === "placement" && !cleanOnly) {
     const source = sourceRecord(record);
     if (source) {
       const label = document.createElement("label");
@@ -374,8 +412,9 @@ function renderInspector() {
   const displayRecord = store.stage === "text"
     ? {...record, englishText: (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || ""}
     : record;
-  for (const [name, labelText, type, value, choices] of fieldsFor(store.stage, displayRecord, store.document?.fonts || [])) {
-    const wrapper = document.createElement("label");
+  for (const [name, labelText, type, value, choices] of fieldsFor(store.stage, displayRecord, store.document?.fonts || [], store.selection.artifact)) {
+    const isAngle = ["rotation", "skewX", "skewY"].includes(name);
+    const wrapper = document.createElement(isAngle ? "div" : "label");
     wrapper.className = "field-row";
     wrapper.append(document.createTextNode(labelText));
     let input;
@@ -394,18 +433,37 @@ function renderInspector() {
       if (type === "checkbox") input.checked = !!value;
       else input.value = value;
       if (name === "fontSizeWidthPercent") { input.min = "0.05"; input.max = "100"; input.step = "0.05"; }
-      if (["rotation", "skewX", "skewY"].includes(name)) {
+      if (isAngle) {
         const limit = name === "rotation" ? 180 : 60;
         input.min = String(-limit); input.max = String(limit); input.step = "0.5";
       }
     }
     input.name = name;
     values[name] = input;
-    input.addEventListener("change", () => applyInspector(values, formTarget, name));
-    wrapper.append(input);
+    if (isAngle) {
+      const controls = document.createElement("div"); controls.className = "angle-controls";
+      const slider = document.createElement("input"); slider.type = "range";
+      slider.min = input.min; slider.max = input.max; slider.step = input.step; slider.value = value;
+      slider.tabIndex = -1;
+      slider.setAttribute("aria-label", labelText);
+      input.setAttribute("aria-label", labelText);
+      slider.addEventListener("input", () => { input.value = slider.value; });
+      slider.addEventListener("change", () => {
+        input.value = slider.value;
+        applyInspector(values, formTarget, name);
+      });
+      input.addEventListener("change", () => {
+        slider.value = input.value === "" ? "0" : input.value;
+        applyInspector(values, formTarget, name);
+      });
+      controls.append(input, slider); wrapper.append(controls);
+    } else {
+      input.addEventListener("change", () => applyInspector(values, formTarget, name));
+      wrapper.append(input);
+    }
 
     const overrideField = ["left", "top", "right", "bottom"].includes(name)
-      ? (store.stage === "placement" ? "placementRegion" : "region")
+      ? (store.stage === "placement" && !cleanOnly ? "placementRegion" : "region")
       : name;
     const fieldTarget = store.stage === "text" ? textFieldTarget(store.records, record, name) : null;
     const protectedValue = protectionFor(fieldTarget ? fieldTarget.recordId : record.recordId, overrideField);
@@ -433,7 +491,12 @@ function renderInspector() {
   const relatedIds = store.stage === "text"
     ? [...new Set([record.recordId, textFieldTarget(store.records, record, "englishText").recordId].filter(Boolean))]
     : [record.recordId];
-  if (relatedIds.some((rid) => store.document?.protection?.recordStates?.[rid] || store.document?.protection?.records?.[rid])) {
+  if (cleanOnly) {
+    const note = document.createElement("p");
+    note.textContent = "LaMa cleans this area without adding text. It can alter artwork. Select Current or Preview to refresh cleaning.";
+    form.append(note);
+    addButton(form, "Delete clean box", deleteSelected);
+  } else if (relatedIds.some((rid) => store.document?.protection?.recordStates?.[rid] || store.document?.protection?.records?.[rid])) {
     const row = document.createElement("div"); row.className = "field-protection";
     const toggle = document.createElement("button"); toggle.type = "button"; toggle.textContent = "Toggle record protection";
     toggle.dataset.tooltip = "Protect or unprotect all saved changes for this record.";
@@ -466,8 +529,11 @@ function applyInspector(inputs, target, changedField) {
     values[name] = input.type === "checkbox" ? input.checked : input.value;
     if (input.type === "number" && input.value !== "") values[name] = Number(input.value);
   }
-  const updated = applyFields(target.stage, record, values);
-  store.updateRecord(target.artifact, target.recordId, updated);
+  const updated = applyFields(target.stage, record, values, target.artifact);
+  store.mutate((records) => {
+    const items = records[target.artifact];
+    items[items.indexOf(record)] = updated;
+  });
 }
 
 function addButton(target, text, handler, title = "", tooltip = "", shortcut = "") {
@@ -484,7 +550,7 @@ function renderTools() {
   if (store.stage === "ocr") {
     addButton(target, "Add raw box", () => canvas.startDraw(addRawBox), "Draw a missing OCR box", "Draw one raw OCR box manually.", "z");
     addButton(target, ocrAreaRunning ? "OCR running..." : "OCR area", () => canvas.startDraw(ocrArea), "OCR a selected region", "Draw a region to scan only that area. The result adds raw OCR boxes and merges the new boxes with one another.", "x");
-    addButton(target, "Group checked", groupChecked, "Merge checked raw boxes", "Create one merged OCR group from the checked raw boxes. Those boxes are removed from their existing groups.", "c");
+    addButton(target, "Group checked", groupChecked, "Merge checked raw boxes", "Ctrl/Shift-click boxes or check raw rows, then group them. Double-click the page to cycle overlapping boxes.", "c");
     addButton(target, "Split group", splitGroup, "Split the selected merged group", "Delete the selected merged group and create one separate group for each of its source OCR boxes.", "v");
     addButton(target, "Delete", deleteSelected, "Delete selected", "Delete the selected raw box or merged group.", "b");
   } else if (store.stage === "text") {
@@ -519,6 +585,9 @@ function renderTools() {
       const button = addButton(target, label, () => selectTypesettingView(view), "", tooltip, shortcuts[index]);
       button.classList.toggle("active", typesettingView === view);
     }
+    addButton(target, "Add clean box", () => canvas.startDraw(addCleanBox), "Draw a clean-only area",
+      "LaMa cleans this rectangle without adding text or calling the VLM. Select Current or Preview to refresh cleaning.", "b");
+    addButton(target, "Delete clean box", deleteSelected, "Delete the selected clean box");
   }
   if (ocrAreaRunning) {
     for (const button of target.querySelectorAll("button")) button.disabled = true;
@@ -537,11 +606,25 @@ function renderTools() {
   }
 }
 
+function addCleanBox(region) {
+  store.mutate((records) => {
+    const boxes = records.clean_boxes ||= [];
+    const record = {page: store.page, boxno: nextBoxno(boxes), recordId: newRecordId("clean"), region};
+    boxes.push(record);
+    store.selection = {artifact: "clean_boxes", recordId: record.recordId};
+  });
+  setStatus("Clean box added. Select Current or Preview to refresh cleaning.");
+}
+
 function addRawBox(region) {
   store.mutate(() => {
     const records = store.records.ocr_raw || (store.records.ocr_raw = []);
     const record = { page: store.page, boxno: nextBoxno(records), recordId: newRecordId("raw"), region, text: "", ocrSource: "manual" };
     records.push(record); store.selection = { artifact: "ocr_raw", recordId: record.recordId };
+    const groups = store.records.ocr_merged ||= [];
+    groups.push({page: store.page, boxno: nextBoxno(groups), recordId: newRecordId("group"),
+      sourceBoxnos: [record.boxno], sourceTexts: [""], text: "", region: [...region], ocrSource: "manual"});
+    mergeSelection.clear(); mergeSelection.add(record.recordId);
   });
 }
 
@@ -579,12 +662,19 @@ function groupChecked() {
   if (!raw.length) return setStatus("Check one or more raw boxes first.", true);
   store.mutate(() => {
     const selectedBoxnos = new Set(raw.map((item) => item.boxno));
+    const boxno = nextBoxno(store.records.ocr_merged || []);
+    const rawByBoxno = new Map((store.records.ocr_raw || []).map((item) => [item.boxno, item]));
     store.records.ocr_merged = (store.records.ocr_merged || []).filter((group) => {
       group.sourceBoxnos = (group.sourceBoxnos || []).filter((boxno) => !selectedBoxnos.has(boxno));
+      const remaining = group.sourceBoxnos.map((source) => rawByBoxno.get(source)).filter(Boolean);
+      if (remaining.length) {
+        group.sourceTexts = remaining.map((item) => item.text || "");
+        group.text = group.sourceTexts.join(""); group.region = unionRegion(remaining);
+      }
       return group.sourceBoxnos.length;
     });
     const groups = store.records.ocr_merged;
-    const record = { page: store.page, boxno: nextBoxno(groups), recordId: newRecordId("group"), sourceBoxnos: raw.map((item) => item.boxno), sourceTexts: raw.map((item) => item.text || ""), text: raw.map((item) => item.text || "").join(""), region: unionRegion(raw) };
+    const record = { page: store.page, boxno, recordId: newRecordId("group"), sourceBoxnos: raw.map((item) => item.boxno), sourceTexts: raw.map((item) => item.text || ""), text: raw.map((item) => item.text || "").join(""), region: unionRegion(raw) };
     groups.push(record); store.selection = { artifact: "ocr_merged", recordId: record.recordId };
     mergeSelection.clear();
   });
@@ -606,7 +696,12 @@ function splitGroup() {
 
 function deleteSelected() {
   if (!store.selection) return;
-  if (store.stage === "placement") return setStatus("Reject the source record in Text & Translation.", true);
+  if (store.stage === "placement") {
+    if (store.selection.artifact !== "clean_boxes") return setStatus("Select a clean box to delete it. Reject text in Text & Translation.", true);
+    store.deleteSelected();
+    setStatus("Clean box deleted. Select Current or Preview to refresh cleaning.");
+    return;
+  }
   if (store.stage === "text") {
     const record = store.selectedRecord();
     store.mutate((records) => {
@@ -648,6 +743,7 @@ async function save() {
   try {
     const document = await api.save(store.stage, store.page, {
       baseRevision: store.document.revision,
+      deletedOcrGroupIds: store.stage === "ocr" ? (store.records.ocr_removed_groups || []) : undefined,
       recordsByArtifact: Object.fromEntries(
         [...SCREEN[store.stage].artifacts, ...(store.stage === "text" ? ["translations"] : [])]
           .map((artifact) => [artifact, store.records[artifact] || []]),
@@ -798,6 +894,7 @@ async function exactPreview() {
       store.page,
       store.records.placements || [],
       store.records.ocr_structured || [],
+      store.records.clean_boxes || [],
     );
     canvas.load(result.url, { showPlacementText: false });
     if (result.cleanedWithLama) {

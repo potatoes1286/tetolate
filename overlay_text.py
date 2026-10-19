@@ -27,6 +27,7 @@ DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3
 DEFAULT_MIN_POINT_SIZE = 14
 DEFAULT_RENDER_BLEED = 8
+TEXT_LAYOUT_VERSION = 2
 TEXT_TRANSFORM_LIMITS = {"rotation": 180, "skewX": 60, "skewY": 60}
 PAGE_HEIGHT_MIN_POINT_RATIO = 0.008
 PAGE_HEIGHT_MAX_POINT_RATIO = 0.024
@@ -42,6 +43,7 @@ TARGET_WIDTH_FILL_RATIO = 0.78
 MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.82
 MAX_COMFORTABLE_WIDTH_FILL_RATIO = 0.92
 TALL_CAPTION_ASPECT_RATIO = 1.75
+WIDE_CAPTION_ASPECT_RATIO = 4.0
 TALL_CAPTION_TARGET_HEIGHT_FILL_RATIO = 0.62
 TALL_CAPTION_TARGET_WIDTH_FILL_RATIO = 0.80
 TALL_CAPTION_MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.86
@@ -588,6 +590,22 @@ def explicit_caption_layout(
 
     minimum = min_point_size(entry, image_height)
     point_size_cap = aesthetic_max_point_size(entry, width, height, image_height)
+    # Relax the short-box height cap only if a larger, single-line layout fits.
+    # Otherwise keep the original search and scoring unchanged.
+    if text.strip() and "\n" not in text and width >= height * WIDE_CAPTION_ASPECT_RATIO:
+        single_line_cap = min(
+            page_relative_max_point_size(image_height, width, height),
+            width * AESTHETIC_WIDTH_POINT_RATIO,
+            height / APPROX_LINE_HEIGHT_RATIO,
+        )
+        configured = configured_max_point_size(entry)
+        if configured is not None:
+            single_line_cap = min(single_line_cap, configured)
+        for size in range(math.floor(single_line_cap), math.floor(point_size_cap), -1):
+            lines = layout_lines_for_point_size(text, float(size), width)
+            if len(lines) == 1 and lines_fit(lines, float(size), width, height, font):
+                point_size_cap = float(size)
+                break
     technical_best_size = technical_fitting_point_size(
         text, width, height, image_height, font
     )

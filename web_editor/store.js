@@ -127,6 +127,7 @@ export class EditorStore extends EventTarget {
     if (!this.selection) return;
     const { artifact, recordId } = this.selection;
     this.mutate(() => {
+      if (artifact === "ocr_merged") (this.records.ocr_removed_groups ||= []).push(recordId);
       this.records[artifact] = (this.records[artifact] || []).filter(
         (item) => item.recordId !== recordId,
       );

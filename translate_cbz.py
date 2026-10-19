@@ -4137,11 +4137,13 @@ def clean_render_page(
     records: list[dict[str, Any]],
     output_dir: Path,
     lama_session: lama_inpaint.LaMaSession | None,
+    clean_boxes: list[dict[str, Any]] | None = None,
 ) -> None:
     print(f"Clean page {page.index}", file=sys.stderr)
     cleaned_path = cleaned_pages_dir(output_dir) / f"{page.image_path.stem}.png"
     keep_mask = debug_image_path(output_dir, "masks", page)
     clean_entries = [record for record in records if not record["openLettering"]]
+    clean_entries.extend(clean_boxes or [])
     clean_text_regions.clean_text_regions(
         clean_entries,
         page.image_path,
@@ -4234,7 +4236,8 @@ def render_pages(
     ensure_translated_pages(selected_pages, structured_by_page)
     ensure_placed_pages(selected_pages, structured_by_page)
 
-    needs_lama = any(
+    manual_clean_boxes = {page.index: editor_runtime.clean_boxes(page.index) for page in selected_pages}
+    needs_lama = any(manual_clean_boxes.values()) or any(
         not record["openLettering"]
         for page in selected_pages
         for record in structured_by_page[page.index]
@@ -4256,6 +4259,7 @@ def render_pages(
                     structured_by_page[page.index],
                     output_dir,
                     lama_session,
+                    manual_clean_boxes[page.index],
                 )
                 for page in selected_pages
             }

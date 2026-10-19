@@ -197,6 +197,81 @@ document.addEventListener("click", (event) => {
 """
 
 
+CATEGORY_OPTIONS_SCRIPT = """
+<script>
+(() => {
+  const form = document.querySelector("form[data-category-options]");
+  if (!form) return;
+  const status = form.querySelector("[data-category-options-status]");
+  const names = {
+    enable_alt_placement: "alt_placement_enabled", enable_proofreading: "proofread_translations",
+    enable_translation_notes: "write_translation_notes", auto_translate_comicinfo_title: "auto_translate_comicinfo_title",
+    pause_after_ocr: "pause_after_ocr", source_language: "source_language", ocr_engine: "ocr_engine",
+    paddleocr_vl_server_url: "paddleocr_vl_server_url", paddleocr_vl_model: "paddleocr_vl_model",
+    ocr_page_workers: "ocr_page_workers", lama_workers: "lama_workers", imagemagick_workers: "imagemagick_workers",
+    vlm_base_url: "vlm_base_url", vlm_model: "vlm_model", thinking_budget_tokens: "thinking_budget_tokens",
+    translation_notes: "translation_notes",
+  };
+  let pending = Promise.resolve(), active = 0, submitting = false;
+  const failed = new Set(), versions = new Map(), timers = new Map(), sent = new Map();
+  function updateStatus() {
+    if (!active && !timers.size) status.textContent = failed.size
+      ? "Some options were not saved. Change them again to retry."
+      : "Advanced options saved.";
+  }
+  function save(input) {
+    const name = names[input.name];
+    if (!name) return; // Passwords and upload controls are not category defaults.
+    clearTimeout(timers.get(input)); timers.delete(input);
+    if ((input.name !== "vlm_model" && !input.checkValidity()) || (input.type === "number" && input.value === "")) {
+      versions.set(name, (versions.get(name) || 0) + 1);
+      failed.add(name);
+      status.textContent = "Not saved: enter a valid value.";
+      return;
+    }
+    const value = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+    if (sent.get(name) === value && !failed.has(name)) { updateStatus(); return; }
+    const version = (versions.get(name) || 0) + 1;
+    versions.set(name, version);
+    sent.set(name, value);
+    active++;
+    status.textContent = "Saving advanced options...";
+    pending = pending.then(async () => {
+      try {
+        const body = JSON.stringify({[name]: value});
+        const response = await fetch(`/api/v1/categories/${encodeURIComponent(form.dataset.categoryOptions)}/settings`, {
+          method: "PATCH", headers: {"Content-Type": "application/json"},
+          credentials: "same-origin", keepalive: body.length < 16000, body,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (versions.get(name) === version) failed.delete(name);
+      } catch {
+        if (versions.get(name) === version) failed.add(name);
+      } finally {
+        active--;
+        updateStatus();
+      }
+    });
+  }
+  const options = form.querySelector("details");
+  options.addEventListener("change", (event) => save(event.target));
+  options.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!names[input.name]) return;
+    clearTimeout(timers.get(input));
+    timers.set(input, setTimeout(() => save(input), 250));
+    status.textContent = "Saving advanced options...";
+  });
+  form.addEventListener("submit", () => { submitting = true; });
+  window.addEventListener("beforeunload", (event) => {
+    for (const input of [...timers.keys()]) save(input);
+    if (!submitting && (active || failed.size)) { event.preventDefault(); event.returnValue = ""; }
+  });
+})();
+</script>
+"""
+
+
 def escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -677,6 +752,7 @@ def advanced_options_fields(
     test_category: str = "",
     test_job_id: str = "",
     submit_label: str = "",
+    autosave: bool = False,
 ) -> str:
     try:
         budget = _thinking_budget(thinking_budget_tokens)
@@ -725,9 +801,12 @@ def advanced_options_fields(
         if submit_label
         else ""
     )
+    autosave_html = ('<p class="muted" data-category-options-status role="status">'
+                     'Options save automatically, except auth tokens.</p>' if autosave else "")
     return f"""
 <details{open_attr}>
   <summary>{escape(summary)}</summary>
+  {autosave_html}
   <fieldset>
     <legend>Workflow</legend>
     {translation_notes_html}
@@ -875,7 +954,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
     <button type="submit">Create series</button>
   </form>
 </details>
-<form action="/upload" method="post" enctype="multipart/form-data">
+<form action="/upload" method="post" enctype="multipart/form-data" data-category-options="{escape(code)}">
   <input name="category" type="hidden" value="{escape(code)}">
   <label>Series<br><select name="series_id">{series_options(data.get("series", []))}</select></label>
   <label>Chapter order (for series)<br><input name="chapter" type="number" min="0.000001" step="any"></label>
@@ -902,10 +981,12 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
       has_vlm_auth_token=bool(data.get("hasVlmAuthToken")),
       auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
+      autosave=True,
   )}
   <button type="submit">Queue new job</button>
 </form>
 {VLM_CONNECTION_TEST_SCRIPT}
+{CATEGORY_OPTIONS_SCRIPT}
 <h2>Jobs</h2>
 {jobs_html}
 """,

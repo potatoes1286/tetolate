@@ -156,3 +156,9 @@ def apply_protected_records(
         protected_only=True,
         through_stage=through_stage,
     )
+
+
+def clean_boxes(page: int) -> list[dict[str, Any]]:
+    """Manual cleaning has no generated baseline or model-producing stage."""
+    manifest = _load_manifest()
+    return editor_v2.effective_records(manifest, page, "clean_boxes", []) if manifest else []

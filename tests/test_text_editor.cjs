@@ -100,7 +100,7 @@ test("transforms are manual Typesetting fields, default to zero, and clear at ze
     assert.equal(screens.fieldsFor("placement", {}).find(([name]) => name === field)[3], 0);
     const record = screens.applyFields("placement", {}, {[field]: -12.5});
     assert.equal(record[field], -12.5);
-    for (const value of [0, ""]) assert.ok(!(field in screens.applyFields("placement", record, {[field]: value})));
+    for (const value of [0, ""]) assert.equal(screens.applyFields("placement", record, {[field]: value})[field], 0);
   }
 });
 
@@ -111,6 +111,7 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     append(...children) { for (const child of children) { child.parentNode = this; this.children.push(child); } }
     replaceChildren() { this.children = []; }
     addEventListener(name, callback) { this.listeners[name] = callback; }
+    setAttribute(name, value) { this[name] = value; }
   }
   for (const stage of ["ocr", "placement"]) {
     const elements = {};
@@ -135,7 +136,8 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     assert.deepEqual(changes, ["left", "top", "right", "bottom"].map((name) => [stage, name]));
     assert.ok(form.children.some((child) => child.tag === "label"), "other fields stay outside coordinate row");
     if (stage === "placement") for (const name of ["rotation", "skewX", "skewY"]) {
-      const input = form.children.flatMap((child) => child.children).find((child) => child.name === name);
+      const children = (element) => [element, ...(element.children || []).flatMap(children)];
+      const input = children(form).find((child) => child.name === name);
       assert.equal(input.type, "number");
       assert.equal(input.value, 0);
       assert.equal(input.step, "0.5");
@@ -143,8 +145,73 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
       assert.equal(input.max, name === "rotation" ? "180" : "60");
       input.listeners.change();
       assert.deepEqual(changes.at(-1), [stage, name]);
+      const slider = input.parentNode.children.find((child) => child.type === "range");
+      assert.ok(slider, "slider is beside the number input");
+      assert.equal(slider.min, input.min); assert.equal(slider.max, input.max); assert.equal(slider.step, input.step);
+      assert.equal(slider.tabIndex, -1, "Tab skips the slider, not the number input");
+      assert.ok(slider["aria-label"]); assert.ok(input["aria-label"]);
+      slider.value = "-12.5"; slider.listeners.input();
+      assert.equal(input.value, "-12.5");
+      slider.listeners.change();
+      assert.deepEqual(changes.at(-1), [stage, name]);
+      input.value = "0"; input.listeners.change();
+      assert.equal(slider.value, "0");
     }
   }
   const css = fs.readFileSync(path.join(root, "editor.css"), "utf8");
   assert.match(css, /\.field-grid\s*\{[^}]*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
+});
+
+test("zero and blank angles replace old values in the store, drafts, undo and redo", () => {
+  const storeSource = fs.readFileSync(path.join(root, "store.js"), "utf8");
+  const storage = new Map();
+  const Store = vm.runInNewContext(storeSource.replace("export class", "class") + "\nEditorStore", {
+    EventTarget, Event, structuredClone,
+    localStorage: {getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value)},
+  });
+  const apply = app.match(/function applyInspector\(inputs, target, changedField\) \{[\s\S]*?\n\}/)[0];
+  for (const name of ["rotation", "skewX", "skewY"]) for (const value of ["0", ""]) {
+    const store = new Store({category: "default", jobId: "12345678"});
+    storage.clear();
+    store.setDocument({stage: "placement", page: 0, revision: 1,
+      recordsByArtifact: {placements: [{recordId: "box", [name]: 15}]}});
+    vm.runInNewContext(apply + `\napplyInspector(inputs, target, ${JSON.stringify(name)})`, {
+      store, applyFields: screens.applyFields,
+      inputs: {[name]: {type: "number", value}}, target: {stage: "placement", artifact: "placements", recordId: "box"},
+    });
+    assert.equal(store.records.placements[0][name], 0);
+    assert.equal(JSON.parse(storage.get(store.draftKey())).records.placements[0][name], 0);
+    store.undo(); assert.equal(store.records.placements[0][name], 15);
+    store.redo(); assert.equal(store.records.placements[0][name], 0);
+  }
+});
+
+test("clearing font size restores auto in the record, draft, reload, undo and redo", () => {
+  const storage = new Map();
+  const Store = vm.runInNewContext(fs.readFileSync(path.join(root, "store.js"), "utf8").replace("export class", "class") + "\nEditorStore", {
+    EventTarget, Event, structuredClone,
+    localStorage: {getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value)},
+  });
+  const config = {category: "default", jobId: "12345678"};
+  const store = new Store(config);
+  const document = {stage: "placement", page: 0, revision: 1,
+    recordsByArtifact: {placements: [{recordId: "box", fontSizeWidthPercent: 1.65, font: "ComicNeue-Bold.ttf", rotation: 12}]}};
+  store.setDocument(document);
+  const apply = app.match(/function applyInspector\(inputs, target, changedField\) \{[\s\S]*?\n\}/)[0];
+  const context = vm.createContext({store, applyFields: screens.applyFields,
+    inputs: {fontSizeWidthPercent: {type: "number", value: ""}},
+    target: {stage: "placement", artifact: "placements", recordId: "box"}});
+  vm.runInContext(apply + '\napplyInspector(inputs, target, "fontSizeWidthPercent")', context);
+  const isAuto = (record) => assert.equal(Object.hasOwn(record, "fontSizeWidthPercent"), false);
+  isAuto(store.records.placements[0]);
+  assert.equal(store.records.placements[0].font, "ComicNeue-Bold.ttf");
+  assert.equal(store.records.placements[0].rotation, 12);
+  isAuto(JSON.parse(storage.get(store.draftKey())).records.placements[0]);
+  const reloaded = new Store(config); reloaded.setDocument(document);
+  isAuto(reloaded.records.placements[0]);
+  store.undo(); assert.equal(store.records.placements[0].fontSizeWidthPercent, 1.65);
+  store.redo(); isAuto(store.records.placements[0]);
+  context.inputs.fontSizeWidthPercent.value = "2.25";
+  vm.runInContext('applyInspector(inputs, target, "fontSizeWidthPercent")', context);
+  assert.equal(store.records.placements[0].fontSizeWidthPercent, 2.25);
 });

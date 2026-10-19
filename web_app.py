@@ -2139,7 +2139,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         model = data.get("vlmModel")
         if isinstance(model, str):
             try:
-                normalized["vlmModel"] = validate_vlm_model(model)
+                normalized["vlmModel"] = validate_vlm_model(model) if model.strip() else ""
             except ValueError:
                 pass
         for key in (
@@ -3364,7 +3364,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
-            self.required_status_vlm_model(status)
 
             page_count = len(self.original_page_files(code, job_id))
             if page_count <= 0:
@@ -3403,6 +3402,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                         detail=f"Unsupported rerun stage for page {page}: {page_stage}.",
                     )
                 page_reruns.append({"page": page, "resumeFrom": page_stage})
+            if any(item["resumeFrom"] != "render" for item in page_reruns):
+                self.required_status_vlm_model(status)
             first_rerun = page_reruns[0]
 
             if self.has_editor_v2(code, job_id):
@@ -4665,7 +4666,8 @@ CONTROL_OPTION_FIELDS = {
 }
 
 
-def resolve_control_settings(manager: JobManager, code: str, data: dict[str, Any], job_id: str | None = None) -> dict[str, Any]:
+def resolve_control_settings(manager: JobManager, code: str, data: dict[str, Any], job_id: str | None = None,
+                             *, require_model: bool = True) -> dict[str, Any]:
     defaults = manager.load_category_advanced_options(code)
     if job_id is not None:
         defaults.update(manager.load_status(code, job_id) or {})
@@ -4674,7 +4676,8 @@ def resolve_control_settings(manager: JobManager, code: str, data: dict[str, Any
         str(options["thinking_budget_tokens"]), manager.config.default_thinking_budget_tokens,
     )
     options["vlm_base_url"] = parse_vlm_base_url_form(options["vlm_base_url"], manager.config)
-    options["vlm_model"] = parse_vlm_model_form(options["vlm_model"])
+    options["vlm_model"] = (parse_vlm_model_form(options["vlm_model"])
+                            if require_model or options["vlm_model"].strip() else "")
     options["source_language"] = parse_source_language_form(options["source_language"], manager.config.default_source_language)
     options["ocr_engine"] = parse_ocr_engine_form(options["ocr_engine"], manager.config.default_ocr_engine)
     options["paddleocr_vl_server_url"] = parse_paddleocr_vl_server_url_form(options["paddleocr_vl_server_url"], manager.config)
@@ -5383,10 +5386,13 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         data = await request.json()
         records = data.get("records") if isinstance(data, dict) else None
         clean_records = data.get("cleanRecords") if isinstance(data, dict) else None
+        clean_boxes = data.get("cleanBoxes", []) if isinstance(data, dict) else []
         if not isinstance(records, list):
             raise HTTPException(status_code=400, detail="records must be an array.")
         if not isinstance(clean_records, list):
             raise HTTPException(status_code=400, detail="cleanRecords must be an array.")
+        if not isinstance(clean_boxes, list):
+            raise HTTPException(status_code=400, detail="cleanBoxes must be an array.")
         _path, cached, cleaned_with_lama = await run_in_threadpool(
             manager.render_editor_v2_preview,
             code,
@@ -5394,6 +5400,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             page,
             records,
             clean_records,
+            clean_boxes,
         )
         return JSONResponse(
             {

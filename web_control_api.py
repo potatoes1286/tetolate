@@ -87,6 +87,10 @@ class Settings(Input):
         return data
 
 
+class CategorySettings(Settings):
+    translation_notes: str | None = None
+
+
 class SeriesUpdate(Input):
     name: str | None = None
     instructions: str | None = None
@@ -282,13 +286,15 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         return manager.load_category_advanced_options(code)
 
     @router.patch("/categories/{code}/settings")
-    async def update_category_settings(request: Request, code: str, data: Settings):
+    async def update_category_settings(request: Request, code: str, data: CategorySettings):
         manager = get_manager(request)
         manager.validate_category(code)
         changes = data.changes()
         if "paddleocr_vl_auth_token" in changes or changes.get("clear_paddleocr_vl_auth_token"):
             raise HTTPException(400, "Set OCR authentication on individual jobs.")
-        options = resolve_settings(manager, code, changes)
+        options = resolve_settings(manager, code, changes, require_model=False)
+        if "translation_notes" in changes:
+            options["translation_notes"] = changes["translation_notes"]
         token = options.pop("vlm_auth_token")
         options.pop("paddleocr_vl_auth_token")
         manager.remember_category_advanced_options(code, **options)

@@ -1,6 +1,6 @@
 import { SCREEN } from "./screens.js";
 
-const COLORS = { ocr_raw: "#e11d48", ocr_merged: "#2563eb", ocr_structured: "#059669", translations: "#7c3aed", placements: "#d97706" };
+const COLORS = { ocr_raw: "#e11d48", ocr_merged: "#2563eb", ocr_structured: "#059669", translations: "#7c3aed", placements: "#d97706", clean_boxes: "#dc2626" };
 const DRAG_UNLOCK_PIXELS = 7;
 const RESIZE_HANDLE_VISUAL_PIXELS = 10;
 const RESIZE_HANDLE_HIT_RADIUS_PIXELS = 14;
@@ -11,7 +11,7 @@ function roundPixel(value) {
 }
 
 export class EditorCanvas {
-  constructor(canvas, store, onStatus, renderTextLayers) {
+  constructor(canvas, store, onStatus, renderTextLayers, groupSelection = null) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.store = store;
@@ -25,11 +25,13 @@ export class EditorCanvas {
     this.layerTimer = null;
     this.renderingLayers = false;
     this.renderTextLayers = renderTextLayers;
+    this.groupSelection = groupSelection;
     this.image.onload = () => { this.resize(); this.draw(); };
     canvas.addEventListener("pointerdown", (event) => this.pointerDown(event));
     canvas.addEventListener("pointermove", (event) => this.pointerMove(event));
     canvas.addEventListener("pointerup", (event) => this.pointerUp(event));
     canvas.addEventListener("pointercancel", (event) => this.pointerUp(event));
+    canvas.addEventListener("dblclick", (event) => this.doubleClick(event));
     store.addEventListener("change", () => this.draw());
   }
 
@@ -155,7 +157,8 @@ export class EditorCanvas {
       for (const record of this.store.records[artifact] || []) {
         const region = this.region(record, artifact);
         if (!region) continue;
-        const selected = this.store.selection?.recordId === record.recordId;
+        const active = this.store.selection?.recordId === record.recordId;
+        const selected = active || (this.store.stage === "ocr" && this.groupSelection?.has(artifact, record));
         this.ctx.strokeStyle = selected ? "#f59e0b" : (COLORS[artifact] || "#2563eb");
         this.ctx.lineWidth = selected ? 5 : 3;
         this.ctx.strokeRect(region[0], region[1], region[2] - region[0], region[3] - region[1]);
@@ -163,8 +166,8 @@ export class EditorCanvas {
         this.ctx.fillRect(region[0], Math.max(0, region[1] - 24), 44, 24);
         this.ctx.fillStyle = "white";
         this.ctx.font = "bold 18px sans-serif";
-        this.ctx.fillText(String(record.boxno ?? "?"), region[0] + 5, Math.max(18, region[1] - 5));
-        if (selected && SCREEN[this.store.stage].movable) {
+        this.ctx.fillText(`${artifact === "clean_boxes" ? "C" : ""}${record.boxno ?? "?"}`, region[0] + 5, Math.max(18, region[1] - 5));
+        if (active && SCREEN[this.store.stage].movable) {
           const handle = this.imagePixelsForScreenPixels(RESIZE_HANDLE_VISUAL_PIXELS);
           this.ctx.fillStyle = "#f59e0b";
           this.ctx.fillRect(
@@ -226,10 +229,18 @@ export class EditorCanvas {
     if (this.busy) { this.onStatus("Wait for the current OCR request to finish."); return; }
     const point = this.point(event);
     if (this.drawAction) { this.drag = { mode: "draw", start: point, current: point, action: this.drawAction }; return; }
+    const hits = this.hits(point);
+    const extend = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (this.store.stage === "ocr" && this.groupSelection && extend) {
+      const hit = hits.find((item) => item.artifact === "ocr_raw") || hits[0];
+      if (hit) this.groupSelection.select(hit, true);
+      return;
+    }
     const resizeHit = this.selectedResizeHit(point);
-    const hit = resizeHit || this.hits(point)[0];
-    if (!hit) { this.store.select(null, null); return; }
-    this.store.select(hit.artifact, hit.record.recordId);
+    const hit = resizeHit || hits.find((item) => item.record.recordId === this.store.selection?.recordId
+      && item.artifact === this.store.selection.artifact) || hits[0];
+    this.selectHit(hit);
+    if (!hit) return;
     if (!SCREEN[this.store.stage].movable) return;
     const radius = this.imagePixelsForScreenPixels(RESIZE_HANDLE_HIT_RADIUS_PIXELS);
     const resize = !!resizeHit || (
@@ -246,6 +257,20 @@ export class EditorCanvas {
       recordId: hit.record.recordId,
     };
     this.canvas.setPointerCapture?.(event.pointerId);
+  }
+  selectHit(hit) {
+    if (this.store.stage === "ocr" && this.groupSelection) this.groupSelection.select(hit);
+    else this.store.select(hit?.artifact || null, hit?.record.recordId || null);
+  }
+  doubleClick(event) {
+    if (this.busy || this.drawAction || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const hits = this.hits(this.point(event));
+    if (hits.length < 2) return;
+    event.preventDefault();
+    const current = hits.findIndex((item) => item.artifact === this.store.selection?.artifact
+      && item.record.recordId === this.store.selection.recordId);
+    this.selectHit(hits[(current + 1) % hits.length]);
+    this.drag = null;
   }
   pointerMove(event) {
     if (!this.drag) return;

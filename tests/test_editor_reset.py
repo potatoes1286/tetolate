@@ -32,7 +32,7 @@ class EditorResetTests(unittest.TestCase):
         self.data_dir = self.manager.output_dir(self.code, self.job_id) / "data"
         for page in (0, 1):
             for artifact in editor_v2.ARTIFACT_STAGES:
-                write_json_atomic(self.data_dir / artifact / f"page_{page:04d}.json", [
+                write_json_atomic(self.data_dir / artifact / f"page_{page:04d}.json", [] if artifact == "clean_boxes" else [
                     {"page": page, "boxno": box, "region": [10, 10, 30, 40],
                      "sourceBoxnos": [box], "text": "Generated", "englishText": "Generated",
                      "placementRegion": [10, 10, 30, 40], "font": "Original font",
@@ -55,10 +55,14 @@ class EditorResetTests(unittest.TestCase):
                 effective = {}
                 for artifact in editor_v2.STAGE_ARTIFACTS[stage]:
                     baseline = self.manager.load_editor_v2_baseline(self.code, self.job_id, artifact, 0)
-                    edited = copy.deepcopy(baseline[:1])
-                    edited[0].update(text="Edited", englishText="Edited", font="Edited font",
-                                     openLettering=True, safeToEraseOriginal=False)
-                    edited.insert(0, {**baseline[1], "recordId": "manual", "boxno": 9})
+                    if artifact == "clean_boxes":
+                        self.assertEqual(baseline, [])
+                        edited = [{"page": 0, "boxno": 0, "recordId": "clean-manual", "region": [10, 10, 30, 40]}]
+                    else:
+                        edited = copy.deepcopy(baseline[:1])
+                        edited[0].update(text="Edited", englishText="Edited", font="Edited font",
+                                         openLettering=True, safeToEraseOriginal=False)
+                        edited.insert(0, {**baseline[1], "recordId": "manual", "boxno": 9})
                     editor_v2.update_artifact_override(manifest, 0, stage, artifact, baseline, edited)
                     effective[artifact] = edited
                 editor_v2.freeze_stage(manifest, 0, stage, effective, True)

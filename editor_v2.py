@@ -26,7 +26,7 @@ STAGE_ARTIFACTS = {
     "structure": ("ocr_structured",),
     "erase": ("ocr_structured", "alt_placement"),
     "translation": ("translations",),
-    "placement": ("placements",),
+    "placement": ("placements", "clean_boxes"),
 }
 ARTIFACT_STAGES = {
     artifact: tuple(stage for stage in STAGE_ORDER if artifact in STAGE_ARTIFACTS[stage])
@@ -47,6 +47,7 @@ STAGE_FIELDS: dict[str, dict[str, frozenset[str] | None]] = {
     },
     "translation": {"translations": frozenset({"englishText", "text"})},
     "placement": {
+        "clean_boxes": frozenset({"region"}),
         "placements": frozenset(
             {
                 "placementRegion",
@@ -104,6 +105,29 @@ def deleted_records(manifest: dict[str, Any], page: int, stage: str, artifact: s
     override = manifest.get("pages", {}).get(str(page), {}).get("stages", {}).get(stage, {}).get("artifacts", {}).get(artifact, {})
     return [item["record"] for item in override.get("deleted", {}).values()
             if isinstance(item, dict) and isinstance(item.get("record"), dict)]
+
+
+def complete_manual_ocr_groups(
+    manifest: dict[str, Any], page: int, raw_records: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Give ungrouped manual detections a stable singleton, unless deleted."""
+    result = copy.deepcopy(groups)
+    represented = {source for group in groups for source in group.get("sourceBoxnos", [])}
+    deleted = deleted_records(manifest, page, "ocr", "ocr_merged")
+    excluded = {source for group in deleted for source in group.get("sourceBoxnos", [])}
+    next_boxno = max((group.get("boxno", -1) for group in [*groups, *deleted]), default=-1) + 1
+    for raw in raw_records:
+        boxno = raw.get("boxno")
+        if raw.get("ocrSource") != "manual" or boxno in represented or boxno in excluded:
+            continue
+        result.append({"page": page, "boxno": next_boxno,
+                       "recordId": f"group_{raw['recordId']}", "ocrSource": "manual",
+                       "sourceBoxnos": [boxno], "sourceTexts": [str(raw.get("text", ""))],
+                       "text": str(raw.get("text", "")), "region": copy.deepcopy(raw["region"])})
+        next_boxno += 1
+        represented.add(boxno)
+    return result
 
 
 def visible_artifacts(
@@ -445,7 +469,10 @@ def apply_artifact_override(
         for name, item in field_values.items():
             if not isinstance(item, dict) or (protected_only and not item.get("protected")):
                 continue
-            target[name] = copy.deepcopy(item.get("value"))
+            if name == "fontSizeWidthPercent" and item.get("value") is None:
+                target.pop(name, None)
+            else:
+                target[name] = copy.deepcopy(item.get("value"))
 
     for rid, item in override.get("added", {}).items():
         if not isinstance(item, dict) or (protected_only and not item.get("protected")):

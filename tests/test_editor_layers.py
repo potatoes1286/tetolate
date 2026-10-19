@@ -139,6 +139,25 @@ class EditorLayerTests(unittest.TestCase):
             self.assertNotEqual(first, self.layer(record))
             self.assertEqual(render.call_count, 2)
 
+    def test_layout_rule_changes_invalidate_layer_and_current_caches(self):
+        original = self.manager.original_page_path(self.code, self.job_id, 0)
+        with self.renderer() as render, mock.patch.object(overlay_text, "ensure_magick", return_value="magick"):
+            first = self.layer()
+            with mock.patch.object(overlay_text, "TEXT_LAYOUT_VERSION", overlay_text.TEXT_LAYOUT_VERSION + 1):
+                self.assertNotEqual(first, self.layer())
+            self.assertEqual(render.call_count, 2)
+
+        def fake_overlay(_entries, _source, output):
+            shutil.copyfile(original, output)
+
+        with mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, False)), \
+             mock.patch.object(overlay_text, "overlay_text", side_effect=fake_overlay) as render:
+            self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])[1])
+            with mock.patch.object(overlay_text, "TEXT_LAYOUT_VERSION", overlay_text.TEXT_LAYOUT_VERSION + 1):
+                self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])[1])
+            self.assertEqual(render.call_count, 2)
+
     def test_invalid_geometry_styles_text_and_font_paths_are_rejected(self):
         outside = self.root / "secret"
         outside.write_text("secret")
@@ -203,6 +222,7 @@ class EditorLayerTests(unittest.TestCase):
                   {"manualLineBreaks": "One\nTWO\nThree"}, {"placementRegion": [10, 10, 130, 700]},
                   {"placementRegion": [10, 10, 700, 130]}]
         cases += [{"rotation": angle} for angle in (-180, -35, 35, 90, 180)]
+        cases += [{"manualLineBreaks": "Even if you say that...", "placementRegion": [40, 50, 755, 135]}]
         cases += [{"skewX": -30}, {"skewY": 30}, {"rotation": 23, "skewX": 30, "skewY": -20},
                   {"rotation": -40, "skewX": 60, "skewY": 60},
                   {"rotation": 45, "placementRegion": [0, 0, 161, 103]},

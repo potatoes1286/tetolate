@@ -68,10 +68,10 @@ export class EditorApi {
     });
   }
 
-  preview(stage, page, records, cleanRecords) {
+  preview(stage, page, records, cleanRecords, cleanBoxes = []) {
     return request(`${this.root}/pages/${page}/stages/${stage}/preview`, {
       method: "POST", headers: jsonHeaders,
-      body: JSON.stringify({ records, cleanRecords }),
+      body: JSON.stringify({ records, cleanRecords, cleanBoxes }),
     });
   }
 

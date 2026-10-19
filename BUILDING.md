@@ -78,6 +78,11 @@ tokens survive restarts until revoked; the server stores their hashes, and remot
 CLI login saves the token in a mode-0600 configuration file. Browser login and
 read-only token restrictions also remain in effect.
 
+On the category upload page, Advanced Options save automatically, including
+parallel workers. Wait for “Advanced options saved” before leaving. Defaults
+can be saved before selecting a model; new jobs still need one. Auth tokens
+keep their separate test/upload save behavior.
+
 Use `schema --json` for endpoint and settings schemas. Settings use snake_case
 names, such as `vlm_model`, `pause_after_ocr`, and `ocr_page_workers`. Partial updates
 keep other settings. For example:
@@ -164,16 +169,24 @@ pipeline steps. Regeneration uses the earliest pending change on each page:
 source edits start at erase decisions, erase edits start at translation, and
 English-text edits start at typesetting. Notes-only edits do not rerun the pipeline.
 Reset and Protect stage apply to all three groups in Text & Translation.
+In OCR & Merge, new raw boxes form one-box groups. Saved manual boxes that
+have no group also appear in the later tabs. Ctrl/Shift-click boxes (or check
+raw rows), then use Group checked. Double-click cycles overlapping boxes.
 Deleting a source box hides its linked boxes in later tabs. Saved downstream
 edits are kept; resetting the source stage restores them. Rendered pages still
 need regeneration.
-Typesetting Preview uses cached ImageMagick text layers on the last cleaned
+Typesetting Preview uses cached ImageMagick text layers on the current cleaned
 page. Fonts, wrapping, sizing, outlines, and alignment use the same renderer as
 Current. Moving boxes reuses cached pixels; other edits refresh the affected
 layer after a short delay. Uncached layers share one request and one ImageMagick
 process (up to 256 boxes per batch); cached layers are not rendered again.
 New layers appear together when their batch finishes.
-Current also updates the cleaning mask when needed.
+Current and Preview update the cleaning mask when selected.
+Use Add clean box in Typesetting to draw an area for LaMa to clean without
+adding text. Move, resize, or delete the box, then select Current or Preview
+to refresh cleaning. Save and Regenerate downstream apply it to final pages
+and CBZ exports without OCR or VLM calls. Undo/redo includes clean boxes;
+Reset stage removes them on that page. Cleaning can alter artwork in the area.
 Typesetting also has manual rotation (±180°) and horizontal/vertical skew
 (±60°). Set them to zero to remove the effect. Positive rotation is clockwise;
 horizontal skew, vertical skew, then rotation are applied about the box center.

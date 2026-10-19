@@ -254,6 +254,101 @@ class ControlAPITests(unittest.TestCase):
 
         self.run_http(exercise)
 
+    def test_category_options_autosave_reload_and_restart_without_a_model_or_upload(self):
+        self.manager.config = replace(self.manager.config, default_vlm_model="")
+        self.manager.save_status("default", "12345678", {"status": "complete", "lamaWorkers": 1})
+        before_job = self.manager.load_status("default", "12345678")
+        changes = {"ocr_page_workers": 4, "lama_workers": 2, "imagemagick_workers": 8,
+                   "thinking_budget_tokens": 0, "pause_after_ocr": True,
+                   "proofread_translations": False, "write_translation_notes": False,
+                   "auto_translate_comicinfo_title": False, "alt_placement_enabled": False,
+                   "source_language": "kr", "ocr_engine": "paddleocr_vl",
+                   "paddleocr_vl_server_url": "http://ocr.internal:9001/v1",
+                   "paddleocr_vl_model": "ocr-model", "vlm_base_url": "http://vlm.internal:9002/v1",
+                   "translation_notes": "Names and terms"}
+
+        async def exercise(client):
+            client.headers.pop("Authorization")
+            client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin(self.helper.ADMIN_PASSWORD))
+            for key, value in changes.items():
+                response = await client.patch("/api/v1/categories/default/settings", json={key: value})
+                self.assertEqual(response.status_code, 200, response.text)
+            for restart in (False, True):
+                if restart:
+                    self.manager = web_app.JobManager(self.manager.config)
+                    self.manager.initialize_web_state()
+                    self.app.state.manager = self.manager
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin(self.helper.ADMIN_PASSWORD))
+                response = await client.get("/api/v1/categories/default/settings")
+                settings = response.json()
+                for key, value in changes.items():
+                    field = web_app.CONTROL_OPTION_FIELDS.get(key, "translationNotes")
+                    self.assertEqual(settings[field], value)
+                self.assertEqual(settings["vlmModel"], "")
+                response = await client.get("/category/default")
+                self.assertEqual(response.status_code, 200)
+                for name, value in (("ocr_page_workers", 4), ("lama_workers", 2), ("imagemagick_workers", 8)):
+                    self.assertIn(f'name="{name}" type="number" min="1" max="32" step="1" value="{value}"', response.text)
+                self.assertIn('data-category-options="default"', response.text)
+                self.assertIn('data-category-options-status role="status"', response.text)
+                self.assertEqual(self.manager.load_status("default", "12345678"), before_job)
+            response = await client.patch("/api/v1/categories/default/settings", json={"translation_notes": ""})
+            self.assertEqual(response.json()["translationNotes"], "")
+            response = await client.post("/api/v1/jobs", data={"category": "default"},
+                                         files={"file": ("input.cbz", archive_bytes(), "application/zip")})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("VLM model is required", response.text)
+
+        self.run_http(exercise)
+
+    def test_category_partial_saves_preserve_secrets_and_other_categories_and_validate_inputs(self):
+        self.manager.create_category("other")
+        self.manager.remember_vlm_token(self.manager.config.default_vlm_base_url, "private-key")
+
+        async def exercise(client):
+            response = await client.patch("/api/v1/categories/default/settings", json={"lama_workers": 3})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(self.manager.saved_vlm_token(self.manager.config.default_vlm_base_url), "private-key")
+            before = self.manager.category_advanced_options_path("default").read_bytes()
+            other = self.manager.load_category_advanced_options("other")
+            for changes in ({"lama_workers": 0}, {"imagemagick_workers": 33}, {"ocr_page_workers": "4"},
+                            {"pause_after_ocr": "false"}, {"translation_notes": None},
+                            {"vlm_model": "bad\nmodel"}, {"unknown": True},
+                            {"paddleocr_vl_auth_token": "private-ocr"}):
+                response = await client.patch("/api/v1/categories/default/settings", json=changes)
+                self.assertIn(response.status_code, (400, 422), response.text)
+                self.assertNotIn("private-key", response.text)
+                self.assertNotIn("private-ocr", response.text)
+                self.assertEqual(self.manager.category_advanced_options_path("default").read_bytes(), before)
+            self.assertEqual(self.manager.load_category_advanced_options("other"), other)
+            self.assertNotIn("private-key", (await client.get("/api/v1/categories/default/settings")).text)
+            response = await client.patch("/api/v1/categories/default/settings", json={"lama_workers": 4},
+                                          headers={"Origin": "http://other"})
+            self.assertEqual(response.status_code, 403)
+            read_only = self.manager.create_control_token("read", read_only=True)["token"]
+            client.headers["Authorization"] = "Bearer " + read_only
+            self.assertEqual((await client.patch("/api/v1/categories/default/settings", json={"lama_workers": 4})).status_code, 403)
+            client.headers.pop("Authorization")
+            self.assertEqual((await client.patch("/api/v1/categories/default/settings", json={"lama_workers": 4})).status_code, 401)
+            self.assertEqual(self.manager.category_advanced_options_path("default").read_bytes(), before)
+
+        self.run_http(exercise)
+
+    def test_category_model_can_be_cleared_without_restoring_the_config_default(self):
+        self.manager.config = replace(self.manager.config, default_vlm_model="config-model")
+
+        async def exercise(client):
+            for model in ("selected-model", ""):
+                response = await client.patch("/api/v1/categories/default/settings", json={"vlm_model": model})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["vlmModel"], model)
+                self.assertEqual(self.manager.public_category_jobs("default")["defaultVlmModel"], model)
+            response = await client.patch("/api/v1/categories/default/settings", json={"lama_workers": 2})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["vlmModel"], "")
+
+        self.run_http(exercise)
+
     def test_series_membership_and_publication_actions(self):
         async def exercise(client):
             response = await client.post("/api/v1/categories/default/series", json={"name": "Example"})

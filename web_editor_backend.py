@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import shutil
 import tempfile
 from pathlib import Path
@@ -182,6 +183,8 @@ class EditorManagerMixin:
     def load_editor_v2_baseline(
         self, code: str, job_id: str, artifact: str, page: int
     ) -> list[dict[str, Any]]:
+        if artifact == "clean_boxes":
+            return []  # Manual-only records must never become a generated baseline.
         path = self.editor_v2_generated_path(code, job_id, artifact, page)
         if not path.is_file():
             path = (
@@ -210,12 +213,16 @@ class EditorManagerMixin:
         artifact: str,
         page: int,
     ) -> list[dict[str, Any]]:
-        return editor_v2.effective_records(
+        records = editor_v2.effective_records(
             manifest,
             page,
             artifact,
             self.load_editor_v2_baseline(code, job_id, artifact, page),
         )
+        if artifact == "ocr_merged":
+            records = editor_v2.complete_manual_ocr_groups(manifest, page,
+                self.editor_v2_effective_records(code, job_id, manifest, "ocr_raw", page), records)
+        return records
 
     def add_pending_ocr_descendants(
         self,
@@ -226,10 +233,23 @@ class EditorManagerMixin:
     ) -> None:
         structured = artifacts.setdefault("ocr_structured", [])
         represented_sources = {source for record in structured for source in record.get("sourceBoxnos", [])}
+        raw_by_boxno = {record["boxno"]: record for record in artifacts.get("ocr_raw", [])}
         for merged in artifacts.get("ocr_merged", []):
-            sources = set(merged.get("sourceBoxnos", []))
-            if not sources or sources.intersection(represented_sources) or sources <= rejected_sources:
+            sources = [source for source in merged.get("sourceBoxnos", [])
+                       if source not in represented_sources and source not in rejected_sources]
+            if not sources:
                 continue
+            pending = merged
+            if len(sources) != len(merged.get("sourceBoxnos", [])):
+                # A regrouped box can contain both old and newly added text.
+                # Show only missing sources until Structure is regenerated.
+                raw = [raw_by_boxno[source] for source in sources if source in raw_by_boxno]
+                regions = [record["region"] for record in raw]
+                texts = [str(record.get("text", "")) for record in raw]
+                pending = {**merged, "sourceTexts": texts, "text": "".join(texts)}
+                if regions:
+                    pending["region"] = [min(region[0] for region in regions), min(region[1] for region in regions),
+                                         max(region[2] for region in regions), max(region[3] for region in regions)]
             boxno = merged.get("boxno")
             if boxno in reserved_boxnos:
                 boxno = max(reserved_boxnos, default=-1) + 1
@@ -238,10 +258,10 @@ class EditorManagerMixin:
                 {
                     "page": page,
                     "boxno": boxno,
-                    "sourceBoxnos": copy.deepcopy(merged.get("sourceBoxnos", [])),
-                    "sourceTexts": copy.deepcopy(merged.get("sourceTexts", [])),
-                    "region": copy.deepcopy(merged.get("region")),
-                    "text": str(merged.get("text", "")),
+                    "sourceBoxnos": sources,
+                    "sourceTexts": copy.deepcopy(pending.get("sourceTexts", [])),
+                    "region": copy.deepcopy(pending.get("region")),
+                    "text": str(pending.get("text", "")),
                     "sfx": False,
                     "openLettering": False,
                     "safeToEraseOriginal": True,
@@ -324,7 +344,11 @@ class EditorManagerMixin:
         artifacts = editor_v2.visible_artifacts(manifest, page, artifacts)
         page_state = manifest.get("pages", {}).get(str(page), {})
         pending_stages = set(page_state.get("pendingStages", []))
-        if pending_stages.intersection(editor_v2.STAGE_ORDER[:-1]):
+        represented = {source for record in artifacts["ocr_structured"] for source in record.get("sourceBoxnos", [])}
+        pending_manual = any(group.get("ocrSource") == "manual" and
+                             not represented.intersection(group.get("sourceBoxnos", []))
+                             for group in artifacts["ocr_merged"])
+        if pending_manual or pending_stages.intersection(editor_v2.STAGE_ORDER[:-1]):
             rejected_sources = {
                 source
                 for member in editor_v2.TEXT_STAGES[:2]
@@ -598,6 +622,9 @@ class EditorManagerMixin:
                 raise HTTPException(status_code=400, detail="recordsByArtifact must be an object.")
             display = self.editor_v2_payload(code, job_id, stage, page)["recordsByArtifact"]
             if stage == "ocr":
+                deleted_groups = data.get("deletedOcrGroupIds", [])
+                if not isinstance(deleted_groups, list) or any(not isinstance(value, str) for value in deleted_groups):
+                    raise HTTPException(400, "deletedOcrGroupIds must be an array of record IDs.")
                 raw_records = supplied.get("ocr_raw")
                 merged_records = supplied.get("ocr_merged")
                 if not isinstance(raw_records, list) or not isinstance(merged_records, list):
@@ -621,7 +648,9 @@ class EditorManagerMixin:
                     raise HTTPException(
                         status_code=400, detail=f"{artifact} records must be an array."
                     )
-                if artifact == "placements":
+                if artifact == "clean_boxes":
+                    records = self.normalize_clean_boxes(code, job_id, page, records)
+                elif artifact == "placements":
                     records = self.normalize_saved_placements(
                         code, job_id, page, records
                     )
@@ -684,6 +713,17 @@ class EditorManagerMixin:
                     baseline,
                     records,
                 )
+                if stage == "ocr" and artifact == "ocr_merged":
+                    # A removed derived singleton is a deliberate group deletion,
+                    # not another orphan to recreate on the next page load.
+                    retained = {record.get("recordId") for record in records}
+                    deleted = editor_v2.artifact_override(manifest, page, stage, artifact)["deleted"]
+                    for record in display[artifact]:
+                        if record["recordId"] not in retained and record["recordId"] in deleted_groups:
+                            deleted.setdefault(record["recordId"], {
+                                "record": copy.deepcopy(record), "region": copy.deepcopy(record.get("region")),
+                                "protected": True,
+                            })
                 if editor_v2.stage_override(manifest, page, stage).get("frozen"):
                     editor_v2.artifact_override(manifest, page, stage, artifact)["freeze"] = {
                         "records": editor_v2.hydrate_ids(artifact, page, records), "protected": True,
@@ -719,7 +759,10 @@ class EditorManagerMixin:
                         pages[str(page)] = notes["page"]
                     else:
                         pages.pop(str(page), None)
-            editor_v2.mark_saved(manifest, page, stage, before=before)
+            if stage == "placement":
+                editor_v2.mark_stages_saved(manifest, page, (stage,), before={stage: before})
+            else:
+                editor_v2.mark_saved(manifest, page, stage, before=before)
             self.save_editor_v2_manifest(code, job_id, manifest)
             write_json_atomic(
                 self.translation_notes_path(code, job_id),
@@ -1250,7 +1293,7 @@ class EditorManagerMixin:
             entry.pop("page", None)
             font = Path(entry["font"])
             font_stat = font.stat() if font.is_file() else None
-            signature = [entry, image_width, image_height,
+            signature = [overlay_text.TEXT_LAYOUT_VERSION, entry, image_width, image_height,
                          [font_stat.st_size, font_stat.st_mtime_ns] if font_stat else None]
             key = hashlib.sha256(json.dumps(signature, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             output = directory / f"{key}.png"
@@ -1274,11 +1317,13 @@ class EditorManagerMixin:
     def render_editor_v2_preview(
         self, code: str, job_id: str, page: int,
         placement_records: list[Any], structured_records: list[Any],
+        clean_boxes: list[Any] | None = None,
     ) -> tuple[Path, bool, bool]:
         self.require_editable_job(code, job_id, "placement")
+        boxes = self.normalize_clean_boxes(code, job_id, page, clean_boxes or [])
         entries = self.editor_v2_render_entries(code, job_id, page, placement_records)
         source, cleaned_with_lama = self.current_editor_clean_source(
-            code, job_id, page, structured_records
+            code, job_id, page, [*structured_records, *boxes]
         )
         output = self.editor_v2_preview_path(code, job_id, page)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1297,6 +1342,7 @@ class EditorManagerMixin:
                 }
             )
         cache_payload = {
+            "layoutVersion": overlay_text.TEXT_LAYOUT_VERSION,
             "entries": entries,
             "source": str(source.resolve()),
             "sourceSize": source_stat.st_size,
@@ -1489,6 +1535,38 @@ class EditorManagerMixin:
             normalized_merged.append(record)
 
         return normalized_raw, normalized_merged
+
+    def normalize_clean_boxes(
+        self, code: str, job_id: str, page: int, records: list[Any],
+    ) -> list[dict[str, Any]]:
+        if len(records) > 256:
+            raise HTTPException(400, "A page supports at most 256 clean boxes.")
+        with Image.open(self.original_page_path(code, job_id, page)) as image:
+            width, height = image.size
+        result = []
+        ids: set[str] = set()
+        numbers: set[int] = set()
+        for item in records:
+            if not isinstance(item, dict):
+                raise HTTPException(400, "Each clean box must be an object.")
+            rid, boxno, region = item.get("recordId"), item.get("boxno"), item.get("region")
+            if not isinstance(rid, str) or not rid or len(rid) > 200 or rid in ids:
+                raise HTTPException(400, "Clean boxes require unique record IDs.")
+            if isinstance(boxno, bool) or not isinstance(boxno, int) or boxno < 0 or boxno in numbers:
+                raise HTTPException(400, "Clean boxes require unique non-negative box numbers.")
+            if not isinstance(region, list) or len(region) != 4 or any(
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                for value in region
+            ):
+                raise HTTPException(400, "Clean box regions require four finite numbers.")
+            left, top, right, bottom = [max(0, min(limit, round(value)))
+                for value, limit in zip(region, (width, height, width, height))]
+            if right <= left or bottom <= top:
+                raise HTTPException(400, "Clean box regions must have positive width and height inside the page.")
+            result.append({"recordId": rid, "page": page, "boxno": boxno, "region": [left, top, right, bottom]})
+            ids.add(rid)
+            numbers.add(boxno)
+        return result
 
     def normalize_saved_placements(
         self,

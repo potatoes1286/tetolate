@@ -24,6 +24,9 @@ class EditorVisibilityTests(unittest.TestCase):
         # Keep distinct OCR detections apart: overlapping detections are suppressed together.
         for artifact in editor_v2.ARTIFACT_STAGES:
             records = self.manager.load_editor_v2_baseline(self.code, self.job_id, artifact, 0)
+            if artifact == "clean_boxes":
+                self.assertEqual(records, [])  # Manual cleaning has no generated records.
+                continue
             records[1]["region"] = records[1]["placementRegion"] = [50, 10, 70, 40]
             self.baseline(artifact, records)
 

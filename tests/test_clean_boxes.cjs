@@ -1,0 +1,141 @@
+// Run with: node tests/test_clean_boxes.cjs
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const {test} = require("node:test");
+const vm = require("node:vm");
+const root = path.join(__dirname, "../web_editor");
+const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
+const app = read("app.js");
+const fn = (name) => app.match(new RegExp(`(?:async )?function ${name}\\([^]*?\\n\\}`))[0];
+const screens = vm.runInNewContext(read("screens.js").replaceAll("export ", "") + "\n({SCREEN, fieldsFor, applyFields, recordLabel})");
+
+function setup() {
+  const storage = new Map(), handlers = {}, status = [], layers = [], labels = [];
+  const localStorage = {getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key)};
+  const Store = vm.runInNewContext(read("store.js").replace("export class", "class") + "\nEditorStore", {EventTarget, Event, structuredClone, localStorage});
+  const store = new Store({category: "default", jobId: "test"});
+  const document = {stage: "placement", page: 0, revision: 0, recordsByArtifact: {
+    placements: [{recordId: "text-one", boxno: 0, placementRegion: [10, 10, 40, 40]}],
+    translations: [{boxno: 0, englishText: "Existing text"}], clean_boxes: [], ocr_structured: [],
+  }};
+  store.setDocument(document);
+  let id = 0;
+  const context = vm.createContext({store, SCREEN: screens.SCREEN, newRecordId: (prefix) => `${prefix}-${++id}`,
+    setStatus: (...args) => status.push(args), selectedArtifact: () => store.selection?.artifact,
+    applyFields: screens.applyFields});
+  for (const name of ["nextBoxno", "addCleanBox", "deleteSelected", "applyInspector", "recordsForList"])
+    vm.runInContext(fn(name), context);
+  const ctx = {clearRect() {}, drawImage() {}, strokeRect() {}, fillRect() {}, fillText: (text) => labels.push(text)};
+  const element = {width: 200, height: 200, style: {}, getContext: () => ctx,
+    getBoundingClientRect: () => ({left: 0, top: 0, width: 200, height: 200}),
+    addEventListener: (name, handler) => { handlers[name] = handler; }, setPointerCapture() {}};
+  const Canvas = vm.runInNewContext(read("canvas.js").replace(/^import .*\n/, "").replace("export class", "class") + "\nEditorCanvas", {
+    SCREEN: screens.SCREEN, Image: class {}, setTimeout, clearTimeout,
+  });
+  const canvas = new Canvas(element, store, () => {}, async (_page, entries) => { layers.push(entries); return entries.map(() => ({width: 20, height: 20, close() {}})); });
+  const event = (x, y) => ({clientX: x, clientY: y, pointerId: 1, preventDefault() {}});
+  const drag = (from, to) => { handlers.pointerdown(event(...from)); handlers.pointermove(event(...to)); handlers.pointerup(event(...to)); };
+  return {store, context, canvas, drag, storage, localStorage, document, Store, status, layers, labels};
+}
+
+test("drawing a clean box creates no OCR, translation or placement record", () => {
+  const page = setup(), before = JSON.stringify(page.store.records);
+  page.canvas.startDraw(page.context.addCleanBox);
+  page.drag([50, 50], [90, 100]);
+  assert.equal(page.store.selection.artifact, "clean_boxes");
+  assert.equal(page.store.records.placements.length, 1);
+  assert.equal(page.store.records.translations.length, 1);
+  assert.equal(page.store.records.ocr_structured.length, 0);
+  const box = page.store.records.clean_boxes[0];
+  assert.deepEqual(Array.from(box.region), [50, 50, 90, 100]);
+  assert.deepEqual(Object.keys(box).sort(), ["boxno", "page", "recordId", "region"]);
+  page.store.undo(); assert.equal(JSON.stringify(page.store.records), before);
+  page.store.redo(); assert.equal(page.store.records.clean_boxes.length, 1);
+});
+
+test("clean box drafts survive reload with the same identity", () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  const restored = new page.Store({category: "default", jobId: "test"});
+  restored.setDocument(page.document);
+  assert.equal(restored.records.clean_boxes[0].recordId, page.store.records.clean_boxes[0].recordId);
+  assert.equal(restored.dirty, true);
+});
+
+test("clean box move and resize use region and do not move text", () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  page.drag([60, 60], [70, 70]);
+  let box = page.store.records.clean_boxes[0];
+  assert.deepEqual(Array.from(box.region), [60, 60, 100, 110]);
+  assert.equal(box.placementRegion, undefined);
+  page.drag([100, 110], [120, 135]);
+  assert.deepEqual(Array.from(box.region), [60, 60, 120, 135]);
+  assert.deepEqual(page.store.records.placements[0].placementRegion, [10, 10, 40, 40]);
+  page.store.undo(); assert.deepEqual(Array.from(page.store.records.clean_boxes[0].region), [60, 60, 100, 110]);
+});
+
+test("clean inspector has only coordinates and edits region rather than placementRegion", () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  const box = page.store.selectedRecord();
+  assert.deepEqual(Array.from(screens.fieldsFor("placement", box, [], "clean_boxes"), (field) => field[0]), ["left", "top", "right", "bottom"]);
+  assert.equal(screens.recordLabel("placement", box, "clean_boxes"), "0  Clean only");
+  page.context.applyInspector({left: {type: "number", value: "55"}}, {...page.store.selection, stage: "placement"}, "left");
+  assert.deepEqual(Array.from(page.store.records.clean_boxes[0].region), [55, 50, 90, 100]);
+  assert.equal(page.store.records.clean_boxes[0].placementRegion, undefined);
+});
+
+test("delete removes only clean boxes and remains undoable", () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  page.context.deleteSelected(); assert.equal(page.store.records.clean_boxes.length, 0);
+  page.store.undo(); assert.equal(page.store.records.clean_boxes.length, 1);
+  page.store.select("placements", "text-one"); page.context.deleteSelected();
+  assert.equal(page.store.records.placements.length, 1);
+  assert.match(page.status.at(-1)[0], /Select a clean box/);
+});
+
+test("clean boxes are drawn and listed but never request text layers", async () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  assert.ok(page.context.recordsForList().some((item) => item.artifact === "clean_boxes"));
+  page.store.records.placements = [];
+  page.canvas.image.complete = true; page.canvas.draw();
+  assert.ok(page.labels.includes("C0"));
+  assert.equal(page.canvas.layers.size, 0);
+  assert.equal(page.canvas.layerTimer, null);
+  assert.equal(page.layers.length, 0);
+});
+
+test("Current and Preview send clean boxes while Preview keeps cached text layers", async () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  const requests = [], loads = [];
+  Object.assign(page.context, {typesettingView: "preview", api: {preview: async (...args) => { requests.push(args); return {url: "clean-preview", cleanedWithLama: true}; }},
+    canvas: {load: (...args) => loads.push(args)}, imageUrl: () => "original"});
+  vm.runInContext(fn("exactPreview") + "\n" + fn("loadTypesettingView"), page.context);
+  await page.context.loadTypesettingView();
+  assert.equal(requests[0][2].length, 0);
+  assert.equal(requests[0][4][0].recordId, page.store.records.clean_boxes[0].recordId);
+  assert.equal(loads[0].length, 1, "Preview enables cached layers");
+  await page.context.exactPreview();
+  assert.equal(requests[1][2].length, 1);
+  assert.equal(requests[1][4].length, 1);
+  assert.equal(loads[1][1].showPlacementText, false);
+});
+
+test("save and preview API serialize clean boxes separately from text", async () => {
+  const requests = [];
+  const Api = vm.runInNewContext(read("api.js").replace("export class", "class") + "\nEditorApi", {
+    fetch: async (url, options) => { requests.push([url, JSON.parse(options.body)]); return {ok: true, json: async () => ({ok: true})}; },
+  });
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  const api = new Api("default", "test");
+  await api.preview("placement", 0, [], [], page.store.records.clean_boxes);
+  assert.equal(requests[0][1].cleanBoxes.length, 1);
+  assert.deepEqual(requests[0][1].records, []);
+  Object.assign(page.context, {api: {save: async (_stage, _page, body) => {
+    assert.equal(body.recordsByArtifact.clean_boxes.length, 1);
+    assert.equal(body.recordsByArtifact.placements.length, 1);
+    return page.document;
+  }}, resetting: false, byId: () => ({}), loadTypesettingView: async () => {}});
+  vm.runInContext(fn("save"), page.context);
+  await page.context.save();
+  assert.equal(page.store.dirty, false);
+});

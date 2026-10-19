@@ -8,23 +8,25 @@ export const ALIGNMENT_LABELS = {
 export const SCREEN = {
   ocr: { artifacts: ["ocr_merged", "ocr_raw"], primary: "ocr_merged", region: "region", movable: true },
   text: { artifacts: ["ocr_structured"], primary: "ocr_structured", region: "region", movable: false },
-  placement: { artifacts: ["placements"], primary: "placements", region: "placementRegion", movable: true },
+  placement: { artifacts: ["placements", "clean_boxes"], primary: "placements", region: "placementRegion", movable: true },
 };
 
-export function recordLabel(stage, record) {
+export function recordLabel(stage, record, artifact = null) {
   const number = Number.isInteger(record.boxno) ? record.boxno : "?";
+  if (artifact === "clean_boxes") return `${number}  Clean only`;
   const text = stage === "text" && record.englishText
     ? `${record.text || ""} → ${record.englishText}` : (record.text || record.englishText || "");
   return `${number}  ${String(text || "(empty)").replace(/\s+/g, " ").slice(0, 80)}`;
 }
 
-export function fieldsFor(stage, record, fonts = []) {
-  const regionKey = stage === "placement" ? "placementRegion" : "region";
+export function fieldsFor(stage, record, fonts = [], artifact = null) {
+  const regionKey = stage === "placement" && artifact !== "clean_boxes" ? "placementRegion" : "region";
   const region = record[regionKey] || record.region || [0, 0, 0, 0];
   const regionFields = [
     ["left", "Left", "number", region[0]], ["top", "Top", "number", region[1]],
     ["right", "Right", "number", region[2]], ["bottom", "Bottom", "number", region[3]],
   ];
+  if (artifact === "clean_boxes") return regionFields;
   if (stage === "ocr") return [...regionFields, ["text", "OCR text", "textarea", record.text || ""]];
   if (stage === "text") return [
     ["text", "Corrected source text", "textarea", record.text || ""],
@@ -75,9 +77,9 @@ export function updateTextField(records, source, field, value, page, newId) {
   }
 }
 
-export function applyFields(stage, record, values) {
+export function applyFields(stage, record, values, artifact = null) {
   const result = { ...record };
-  const regionKey = stage === "placement" ? "placementRegion" : "region";
+  const regionKey = stage === "placement" && artifact !== "clean_boxes" ? "placementRegion" : "region";
   if (["left", "top", "right", "bottom"].some((key) => key in values)) {
     const old = result[regionKey] || result.region || [0, 0, 0, 0];
     result[regionKey] = [
@@ -88,7 +90,7 @@ export function applyFields(stage, record, values) {
   for (const [key, value] of Object.entries(values)) {
     if (!["left", "top", "right", "bottom"].includes(key)) {
       if (key === "fontSizeWidthPercent" && value === "") delete result[key];
-      else if (["rotation", "skewX", "skewY"].includes(key) && (value === "" || value === 0)) delete result[key];
+      else if (["rotation", "skewX", "skewY"].includes(key) && value === "") result[key] = 0;
       else result[key] = value;
     }
   }

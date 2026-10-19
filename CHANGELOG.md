@@ -6,7 +6,8 @@
 
 - Added a manual GitHub release check beside the web UI version.
 - Added an editor stage reset to remove saved edits and protection flags on one page.
-- Added manual rotation and skew controls to Typesetting, Preview, and final output.
+- Added manual rotation and skew controls with sliders and keyboard-friendly inputs.
+- Added clean-only boxes in Typesetting, with preview and export support without a VLM model.
 
 ### Changed
 
@@ -18,6 +19,11 @@
 
 ### Fixed
 
+- Clearing the editor font size restores automatic sizing and stays cleared after saving.
+- Typesetting saves preserve pending OCR and translation changes.
+- Manual OCR additions reach later editor tabs; canvas multi-selection, grouping, and overlap selection work together.
+- Improved automatic font sizing for wide, single-line captions without enlarging multi-line text.
+- Category Advanced Options save automatically and survive reloads, including parallel workers.
 - Resetting editor stages clears discarded pending edits and their out-of-date flags.
 - Deleted source boxes stay hidden in later editor tabs; reset restores their saved data.
 
