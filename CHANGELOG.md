@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Local CLI access no longer needs login; remote access still requires a token.
+- Compose now exposes the web UI to the LAN by default.
+
 ## 1.0.0 - 2026-09-04
 
 Devnote:

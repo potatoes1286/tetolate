@@ -16,7 +16,8 @@ from PIL import Image
 from tests import test_regressions
 import web_app
 import web_control_api
-from web_control_auth import CONTROL_TOKENS_FILENAME
+from web_control_auth import CONTROL_TOKENS_FILENAME, LOCAL_CLI_TOKEN_FILENAME
+import tetolate_cli
 
 
 def archive_bytes() -> bytes:
@@ -67,6 +68,62 @@ class ControlAPITests(unittest.TestCase):
         self.assertNotIn(self.token, json.dumps(records))
         restarted.revoke_control_token(records[0]["id"])
         self.assertIsNone(self.manager.authenticate_control_token(self.token))
+
+    def test_local_cli_credential_is_private_persistent_and_instance_specific(self):
+        path = self.manager.config.jobs_dir / LOCAL_CLI_TOKEN_FILENAME
+        token = tetolate_cli.local_control_token("http://127.0.0.1:8088", self.manager.config.jobs_dir)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(self.manager.authenticate_control_token(token)["local"])
+        self.assertNotIn(token, json.dumps(self.manager.list_control_tokens()))
+        restarted = web_app.JobManager(self.manager.config)
+        restarted.initialize_web_state()
+        self.assertIsNotNone(restarted.authenticate_control_token(token))
+        other_root = self.root / "other"
+        other_root.mkdir()
+        other = self.helper.initialized_manager(other_root)
+        self.assertIsNone(other.authenticate_control_token(token))
+        self.assertIsNone(self.manager.authenticate_control_token("not-a-token"))
+        self.assertIsNone(self.manager.authenticate_control_token("non-ascii-\u00e9"))
+
+    def test_local_cli_access_does_not_make_http_or_browser_access_anonymous(self):
+        token = tetolate_cli.local_control_token("http://localhost", self.manager.config.jobs_dir)
+        async def exercise(client):
+            client.headers.pop("Authorization")
+            response = await client.get("/api/v1/status", headers={"X-Forwarded-For": "127.0.0.1", "X-Tetolate-CLI": "true"})
+            self.assertEqual(response.status_code, 401)
+            client.headers["Authorization"] = "Bearer " + token
+            response = await client.get("/api/v1/status")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn(token, response.text)
+            self.assertEqual((await client.post("/api/v1/pause")).status_code, 200)
+            self.assertTrue(self.manager._paused)
+            self.assertEqual((await client.post("/api/v1/resume")).status_code, 200)
+            self.assertFalse(self.manager._paused)
+            self.assertEqual((await client.post("/admin/pause")).status_code, 303)
+            self.assertFalse(self.manager._paused)
+            response = await client.post("/api/v1/pause", headers={"Origin": "https://other.example"})
+            self.assertEqual(response.status_code, 403)
+            self.assertFalse(self.manager._paused)
+            response = await client.post("/api/v1/tokens", json={"name": "agent", "read_only": True})
+            self.assertEqual(response.status_code, 201)
+            self.assertTrue(response.json()["readOnly"])
+            self.assertNotEqual(response.json()["token"], token)
+            client.headers["Authorization"] = "Bearer " + response.json()["token"]
+            self.assertEqual((await client.post("/api/v1/pause")).status_code, 403)
+        self.run_http(exercise)
+
+    def test_local_cli_credential_rejects_symlinks_and_invalid_content(self):
+        path = self.manager.config.jobs_dir / LOCAL_CLI_TOKEN_FILENAME
+        path.write_text(json.dumps({"token": "do-not-echo-this-secret"}))
+        with self.assertRaises(RuntimeError) as error:
+            self.manager.initialize_web_state()
+        self.assertNotIn("do-not-echo-this-secret", str(error.exception))
+        path.unlink()
+        target = self.root / "target.json"
+        target.write_text("{}")
+        path.symlink_to(target)
+        with self.assertRaises(RuntimeError):
+            self.manager.initialize_web_state()
 
     def test_login_and_read_only_authentication_preserve_browser_boundary(self):
         async def exercise(client):

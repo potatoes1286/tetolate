@@ -62,12 +62,21 @@ cache. LaMa uses the bundled runner's fixed settings and needs no configuration.
 
 `python tetolate_cli.py` controls an existing server; `run.sh` runs a separate local
 translation. The CLI has no third-party dependencies. It does not read or edit the
-server's job files.
+server's job files; it reads only its private local credential.
+
+Local commands need no login. At startup, the server creates a mode-0600
+`.cli-token.json` in its jobs directory. The CLI reads it from
+`$TETOLATE_DATA_DIR/jobs` or `./data/jobs`; use `--jobs-dir` for a custom path.
+Automatic discovery applies only to loopback server addresses and bypasses HTTP
+proxies. Do not share this file: it grants full control. Explicit environment or
+saved control tokens take priority, including read-only tokens.
 
 The JSON API is under `/api/v1/`. It accepts browser admin sessions or
 `Authorization: Bearer <control-token>`. Control tokens apply only to this API;
-VLM API keys are separate. Tokens survive restarts until revoked. The server stores
-token hashes; the CLI stores its token in a mode-0600 configuration file.
+VLM API keys are separate. Remote access still requires a control token. These
+tokens survive restarts until revoked; the server stores their hashes, and remote
+CLI login saves the token in a mode-0600 configuration file. Browser login and
+read-only token restrictions also remain in effect.
 
 Use `schema --json` for endpoint and settings schemas. Settings use snake_case
 names, such as `vlm_model`, `pause_after_ocr`, and `ocr_page_workers`. Partial updates
@@ -105,8 +114,9 @@ does not call the VLM. `jobs pages` lists pages; `jobs page` downloads one.
 Both support `--kind original|final`. `rerun --pages` accepts ranges such as
 `0-3,6,8`; `--from ocr_merge` matches the web OCR & Merge pass.
 
-`tokens create NAME` asks for the admin password and shows a new token once
-without replacing the saved login. It supports `--read-only` and
+`tokens create NAME` shows a new token once without replacing a saved login.
+Local filesystem access needs no password; remote access asks for the admin
+password. It supports `--read-only` and
 `--password-stdin`. `password` changes the admin password and signs out browser
 sessions; control tokens remain valid until revoked. For non-interactive use,
 `password --password-stdin` reads current, new, and confirmation passwords as
@@ -119,7 +129,7 @@ are not exposed through the control API or CLI.
 
 Exit codes: 0 success, 1 server/job error or paused job, 2 invalid arguments or
 local files, 3 authentication/permission error, 4 wait/follow timeout, 5 connection
-error. Non-interactive login requires `--password-stdin`.
+error. Non-interactive remote login requires `--password-stdin`.
 
 ## Container Image
 
@@ -201,4 +211,4 @@ For the first publication, verify all of the following:
 - `docker pull ghcr.io/potatoes1286/tetolate:1.0.0` succeeds when signed out of GHCR.
 - The versioned `compose.yaml` starts tetolate from a directory that does not contain the repository source.
 - `docker compose ps` reports the published image as healthy.
-- The container remains published only on `127.0.0.1:8088`.
+- Confirm the intended port binding: Compose uses `0.0.0.0:8088`; use `127.0.0.1:8088` for local-only access.

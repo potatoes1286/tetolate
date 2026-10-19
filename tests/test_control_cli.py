@@ -70,6 +70,86 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("saved-private-token", stderr.getvalue())
         self.assertEqual(json.loads(stderr.getvalue())["error"]["code"], "unauthorized")
 
+    def local_credential(self):
+        jobs = self.root / "jobs"
+        token = cli.LOCAL_CLI_TOKEN_PREFIX + "A" * 43
+        cli.save_config(jobs / cli.LOCAL_CLI_TOKEN_FILENAME, {"token": token})
+        return jobs, token
+
+    def test_local_credential_is_only_discovered_for_loopback_servers(self):
+        jobs, token = self.local_credential()
+        for host in ("127.0.0.1", "127.12.3.4", "localhost", "[::1]"):
+            with self.subTest(host=host):
+                self.assertEqual(cli.local_control_token(f"http://{host}:8088", jobs), token)
+        with mock.patch.object(Path, "lstat", side_effect=AssertionError("Do not read local keys for remote servers")):
+            for host in ("other.example", "192.168.1.10", "127.0.0.1.example", "0.0.0.0"):
+                self.assertIsNone(cli.local_control_token(f"http://{host}:8088", jobs))
+        self.assertIsNone(cli.local_control_token("http://localhost", self.root / "missing"))
+
+    def test_local_credential_rejects_public_files_symlinks_and_bad_content(self):
+        jobs, token = self.local_credential()
+        path = jobs / cli.LOCAL_CLI_TOKEN_FILENAME
+        path.chmod(0o644)
+        with self.assertRaises(cli.ClientError):
+            cli.local_control_token("http://localhost", jobs)
+        path.unlink()
+        target = self.root / "private.json"
+        cli.save_config(target, {"token": token})
+        path.symlink_to(target)
+        with self.assertRaises(cli.ClientError):
+            cli.local_control_token("http://localhost", jobs)
+        path.unlink()
+        for data in ({"token": "private-invalid-token"}, [], {"token": 3}):
+            path.write_text(json.dumps(data))
+            path.chmod(0o600)
+            with self.assertRaises(cli.ClientError) as error:
+                cli.local_control_token("http://localhost", jobs)
+            self.assertNotIn("private-invalid-token", str(error.exception))
+
+    def test_local_commands_need_no_login_or_saved_config(self):
+        jobs, token = self.local_credential()
+        config = self.root / "cli.json"
+        for options in (["--jobs-dir", str(jobs)], []):
+            with (mock.patch.dict(os.environ, {"TETOLATE_CONTROL_TOKEN": "", "TETOLATE_SERVER_URL": "", "TETOLATE_DATA_DIR": str(self.root)}),
+                  mock.patch.object(cli.Client, "request", return_value={"state": "idle"}) as request,
+                  mock.patch.object(cli.getpass, "getpass", side_effect=AssertionError("No password prompt")),
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                result = cli.main(["--config", str(config), "--server", "http://127.0.0.1:8088", "--json", "status", *options])
+            self.assertEqual(result, 0)
+            request.assert_called_once_with("GET", "/status")
+            self.assertNotIn(token, output.getvalue())
+            self.assertFalse(config.exists())
+
+    def test_explicit_remote_credentials_take_priority_over_local_discovery(self):
+        jobs, _ = self.local_credential()
+        config = self.root / "cli.json"
+        cli.save_config(config, {"server": "http://127.0.0.1:8088", "token": "saved-token"})
+        for environment, expected in (("", "saved-token"), ("environment-token", "environment-token")):
+            with (mock.patch.dict(os.environ, {"TETOLATE_CONTROL_TOKEN": environment}),
+                  mock.patch.object(cli, "local_control_token", side_effect=AssertionError("Do not override explicit credentials")),
+                  mock.patch.object(cli, "execute", return_value={}) as execute,
+                  contextlib.redirect_stdout(io.StringIO())):
+                self.assertEqual(cli.main(["--config", str(config), "--jobs-dir", str(jobs), "status"]), 0)
+            self.assertEqual(execute.call_args.args[0].token, expected)
+
+    def test_local_credential_bypasses_http_proxies(self):
+        _, token = self.local_credential()
+        with mock.patch.object(cli, "build_opener") as build:
+            cli.Client("http://localhost:8088", token)
+        self.assertEqual(build.call_args.args[0].proxies, {})
+
+    def test_local_token_creation_and_logout_need_no_password(self):
+        _, token = self.local_credential()
+        client = cli.Client("http://localhost:8088", token)
+        with (mock.patch.object(cli.getpass, "getpass", side_effect=AssertionError("No password prompt")),
+              mock.patch.object(client, "request", return_value={"token": "new-token"}) as request):
+            self.execute(["tokens", "create", "agent", "--read-only"], client)
+            request.assert_called_once_with("POST", "/tokens", {"name": "agent", "read_only": True})
+            request.reset_mock()
+            _, result = self.execute(["logout"], client)
+            request.assert_not_called()
+            self.assertIn("does not use a saved login", result["message"])
+
     def test_multipart_streams_archive_and_sets_exact_length(self):
         path = self.root / "book.cbz"
         path.write_bytes(b"file data" * 200000)

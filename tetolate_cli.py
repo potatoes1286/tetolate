@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 from http.client import HTTPException as HTTPTransportError
 import json
 import math
@@ -12,15 +13,18 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import stat
 import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
 API = "/api/v1"
+LOCAL_CLI_TOKEN_FILENAME = ".cli-token.json"
+LOCAL_CLI_TOKEN_PREFIX = "tetolate_local_"
 EXIT_AUTH = 3
 EXIT_TIMEOUT = 4
 EXIT_CONNECTION = 5
@@ -74,6 +78,35 @@ def save_config(path: Path, data: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def local_control_token(server: str, jobs_dir: Path) -> str | None:
+    """Use filesystem authority only for local servers, never a remote URL."""
+    host = urlsplit(server).hostname
+    if host != "localhost":
+        try:
+            if not ipaddress.ip_address(host).is_loopback:
+                return None
+        except ValueError:
+            return None
+    path = jobs_dir / LOCAL_CLI_TOKEN_FILENAME
+    try:
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode) or mode & 0o077:
+            raise ClientError("Local CLI credential must be a private regular file (mode 0600).", EXIT_AUTH, "unauthorized")
+        with path.open(encoding="utf-8") as source:
+            data = json.loads(source.read(1024))
+        token = data.get("token") if isinstance(data, dict) else None
+        if (not isinstance(token, str) or not token.startswith(LOCAL_CLI_TOKEN_PREFIX)
+                or len(token) != len(LOCAL_CLI_TOKEN_PREFIX) + 43
+                or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+                       for char in token[len(LOCAL_CLI_TOKEN_PREFIX):])):
+            raise ClientError("Invalid local CLI credential.", EXIT_AUTH, "unauthorized")
+        return token
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, UnicodeError):
+        raise ClientError("Cannot read local CLI credential. Check --jobs-dir and file permissions.", EXIT_AUTH, "unauthorized") from None
+
+
 class Multipart:
     """A streamed request body with a known length; files are not loaded into RAM."""
     def __init__(self, files: Path | list[tuple[str, Path]], fields: dict):
@@ -105,11 +138,13 @@ class Multipart:
 class Client:
     def __init__(self, server: str, token: str | None = None, request_timeout: float = 30):
         self.server = server_url(server)
-        if token is not None and (not isinstance(token, str) or len(token) > 256 or any(char.isspace() or char == "\0" for char in token)):
+        if token is not None and (not isinstance(token, str) or not token.isascii() or len(token) > 256 or any(char.isspace() or char == "\0" for char in token)):
             raise ClientError("Invalid control token.", EXIT_AUTH, "unauthorized")
         self.token = token
         self.timeout = request_timeout
-        self.opener = build_opener(NoRedirect())
+        # A local filesystem credential must not pass through an HTTP proxy.
+        self.opener = (build_opener(ProxyHandler({}), NoRedirect())
+                       if token and token.startswith(LOCAL_CLI_TOKEN_PREFIX) else build_opener(NoRedirect()))
 
     def open(self, method: str, path: str, data=None, *, multipart: Multipart | None = None, timeout: float | None = None):
         headers = {"Accept": "application/json"}
@@ -184,6 +219,7 @@ def parser() -> argparse.ArgumentParser:
     for flags, kwargs in [
         (("--server",), {"help": "Server URL; or TETOLATE_SERVER_URL"}),
         (("--config",), {"type": Path, "help": "CLI credential file"}),
+        (("--jobs-dir",), {"type": Path, "help": "Server jobs directory for login-free local access (default: TETOLATE_DATA_DIR/jobs or ./data/jobs)"}),
         (("--json",), {"action": "store_true", "help": "JSON output for scripts and agents"}),
         (("--request-timeout",), {"type": positive_float, "help": "Seconds per HTTP request (default: 30)"}),
     ]:
@@ -196,7 +232,7 @@ def parser() -> argparse.ArgumentParser:
 
     for name in ("status", "pause", "resume", "logout", "schema"):
         command(groups, name)
-    login = command(groups, "login", help="Save a persistent control token using the admin password")
+    login = command(groups, "login", help="Save a control token for remote access; local access needs no login")
     login.add_argument("--name", default="terminal")
     login.add_argument("--read-only", action="store_true")
     login.add_argument("--password-stdin", action="store_true", help="Read password from stdin instead of prompting")
@@ -408,6 +444,9 @@ def resolve_series(client: Client, args) -> str:
 
 def execute(client: Client, args, config_path: Path, config: dict):
     group = args.group
+    local_access = bool(client.token and client.token.startswith(LOCAL_CLI_TOKEN_PREFIX))
+    if local_access and group == "tokens" and args.action == "create":
+        return client.request("POST", "/tokens", {"name": args.name, "read_only": args.read_only})
     if group == "login" or (group == "tokens" and args.action == "create"):
         password = password_input(args, "Admin password: ")
         # Authentication must not use a possibly stale token from the client config.
@@ -419,7 +458,7 @@ def execute(client: Client, args, config_path: Path, config: dict):
         save_config(config_path, {"server": client.server, "token": result["token"]})
         return {"server": client.server, "tokenId": result["id"], "readOnly": result["readOnly"], "config": str(config_path)}
     if not client.token:
-        raise ClientError("Run login or set TETOLATE_CONTROL_TOKEN first.", EXIT_AUTH, "unauthorized")
+        raise ClientError("Local access needs the running server's jobs directory (--jobs-dir). For remote access, use login or TETOLATE_CONTROL_TOKEN.", EXIT_AUTH, "unauthorized")
     if group == "password":
         current = password_input(args, "Current password: ")
         new = password_input(args, "New password: ")
@@ -433,6 +472,8 @@ def execute(client: Client, args, config_path: Path, config: dict):
         data.update({key: value for key, value in {"category": args.category, "job_id": args.job_id}.items() if value is not None})
         return client.request("POST", "/vlm/test", data)
     if group == "logout":
+        if local_access:
+            return {"message": "Local CLI access does not use a saved login."}
         parts = client.token.split("_", 2)
         if len(parts) != 3:
             raise ClientError("Invalid control token.", EXIT_AUTH)
@@ -564,6 +605,9 @@ def main(argv=None) -> int:
         token = os.environ.get("TETOLATE_CONTROL_TOKEN") or None
         if not token and config.get("server") and server_url(config["server"]) == address:
             token = config.get("token")
+        if not token and args.group != "login":
+            jobs_dir = getattr(args, "jobs_dir", Path(os.environ.get("TETOLATE_DATA_DIR", "data")) / "jobs")
+            token = local_control_token(address, jobs_dir.expanduser())
         client = Client(address, token, getattr(args, "request_timeout", 30))
         result = execute(client, args, config_path, config)
         display(result, machine)

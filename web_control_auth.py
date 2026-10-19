@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 from datetime import datetime, timezone
 from typing import Any
@@ -13,9 +14,27 @@ import web_security
 
 
 CONTROL_TOKENS_FILENAME = ".control-tokens.json"
+LOCAL_CLI_TOKEN_FILENAME = ".cli-token.json"
 
 
 class ControlAuthMixin:
+    def initialize_local_cli_token(self) -> None:
+        path = self.config.jobs_dir / LOCAL_CLI_TOKEN_FILENAME
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError("Local CLI credential must be a regular file.")
+        if path.exists():
+            try:
+                token = web_security.read_json_object(path).get("token")
+            except ValueError:
+                raise RuntimeError("Cannot read local CLI credential.") from None
+            if not isinstance(token, str) or not re.fullmatch(r"tetolate_local_[A-Za-z0-9_-]{43}", token):
+                raise RuntimeError("Invalid local CLI credential.")
+            path.chmod(0o600)
+        else:
+            token = "tetolate_local_" + secrets.token_urlsafe(32)
+            web_security.write_private_json_atomic(path, {"token": token})
+        self._local_cli_token = token
+
     def load_control_tokens(self) -> dict[str, Any]:
         path = self.config.jobs_dir / CONTROL_TOKENS_FILENAME
         return web_security.read_json_object(path) if path.exists() else {}
@@ -44,6 +63,10 @@ class ControlAuthMixin:
         return {"token": token, **{key: value for key, value in record.items() if key != "hash"}}
 
     def authenticate_control_token(self, token: str) -> dict[str, Any] | None:
+        if not isinstance(token, str) or not token.isascii():
+            return None
+        if self._local_cli_token and secrets.compare_digest(token, self._local_cli_token):
+            return {"id": "local", "name": "Local filesystem access", "readOnly": False, "local": True}
         parts = token.split("_", 2)
         if len(parts) != 3 or parts[0] != "tetolate":
             return None

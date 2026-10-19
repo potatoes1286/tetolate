@@ -93,7 +93,7 @@ and select PaddleOCR-VL in the job's advanced options.
 
 #### Expose to Network
 
-By default, the docker container will only listen to local requests (same computer). To access the web UI from another computer within the same network, change `127.0.0.1` to `0.0.0.0` in `compose.yaml`. It is highly NOT advised to expose it further to WAN requests.
+Compose publishes port 8088 on all interfaces, so other computers on your LAN can connect. Change `0.0.0.0` to `127.0.0.1` in `compose.yaml` for local-only access. Change the default password before allowing LAN access. Do not expose it to the internet.
 
 #### Fonts
 
@@ -128,7 +128,6 @@ Use `tetolate_cli.py` from the repository, or copy it from your container:
 
 ```bash
 podman cp tetolate:/app/tetolate_cli.py ./tetolate_cli.py
-python3 tetolate_cli.py login
 python3 tetolate_cli.py status
 python3 tetolate_cli.py jobs list --json
 python3 tetolate_cli.py jobs submit chapter.cbz --set vlm_model=YOUR_MODEL
@@ -150,9 +149,14 @@ python3 tetolate_cli.py jobs page JOB_ID 0 --kind final --output page.png
 python3 tetolate_cli.py password
 ```
 
-Login asks for the admin password and saves a separate control token in
-`~/.config/tetolate/cli.json` (or under `XDG_CONFIG_HOME`). Use `--server` for another
-server, `login --read-only` for read access, and `logout` to revoke the current token.
+Local CLI access needs no login. Start the updated server first; the CLI reads its
+private credential from `./data/jobs` or `$TETOLATE_DATA_DIR/jobs`. Use `--jobs-dir`
+for another jobs directory. Inside the container, use `podman exec tetolate tetolate status`.
+Local access has full control and does not create a saved login.
+
+Remote access still needs `login --server http://HOST:8088` or a control token.
+Login saves the token in `~/.config/tetolate/cli.json` (or under `XDG_CONFIG_HOME`).
+Use `login --read-only` for read access and `logout` to revoke a saved token.
 Tokens can also be created and revoked under **Terminal access** on the admin page.
 
 For agents, use `--json`, `--help`, and `schema --json`. Credentials can come from

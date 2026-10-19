@@ -224,8 +224,9 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
 
     @router.post("/tokens", status_code=201)
     async def create_token(request: Request, data: TokenName):
-        # Only the browser admin session can mint tokens without a password.
-        if getattr(request.state, "control_auth", None):
+        # Filesystem access grants the same authority as the browser administrator.
+        auth = getattr(request.state, "control_auth", None)
+        if auth and not auth.get("local"):
             raise HTTPException(403, "Use admin login to create a control token.")
         return get_manager(request).create_control_token(data.name, data.read_only)
 
@@ -574,7 +575,7 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
     def control_openapi():
         document = original_openapi()
         document.setdefault("components", {}).setdefault("securitySchemes", {})["ControlToken"] = {
-            "type": "http", "scheme": "bearer", "description": "Persistent Tetolate control token. Obtain with /api/v1/auth/login.",
+            "type": "http", "scheme": "bearer", "description": "The local CLI reads its private credential from the jobs directory. Remote clients obtain a control token with /api/v1/auth/login.",
         }
         for path, operations in document["paths"].items():
             if path.startswith("/api/v1/"):

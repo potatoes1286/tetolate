@@ -1421,6 +1421,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         self._active_processes: dict[tuple[str, str], subprocess.Popen[str]] = {}
         self._worker: threading.Thread | None = None
         self._password_hash = ""
+        self._local_cli_token = ""
         self._categories: set[str] = set()
         self._admin_sessions: dict[str, float] = {}
         self._admin_login_failures: dict[str, list[float]] = {}
@@ -1605,6 +1606,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             self._categories = categories
             if new_installation:
                 self.category_dir(DEFAULT_CATEGORY).mkdir(parents=True, exist_ok=True)
+            self.initialize_local_cli_token()
             self.save_web_state()
 
     def password_matches_hash(self, password: str, password_hash: str) -> bool:
