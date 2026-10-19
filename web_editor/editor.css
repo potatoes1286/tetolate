@@ -42,7 +42,7 @@ body { margin: 0; max-width: none; background: #f7f7f7; color: #181818; }
 .canvas-wrap { flex: 1; min-height: 20rem; overflow: auto; display: flex; justify-content: center; align-items: flex-start; background: #20252a; padding: 0.75rem; }
 #page-canvas { display: block; max-width: 100%; height: auto; background: white; touch-action: none; }
 .status-line { min-height: 1.4rem; margin: 0; padding: 0.35rem 0.65rem; background: white; border-top: 1px solid #ccc; }
-.status-line.error { color: #a40000; }
+.status-line.error { color: #a40000; white-space: pre-wrap; }
 #record-form label, #notes-panel label { margin-bottom: 0.65rem; }
 #record-form input:not([type="checkbox"]), #record-form select, #record-form textarea, #notes-panel textarea { box-sizing: border-box; width: 100%; }
 .field-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.4rem; }

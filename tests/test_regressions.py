@@ -2778,7 +2778,7 @@ class PipelineSmokeTests(unittest.TestCase):
                 fixture_dir=fixture_dir,
             )
             config = translate_cbz.load_config(None, fixture_dir)
-            with mock.patch.object(
+            with mock.patch.object(paddle_ocr_image, "check_paddleocr_vl_endpoint"), mock.patch.object(
                 paddle_ocr_image,
                 "create_paddleocr_vl",
                 return_value=mock.sentinel.ocr,
@@ -2840,7 +2840,7 @@ class PipelineSmokeTests(unittest.TestCase):
                 fixture_dir=fixture_dir,
             )
             config = translate_cbz.load_config(None, fixture_dir)
-            with mock.patch.object(
+            with mock.patch.object(paddle_ocr_image, "check_paddleocr_vl_endpoint"), mock.patch.object(
                 paddle_ocr_image,
                 "create_paddleocr_vl",
                 return_value=mock.sentinel.ocr,

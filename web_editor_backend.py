@@ -1655,12 +1655,13 @@ class EditorManagerMixin:
         config = translate_cbz.load_config(self.config.pipeline_config, None)
         status = self.load_status(code, job_id) or {}
         ocr_config = self.ocr_config_for_status(config.ocr, status)
+        secrets = self.load_job_secrets(code, job_id)
         if ocr_config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
             ocr = paddle_ocr_image.create_paddleocr_vl(
                 ocr_config.device,
                 ocr_config.paddleocr_vl_server_url,
                 ocr_config.paddleocr_vl_model,
-                api_key=ocr_config.paddleocr_vl_api_key,
+                api_key=secrets.get("paddleocrVlAuthToken") or ocr_config.paddleocr_vl_api_key,
                 max_concurrency=ocr_config.paddleocr_vl_max_concurrency,
                 service_url=ocr_config.service_url,
                 service_timeout=ocr_config.service_timeout,

@@ -3153,7 +3153,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             vlm_base_url,
             self.config.default_vlm_base_url,
         )
-        vlm_model = validate_vlm_model(vlm_model)
+        vlm_model = validate_vlm_model(vlm_model) if vlm_model.strip() else ""
         source_language = translate_cbz.normalize_source_language(source_language)
         ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
         ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")

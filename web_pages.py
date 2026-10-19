@@ -272,6 +272,101 @@ CATEGORY_OPTIONS_SCRIPT = """
 """
 
 
+JOB_OPTIONS_SCRIPT = """
+<script>
+function initJobOptions() {
+  const form = document.querySelector("form[data-job-options]");
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = "1";
+  form.noValidate = true;
+  const status = form.querySelector("[data-job-options-status]");
+  const names = {
+    enable_alt_placement: "alt_placement_enabled", enable_proofreading: "proofread_translations",
+    enable_translation_notes: "write_translation_notes", auto_translate_comicinfo_title: "auto_translate_comicinfo_title",
+    pause_after_ocr: "pause_after_ocr", source_language: "source_language", ocr_engine: "ocr_engine",
+    paddleocr_vl_server_url: "paddleocr_vl_server_url", paddleocr_vl_model: "paddleocr_vl_model",
+    ocr_page_workers: "ocr_page_workers", lama_workers: "lama_workers", imagemagick_workers: "imagemagick_workers",
+    vlm_base_url: "vlm_base_url", vlm_model: "vlm_model", thinking_budget_tokens: "thinking_budget_tokens",
+    vlm_auth_token: "vlm_auth_token", paddleocr_vl_auth_token: "paddleocr_vl_auth_token",
+    clear_vlm_auth_token: "clear_vlm_auth_token", clear_paddleocr_vl_auth_token: "clear_paddleocr_vl_auth_token",
+  };
+  let pending = Promise.resolve(), active = 0;
+  const timers = new Map(), sent = new Map(), versions = new Map(), failed = new Map();
+  function updateStatus() {
+    if (!active && !timers.size) status.textContent = failed.size
+      ? `Not saved: ${[...failed.values()].join(" ")}` : "Advanced options saved.";
+  }
+  function save(input) {
+    const name = names[input.name];
+    if (!name) return;
+    clearTimeout(timers.get(input)); timers.delete(input);
+    const version = (versions.get(name) || 0) + 1;
+    if ((input.name !== "vlm_model" && !input.checkValidity()) || (input.type === "number" && input.value === "")) {
+      versions.set(name, version); failed.set(name, "Enter a valid value."); updateStatus(); return;
+    }
+    const value = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+    if (input.type === "password" && !value) {
+      versions.set(name, version); failed.delete(name); sent.delete(name);
+      updateStatus(); return; // Blank keeps the saved key.
+    }
+    if (sent.get(name) === value && !failed.has(name)) { updateStatus(); return; }
+    versions.set(name, version); sent.set(name, value); active++;
+    status.textContent = "Saving advanced options...";
+    pending = pending.then(async () => {
+      try {
+        const response = await fetch(form.dataset.jobOptions, {
+          method: "PATCH", headers: {"Content-Type": "application/json"},
+          credentials: "same-origin", body: JSON.stringify({[name]: value}),
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          let message = `HTTP ${response.status}`;
+          try { const data = JSON.parse(body); message = data.error?.message || data.detail || message; } catch {}
+          throw new Error(message);
+        }
+        if (versions.get(name) === version) failed.delete(name);
+      } catch (error) {
+        if (versions.get(name) === version) failed.set(name, error.message);
+      } finally { active--; updateStatus(); }
+    });
+  }
+  function flush() { for (const input of [...timers.keys()]) save(input); }
+  async function finishSaving() {
+    do { flush(); await pending; } while (active || timers.size);
+    return !failed.size;
+  }
+  const options = form.querySelector("details");
+  options.addEventListener("change", (event) => save(event.target));
+  options.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!names[input.name]) return;
+    clearTimeout(timers.get(input));
+    timers.set(input, setTimeout(() => save(input), 250));
+    status.textContent = "Saving advanced options...";
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    for (const input of form.elements) save(input);
+  });
+  document.addEventListener("click", async (event) => {
+    const link = event.target.closest("a[href]");
+    if (!form.isConnected || !link || event.defaultPrevented || event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey
+        || link.target || link.hasAttribute("download") || !(active || timers.size || failed.size)) return;
+    event.preventDefault();
+    if (!await finishSaving()) { updateStatus(); return; }
+    window.location.assign(link.href);
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (!form.isConnected) return;
+    flush();
+    if (active || failed.size) { event.preventDefault(); event.returnValue = ""; }
+  });
+}
+initJobOptions();
+</script>
+"""
+
+
 def escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -1088,7 +1183,8 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     imagemagick_workers = int(status.get("imagemagickWorkers") or 1)
     advanced_options_html = (
         f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/advanced-options" method="post">
+<form action="/job/{escape(code)}/{escape(job_id)}/advanced-options" method="post" data-job-options="/api/v1/jobs/{escape(job_id)}/settings?category={escape(code)}">
+  <p class="muted" data-job-options-status role="status">Options save automatically.</p>
   {advanced_options_fields(
       thinking_budget,
       vlm_base_url,
@@ -1205,6 +1301,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 <h2>Recent Log</h2>
 <pre id="log" class="job-log">{escape(log_text)}</pre>
 {VLM_CONNECTION_TEST_SCRIPT}
+{JOB_OPTIONS_SCRIPT}
 <script>
 const code = {json.dumps(code)};
 const jobId = {json.dumps(job_id)};
@@ -1338,7 +1435,8 @@ function advancedOptionsMarkup(data) {{
   const clearVlm = data.hasVlmAuthToken
     ? `<label><input name="clear_vlm_auth_token" type="checkbox" value="1"> Remove saved translation VLM token</label>`
     : "";
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post">
+  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post" data-job-options="/api/v1/jobs/${{encodeURIComponent(jobId)}}/settings?category=${{encodeURIComponent(code)}}">
+    <p class="muted" data-job-options-status role="status">Options save automatically.</p>
     <details><summary>Advanced options</summary>
       <fieldset><legend>Workflow</legend>
         <label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label>
@@ -1417,6 +1515,7 @@ async function refreshStatus() {{
       advancedOptions.innerHTML = "";
     }} else if (!advancedOptions.querySelector("form")) {{
       advancedOptions.innerHTML = advancedOptionsMarkup(data);
+      initJobOptions();
     }}
     document.getElementById("restart").innerHTML = restartMarkup(data);
     document.getElementById("terminate").innerHTML = terminateMarkup(data);

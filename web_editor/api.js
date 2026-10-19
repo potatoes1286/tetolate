@@ -4,13 +4,14 @@ async function checkedResponse(url, options = {}) {
   const response = await fetch(url, { cache: "no-store", ...options });
   if (!response.ok) {
     let message = response.statusText;
+    const body = await response.text();
     try {
-      const data = await response.json();
-      message = data.detail || message;
+      const data = JSON.parse(body);
+      message = data.detail || data.error?.message || message;
     } catch {
-      message = (await response.text()) || message;
+      message = body.trim().startsWith("<") ? message : body.trim() || message;
     }
-    const error = new Error(message);
+    const error = new Error(message || `Request failed (HTTP ${response.status}).`);
     error.status = response.status;
     throw error;
   }

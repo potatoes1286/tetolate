@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import base64
 import importlib
+from http import HTTPStatus
 import json
 import math
 import os
 import re
+import socket
 import sys
 import tempfile
 import urllib.error
@@ -586,6 +588,52 @@ def create_paddle_ocr(
         ) from exc
 
 
+def check_paddleocr_vl_endpoint(server_url: str, model_name: str, *, api_key: str | None = None) -> None:
+    """Check reachability, API shape, authentication and model before loading OCR."""
+    endpoint = normalize_ocr_service_url(server_url)
+    if endpoint is None:
+        raise InputError("Set the PaddleOCR-VL inference endpoint in Advanced Options.")
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.username is not None or parsed.password is not None:
+        raise InputError("Use the OCR auth token field, not credentials in the endpoint URL.")
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(f"{endpoint}/models", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = response.read(1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        reason = HTTPStatus(exc.code).phrase if exc.code in HTTPStatus._value2member_map_ else "HTTP error"
+        if exc.code in {401, 403}:
+            detail = "The PaddleOCR-VL endpoint rejected the request. Check the OCR API key."
+        elif exc.code == 404:
+            detail = "The PaddleOCR-VL model-list API was not found. Most endpoints require an address ending in /v1."
+        else:
+            detail = "The PaddleOCR-VL endpoint returned an error. Check the address and port; another service may be using this port."
+        raise InputError(f"{detail}\nEndpoint: {endpoint}\nEndpoint error: {exc.code} {reason}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.gaierror):
+            detail = f"Could not find the OCR server hostname '{parsed.hostname}'. Container names usually work only inside the container network. If Tetolate runs on the host, use the host address and the OCR container's published port."
+        elif isinstance(reason, (TimeoutError, socket.timeout)):
+            detail = "The PaddleOCR-VL endpoint did not respond within 5 seconds. Check the address, port, and model server."
+        else:
+            detail = "Could not connect to the PaddleOCR-VL endpoint. Check that the model server is running and its port is reachable from Tetolate."
+        if parsed.port is None:
+            detail += "\n- Did you forget to set the port?"
+        raise InputError(f"{detail}\nEndpoint: {endpoint}") from exc
+    try:
+        data = json.loads(body) if len(body) <= 1024 * 1024 else None
+        models = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(models, list) or not all(isinstance(model, dict) and isinstance(model.get("id"), str) for model in models):
+            raise ValueError("Invalid model list")
+    except (ValueError, UnicodeError) as exc:
+        raise InputError(f"The OCR endpoint did not return an OpenAI-compatible model list. Check the address and port; this may be a different service.\nEndpoint: {endpoint}") from exc
+    if model_name not in {model["id"] for model in models}:
+        raise InputError(f"The OCR endpoint does not list model '{model_name}'. Check the PaddleOCR-VL model name in Advanced Options.\nEndpoint: {endpoint}")
+
+
 def create_paddleocr_vl(
     device: str,
     server_url: str = DEFAULT_PADDLEOCR_VL_SERVER_URL,
@@ -615,6 +663,7 @@ def create_paddleocr_vl(
             kwargs,
         )
 
+    check_paddleocr_vl_endpoint(server_url, model_name, api_key=api_key)
     configure_paddlex_runtime(device)
 
     try:
@@ -651,7 +700,19 @@ def run_paddle_ocr(ocr: Any, input_image: Path) -> Any:
 def run_paddleocr_vl(ocr: Any, input_image: Path) -> Any:
     if not hasattr(ocr, "predict"):
         raise InputError("Unsupported PaddleOCR-VL object: no predict() method found.")
-    return ocr.predict(str(input_image))
+    try:
+        return ocr.predict(str(input_image))
+    except InputError:
+        raise
+    except Exception as exc:
+        message = str(exc).lower()
+        if any(word in message for word in ("connection", "connecterror", "timed out", "timeout")):
+            detail = "Could not connect to the PaddleOCR-VL inference endpoint. Check the job's OCR endpoint and make sure the model server is reachable from Tetolate."
+        elif any(word in message for word in ("401", "403", "unauthorized", "forbidden")):
+            detail = "The PaddleOCR-VL inference endpoint rejected the request. Check the job's OCR API key."
+        else:
+            detail = f"PaddleOCR-VL could not process the selected image ({type(exc).__name__}). Check the OCR server log."
+        raise InputError(detail) from exc
 
 
 def close_ocr_engine(ocr: Any) -> None:

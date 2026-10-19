@@ -4708,11 +4708,20 @@ def rewind_resume_page_for_missing_artifacts(
     return requested_page
 
 
+def check_ocr_endpoint(config: OCRConfig) -> None:
+    if config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL and not config.service_url:
+        paddle_ocr_image.check_paddleocr_vl_endpoint(
+            config.paddleocr_vl_server_url, config.paddleocr_vl_model,
+            api_key=config.paddleocr_vl_api_key,
+        )
+
+
 def run_full_pipeline(
     args: argparse.Namespace,
     config: PipelineConfig,
     translation_notes: dict[str, Any],
 ) -> None:
+    check_ocr_endpoint(config.ocr)
     prepare_output_dir(args.output_dir, args.overwrite)
 
     pages = extract_cbz(args.input_cbz, args.output_dir)
@@ -4887,6 +4896,9 @@ def run_resume_pipeline(
         )
     if phase in {"extract", "proofreading", "translation_notes", "package"} and args.resume_page != 0:
         raise PipelineError(f"--resume-page is not used with --resume-from {phase}.")
+
+    if phase in {"extract", "ocr_raw"}:
+        check_ocr_endpoint(config.ocr)
 
     if phase == "extract":
         pages = extract_cbz(args.input_cbz, args.output_dir)

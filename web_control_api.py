@@ -357,7 +357,7 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         manager = get_manager(request)
         code = find_job(manager, job_id, category)
         changes = data.changes()
-        options = resolve_settings(manager, code, changes, job_id)
+        options = resolve_settings(manager, code, changes, job_id, require_model=False)
         manager.update_job_advanced_options(code, job_id, **options,
             clear_vlm_auth_token=data.clear_vlm_auth_token, clear_paddleocr_vl_auth_token=data.clear_paddleocr_vl_auth_token)
         return manager.public_status(code, job_id, include_log=False)

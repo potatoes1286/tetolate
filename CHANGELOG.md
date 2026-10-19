@@ -21,6 +21,8 @@
 
 ### Fixed
 
+- Job Advanced Options save automatically before opening the editor, including OCR endpoints and API keys.
+- OCR checks its inference endpoint before model setup and reports readable connection, authentication, and model errors.
 - Source launchers include required OCR dependencies by default.
 - Clearing the editor font size restores automatic sizing and stays cleared after saving.
 - Typesetting saves preserve pending OCR and translation changes.

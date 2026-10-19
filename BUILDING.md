@@ -54,6 +54,11 @@ Start the web interface with:
 
 Both launchers install the OCR and LaMa dependencies automatically.
 
+Stopped jobs save Advanced Options automatically. Opening the editor waits for
+pending saves; a failed save keeps you on the job page. OCR checks the inference
+server's model list before local model setup. When Tetolate runs on the host,
+use the OCR container's published host port, not its container-network name.
+
 The first render downloads the SHA-256-verified `big-lama.pt` model to the Torch
 cache. LaMa uses the bundled runner's fixed settings and needs no configuration.
 
