@@ -60,6 +60,9 @@ STAGE_FIELDS: dict[str, dict[str, frozenset[str] | None]] = {
                 "manualLineBreaks",
                 "minPointSize",
                 "maxPointSize",
+                "rotation",
+                "skewX",
+                "skewY",
             }
         )
     },

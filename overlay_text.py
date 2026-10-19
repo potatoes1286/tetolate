@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PIL import ImageFont
+from PIL import Image, ImageFont
 
 
 DEFAULT_FONT = str(
@@ -27,6 +27,7 @@ DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3
 DEFAULT_MIN_POINT_SIZE = 14
 DEFAULT_RENDER_BLEED = 8
+TEXT_TRANSFORM_LIMITS = {"rotation": 180, "skewX": 60, "skewY": 60}
 PAGE_HEIGHT_MIN_POINT_RATIO = 0.008
 PAGE_HEIGHT_MAX_POINT_RATIO = 0.024
 PAGE_HEIGHT_STROKE_WIDTH_RATIO = 0.0012
@@ -118,7 +119,18 @@ def selected_entries(entries: list[dict[str, Any]], page: int | None) -> list[di
     return selected
 
 
+def validate_text_transform(index: int, item: dict[str, Any]) -> None:
+    for field, limit in TEXT_TRANSFORM_LIMITS.items():
+        if field not in item:
+            continue
+        value = item[field]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not -limit <= value <= limit):
+            raise InputError(f"Entry {index} {field} must be between {-limit} and {limit} degrees.")
+
+
 def validate_entry(index: int, item: dict[str, Any]) -> None:
+    validate_text_transform(index, item)
     region = item.get("region")
     if not isinstance(region, list) or len(region) != 4:
         raise InputError(f"Entry {index} must have region as a list of four numbers.")
@@ -635,6 +647,38 @@ def explicit_pointsize_args(
     return ["-pointsize", f"{point_size:g}"]
 
 
+def text_transform_args(entry: dict[str, Any], width: int, height: int) -> list[str]:
+    """Shear X, shear Y, then rotate clockwise, with one resampling pass."""
+    validate_text_transform(0, entry)
+    rotation, skew_x, skew_y = (entry.get(field, 0) for field in TEXT_TRANSFORM_LIMITS)
+    if not (rotation or skew_x or skew_y):
+        return []
+    angle = math.radians(rotation)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    x, y = math.tan(math.radians(skew_x)), math.tan(math.radians(skew_y))
+    a, b = cosine - sine * y, sine + cosine * y
+    c, d = cosine * x - sine * (1 + x * y), sine * x + cosine * (1 + x * y)
+    # Two pixels of resampling border. Matching parity keeps the center and
+    # composite offset on whole pixels, including odd-sized layout boxes.
+    out_width = math.ceil(round(abs(a) * width + abs(c) * height, 10)) + 4
+    out_height = math.ceil(round(abs(b) * width + abs(d) * height, 10)) + 4
+    out_width += (width - out_width) % 2
+    out_height += (height - out_height) % 2
+    # ImageMagick distortion coordinates put the first pixel center at 0.5.
+    center_x, center_y = width / 2, height / 2
+    dx = out_width / 2 - a * center_x - c * center_y
+    dy = out_height / 2 - b * center_x - d * center_y
+    matrix = ",".join(f"{value:.12g}" for value in (a, b, c, d, dx, dy))
+    # Use exact pixels for right angles only when the centered grids line up.
+    exact_rotation = (not (skew_x or skew_y) and rotation % 90 == 0
+                      and (rotation % 180 == 0 or width % 2 == height % 2))
+    filter_args = ["-filter", "point"] if exact_rotation else []
+    return ["+repage", "-background", "none", "-virtual-pixel", "transparent",
+            *filter_args,
+            "-define", f"distort:viewport={out_width}x{out_height}+0+0",
+            "-distort", "AffineProjection", matrix, "+repage", "-depth", "8"]
+
+
 def text_layer_args(
     entry: dict[str, Any],
     text_path: Path,
@@ -716,6 +760,7 @@ def text_layer_args(
             f"{layer_width}x{layer_height}",
         ")",
         "-composite",
+        *text_transform_args(entry, layer_width, layer_height),
     ]
 
 
@@ -750,19 +795,20 @@ def composite_layer(
     entry: dict[str, Any],
 ) -> None:
     left, top, width, height = rounded_region(entry["region"])
-    del width, height
-    bleed = render_bleed(entry)
+    with Image.open(layer_path) as layer:
+        left += (width - layer.width) // 2
+        top += (height - layer.height) // 2
 
     command = [
         magick,
         str(base_path),
         str(layer_path),
         "-geometry",
-        f"+{left - bleed}+{top - bleed}",
+        f"{left:+d}{top:+d}",
         "-composite",
         str(output_path),
     ]
-    run_magick(command, f"compositing text layer at ({left - bleed}, {top - bleed})")
+    run_magick(command, f"compositing text layer at ({left}, {top})")
 
 
 def run_magick(command: list[str], action: str) -> None:

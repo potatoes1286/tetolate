@@ -99,11 +99,12 @@ class EditorLayerTests(unittest.TestCase):
         custom = self.fonts / "ComicNeue-Bold.ttf"
         shutil.copyfile(translate_cbz.BUNDLED_FONT_DIR / custom.name, custom)
         record = {**self.record, "manualLineBreaks": "Manual\nlines", "gravity": "southeast", "strokeWidth": 4,
-                  "stroke": "white", "fill": "black", "fontSizeWidthPercent": 15}
+                  "stroke": "white", "fill": "black", "fontSizeWidthPercent": 15,
+                  "rotation": 20, "skewX": -15, "skewY": 10}
         entry = self.manager.editor_v2_render_entries(self.code, self.job_id, 0, [record], {0: "Original"})[0]
         self.assertEqual(entry["font"], str(custom))
         self.assertEqual(entry["englishText"], "Manual\nlines")
-        for field in ("gravity", "strokeWidth", "stroke", "fill", "fontSizeWidthPercent"):
+        for field in ("gravity", "strokeWidth", "stroke", "fill", "fontSizeWidthPercent", "rotation", "skewX", "skewY"):
             self.assertEqual(entry[field], record[field])
 
     def test_layers_cache_by_size_and_style_not_position_or_box_identity(self):
@@ -116,6 +117,17 @@ class EditorLayerTests(unittest.TestCase):
                           {"font": "Bangers-Regular.ttf"}, {"strokeWidth": 8}, {"placementRegion": [0, 0, 70, 100]}):
                 self.assertNotEqual(first, self.layer({**self.record, **patch}))
             self.assertEqual(render.call_count, 7)
+
+    def test_transforms_invalidate_layer_cache_but_movement_does_not(self):
+        with self.renderer() as render, mock.patch.object(overlay_text, "ensure_magick", return_value="magick"):
+            original = self.layer()
+            for field in overlay_text.TEXT_TRANSFORM_LIMITS:
+                record = {**self.record, field: 15}
+                transformed = self.layer(record)
+                self.assertNotEqual(original, transformed)
+                self.assertEqual(transformed, self.layer({**record, "placementRegion": [0, 0, 80, 100]}))
+                self.assertEqual(render.call_args.args[1][0][0][field], 15)
+            self.assertEqual(render.call_count, 4)
 
     def test_changing_font_file_invalidates_cached_layer(self):
         font = self.fonts / "Custom.ttf"
@@ -190,6 +202,11 @@ class EditorLayerTests(unittest.TestCase):
         cases += [{"fontSizeWidthPercent": 20}, {"strokeWidth": 8, "fill": "white", "stroke": "black"},
                   {"manualLineBreaks": "One\nTWO\nThree"}, {"placementRegion": [10, 10, 130, 700]},
                   {"placementRegion": [10, 10, 700, 130]}]
+        cases += [{"rotation": angle} for angle in (-180, -35, 35, 90, 180)]
+        cases += [{"skewX": -30}, {"skewY": 30}, {"rotation": 23, "skewX": 30, "skewY": -20},
+                  {"rotation": -40, "skewX": 60, "skewY": 60},
+                  {"rotation": 45, "placementRegion": [0, 0, 161, 103]},
+                  {"rotation": -30, "skewY": -20, "placementRegion": [690, 903, 800, 1000]}]
         records = [{**self.record, "placementRegion": [40, 50, 400, 330], "englishText": text, **patch} for patch in cases]
         with mock.patch.object(overlay_text, "run_magick", wraps=overlay_text.run_magick) as run:
             layers = self.layers(records)
@@ -199,7 +216,9 @@ class EditorLayerTests(unittest.TestCase):
                 region = record["placementRegion"]
                 preview = Image.open(original).convert("RGBA")
                 with Image.open(layer) as image:
-                    preview.alpha_composite(image.convert("RGBA"), (region[0] - 8, region[1] - 8))
+                    preview.alpha_composite(image.convert("RGBA"),
+                        (region[0] + (region[2] - region[0] - image.width) // 2,
+                         region[1] + (region[3] - region[1] - image.height) // 2))
                 with mock.patch.object(self.manager, "editor_v2_effective_records", return_value=[{"boxno": 0, "englishText": text}]), \
                      mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, False)):
                     current, _, _ = self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])

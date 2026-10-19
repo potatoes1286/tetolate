@@ -7,7 +7,7 @@ const vm = require("node:vm");
 const root = path.join(__dirname, "../web_editor");
 const source = fs.readFileSync(path.join(root, "screens.js"), "utf8");
 const screens = vm.runInNewContext(source.replaceAll("export ", "") +
-  "\n({STAGES, SCREEN, fieldsFor, textFieldTarget, updateTextField, recordLabel})");
+  "\n({STAGES, SCREEN, fieldsFor, applyFields, textFieldTarget, updateTextField, recordLabel})");
 const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
 
 function records() {
@@ -94,6 +94,16 @@ test("record labels show both source and English text", () => {
   assert.equal(screens.recordLabel("text", {boxno: 0, text: "Source", englishText: "English"}), "0  Source → English");
 });
 
+test("transforms are manual Typesetting fields, default to zero, and clear at zero or blank", () => {
+  for (const field of ["rotation", "skewX", "skewY"]) {
+    for (const stage of ["ocr", "text"]) assert.ok(!screens.fieldsFor(stage, {}).some(([name]) => name === field));
+    assert.equal(screens.fieldsFor("placement", {}).find(([name]) => name === field)[3], 0);
+    const record = screens.applyFields("placement", {}, {[field]: -12.5});
+    assert.equal(record[field], -12.5);
+    for (const value of [0, ""]) assert.ok(!(field in screens.applyFields("placement", record, {[field]: value})));
+  }
+});
+
 test("OCR and Typesetting coordinates share one row with independent number inputs", () => {
   const render = app.match(/function renderInspector\(\) \{[\s\S]*?\n\}/)[0];
   class Element {
@@ -124,6 +134,16 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     for (const input of inputs) { assert.equal(input.type, "number"); input.listeners.change(); }
     assert.deepEqual(changes, ["left", "top", "right", "bottom"].map((name) => [stage, name]));
     assert.ok(form.children.some((child) => child.tag === "label"), "other fields stay outside coordinate row");
+    if (stage === "placement") for (const name of ["rotation", "skewX", "skewY"]) {
+      const input = form.children.flatMap((child) => child.children).find((child) => child.name === name);
+      assert.equal(input.type, "number");
+      assert.equal(input.value, 0);
+      assert.equal(input.step, "0.5");
+      assert.equal(input.min, name === "rotation" ? "-180" : "-60");
+      assert.equal(input.max, name === "rotation" ? "180" : "60");
+      input.listeners.change();
+      assert.deepEqual(changes.at(-1), [stage, name]);
+    }
   }
   const css = fs.readFileSync(path.join(root, "editor.css"), "utf8");
   assert.match(css, /\.field-grid\s*\{[^}]*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);

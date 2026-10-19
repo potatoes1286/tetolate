@@ -636,6 +636,10 @@ class EditorManagerMixin:
                         if not isinstance(record, dict):
                             continue
                         try:
+                            overlay_text.validate_text_transform(0, record)
+                        except overlay_text.InputError as exc:
+                            raise HTTPException(status_code=400, detail=str(exc)) from exc
+                        try:
                             record["font"] = translate_cbz.normalize_font_name(
                                 record.get("font"), pipeline_config.render_font
                             )
@@ -1203,7 +1207,8 @@ class EditorManagerMixin:
             if font_path.is_file() and not any(font_path.resolve().is_relative_to(directory.resolve())
                     for directory in (translate_cbz.FONT_DIR, translate_cbz.BUNDLED_FONT_DIR)):
                 raise HTTPException(400, "Font files must be inside a configured font directory.")
-            for field in ("fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed"):
+            for field in ("fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed",
+                          "rotation", "skewX", "skewY"):
                 if field in record:
                     entry[field] = record[field]
             if entry["gravity"] not in {"north", "south", "west", "east", "center", "northwest", "northeast", "southwest", "southeast"}:

@@ -99,7 +99,8 @@ test("font, outline, text, wrapping and alignment changes render new layers", as
   page.editor.draw();
   await page.advance();
   const patches = [{font: "Other.ttf"}, {strokeWidth: 0}, {manualLineBreaks: "One\nTwo"},
-    {fontSizeWidthPercent: 50}, ...Object.keys(screens.ALIGNMENT_LABELS).map((gravity) => ({gravity}))];
+    {fontSizeWidthPercent: 50}, {rotation: 25}, {skewX: -15}, {skewY: 10},
+    ...Object.keys(screens.ALIGNMENT_LABELS).map((gravity) => ({gravity}))];
   for (const patch of patches) {
     Object.assign(page.store.records.placements[0], patch);
     page.editor.draw();
@@ -118,6 +119,21 @@ test("clipping and half-pixel rounding match the renderer's pixel grid", async (
   await page.advance();
   assert.deepEqual(page.requests[0][1][0].placementRegion, [0, 0, 180, 180]);
   assert.deepEqual(page.images.at(-1).slice(1), [-8, 12]);
+});
+
+test("expanded transformed layers keep the box center and remain cached during movement", async () => {
+  const page = setup({render: (_page, entries) => entries.map(() => ({width: 244, height: 302, close() {}}))});
+  Object.assign(page.store.records.placements[0], {rotation: 35, skewX: 20, skewY: -10});
+  page.editor.draw();
+  await page.advance();
+  const entry = page.requests[0][1][0];
+  assert.deepEqual([entry.rotation, entry.skewX, entry.skewY], [35, 20, -10]);
+  assert.deepEqual(page.images.at(-1).slice(1), [-22, -51]);
+  page.store.records.placements[0].placementRegion = [30, 30, 190, 190];
+  page.editor.draw();
+  await page.advance();
+  assert.equal(page.requests.length, 1);
+  assert.deepEqual(page.images.at(-1).slice(1), [-12, -41]);
 });
 
 test("Original and Current do not request editable text layers", async () => {

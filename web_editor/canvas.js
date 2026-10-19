@@ -74,7 +74,7 @@ export class EditorCanvas {
     const width = right - left, height = bottom - top;
     if (width <= 0 || height <= 0) return;
     const entry = {placementRegion: [0, 0, width, height], englishText: text};
-    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed"])
+    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed", "rotation", "skewX", "skewY"])
       if (record[field] !== undefined) entry[field] = record[field];
     const page = this.store.page;
     const key = JSON.stringify([page, this.canvas.width, this.canvas.height, this.store.document?.defaultFont, entry]);
@@ -85,7 +85,7 @@ export class EditorCanvas {
       this.layers.set(key, layer);
     }
     if (layer.bitmap) this.ctx.drawImage(layer.bitmap,
-      left - (layer.bitmap.width - width) / 2, top - (layer.bitmap.height - height) / 2);
+      left + Math.floor((width - layer.bitmap.width) / 2), top + Math.floor((height - layer.bitmap.height) / 2));
   }
 
   scheduleLayers() {

@@ -3948,6 +3948,9 @@ def apply_placements_to_records(
             "manualLineBreaks",
             "minPointSize",
             "maxPointSize",
+            "rotation",
+            "skewX",
+            "skewY",
         ):
             if field in placement:
                 record[field] = placement[field]
@@ -4182,6 +4185,7 @@ def typeset_render_page(
                 "stroke": outline_for_fill(fill),
                 "strokeWidth": DEFAULT_RENDER_STROKE_WIDTH,
                 "gravity": config.render_gravity,
+                **{field: record[field] for field in overlay_text.TEXT_TRANSFORM_LIMITS if field in record},
                 **(
                     {"fontSizeWidthPercent": record["fontSizeWidthPercent"]}
                     if isinstance(record.get("fontSizeWidthPercent"), (int, float))

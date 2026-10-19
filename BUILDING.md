@@ -174,6 +174,11 @@ layer after a short delay. Uncached layers share one request and one ImageMagick
 process (up to 256 boxes per batch); cached layers are not rendered again.
 New layers appear together when their batch finishes.
 Current also updates the cleaning mask when needed.
+Typesetting also has manual rotation (±180°) and horizontal/vertical skew
+(±60°). Set them to zero to remove the effect. Positive rotation is clockwise;
+horizontal skew, vertical skew, then rotation are applied about the box center.
+Preview and final output use the same transform. Save, protection, and reset
+include these fields; regeneration needs only Render. The VLM does not set them.
 
 To compare a pre-batch source snapshot with the batch endpoint:
 

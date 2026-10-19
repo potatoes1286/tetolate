@@ -43,6 +43,9 @@ export function fieldsFor(stage, record, fonts = []) {
     ["strokeWidth", "Outline width", "number", record.strokeWidth ?? 2],
     ["gravity", "Alignment", "select", record.gravity || "center", ["north", "center", "south", "west", "east", "northwest", "northeast", "southwest", "southeast"]],
     ["fontSizeWidthPercent", `Font size (wv; blank = auto; auto: ${Number(record._autoFontSizeWidthPercent || 0).toFixed(2)} wv)`, "number", record.fontSizeWidthPercent ?? ""],
+    ["rotation", "Rotation (degrees; positive = clockwise)", "number", record.rotation ?? 0],
+    ["skewX", "Horizontal skew (degrees)", "number", record.skewX ?? 0],
+    ["skewY", "Vertical skew (degrees)", "number", record.skewY ?? 0],
     ["manualLineBreaks", "Manual line breaks", "textarea", record.manualLineBreaks || ""],
   ];
   return [];
@@ -85,6 +88,7 @@ export function applyFields(stage, record, values) {
   for (const [key, value] of Object.entries(values)) {
     if (!["left", "top", "right", "bottom"].includes(key)) {
       if (key === "fontSizeWidthPercent" && value === "") delete result[key];
+      else if (["rotation", "skewX", "skewY"].includes(key) && (value === "" || value === 0)) delete result[key];
       else result[key] = value;
     }
   }

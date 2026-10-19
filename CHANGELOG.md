@@ -6,6 +6,7 @@
 
 - Added a manual GitHub release check beside the web UI version.
 - Added an editor stage reset to remove saved edits and protection flags on one page.
+- Added manual rotation and skew controls to Typesetting, Preview, and final output.
 
 ### Changed
 

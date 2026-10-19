@@ -394,6 +394,10 @@ function renderInspector() {
       if (type === "checkbox") input.checked = !!value;
       else input.value = value;
       if (name === "fontSizeWidthPercent") { input.min = "0.05"; input.max = "100"; input.step = "0.05"; }
+      if (["rotation", "skewX", "skewY"].includes(name)) {
+        const limit = name === "rotation" ? 180 : 60;
+        input.min = String(-limit); input.max = String(limit); input.step = "0.5";
+      }
     }
     input.name = name;
     values[name] = input;
