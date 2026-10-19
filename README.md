@@ -93,7 +93,7 @@ and select PaddleOCR-VL in the job's advanced options.
 
 #### Expose to Network
 
-Compose publishes port 8088 on all interfaces, so other computers on your LAN can connect. Change `0.0.0.0` to `127.0.0.1` in `compose.yaml` for local-only access. Change the default password before allowing LAN access. Do not expose it to the internet.
+Compose publishes port 8088 on `127.0.0.1` for local-only access. For LAN access, change it to `0.0.0.0` in `compose.yaml` and change the default password first. Do not expose it to the internet.
 
 #### Fonts
 

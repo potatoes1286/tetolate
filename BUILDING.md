@@ -211,4 +211,4 @@ For the first publication, verify all of the following:
 - `docker pull ghcr.io/potatoes1286/tetolate:1.0.0` succeeds when signed out of GHCR.
 - The versioned `compose.yaml` starts tetolate from a directory that does not contain the repository source.
 - `docker compose ps` reports the published image as healthy.
-- Confirm the intended port binding: Compose uses `0.0.0.0:8088`; use `127.0.0.1:8088` for local-only access.
+- Confirm Compose binds the web UI to `127.0.0.1:8088` for local-only access.
