@@ -155,11 +155,11 @@ class EditorLayerTests(unittest.TestCase):
         shutil.copyfile(translate_cbz.BUNDLED_FONT_DIR / custom.name, custom)
         record = {**self.record, "manualLineBreaks": "Manual\nlines", "gravity": "southeast", "strokeWidth": 4,
                   "stroke": "white", "fill": "black", "fontSizeWidthPercent": 15,
-                  "rotation": 20, "skewX": -15, "skewY": 10}
+                  "rotation": 20, "skewX": -15, "skewY": 10, "lineSpacing": 8}
         entry = self.manager.editor_v2_render_entries(self.code, self.job_id, 0, [record], {0: "Original"})[0]
         self.assertEqual(entry["font"], str(custom))
         self.assertEqual(entry["englishText"], "Manual\nlines")
-        for field in ("gravity", "strokeWidth", "stroke", "fill", "fontSizeWidthPercent", "rotation", "skewX", "skewY"):
+        for field in ("gravity", "strokeWidth", "stroke", "fill", "fontSizeWidthPercent", "rotation", "skewX", "skewY", "lineSpacing"):
             self.assertEqual(entry[field], record[field])
 
     def test_layers_cache_by_size_and_style_not_position_or_box_identity(self):
@@ -183,6 +183,17 @@ class EditorLayerTests(unittest.TestCase):
                 self.assertEqual(transformed, self.layer({**record, "placementRegion": [0, 0, 80, 100]}))
                 self.assertEqual(render.call_args.args[1][0][0][field], 15)
             self.assertEqual(render.call_count, 4)
+
+    def test_line_spacing_invalidates_layers_and_reuses_each_cached_value(self):
+        with self.renderer() as render, mock.patch.object(overlay_text, "ensure_magick", return_value="magick"):
+            results = []
+            for spacing in (0, 12, -4):
+                record = {**self.record, "lineSpacing": spacing}
+                results.append(self.layer(record))
+                self.assertEqual(results[-1], self.layer(record))
+                self.assertEqual(render.call_args.args[1][0][0]["lineSpacing"], spacing)
+            self.assertEqual(len(set(results)), 3)
+            self.assertEqual(render.call_count, 3)
 
     def test_changing_font_file_invalidates_cached_layer(self):
         font = self.fonts / "Custom.ttf"
@@ -406,6 +417,7 @@ class EditorLayerTests(unittest.TestCase):
         cases += [{"fontSizeWidthPercent": 20}, {"strokeWidth": 8, "fill": "white", "stroke": "black"},
                   {"manualLineBreaks": "One\nTWO\nThree"}, {"placementRegion": [10, 10, 130, 700]},
                   {"placementRegion": [10, 10, 700, 130]}]
+        cases += [{"lineSpacing": spacing, "fontSizeWidthPercent": 3} for spacing in (-5, 0, 12)]
         cases += [{"rotation": angle} for angle in (-180, -35, 35, 90, 180)]
         cases += [{"manualLineBreaks": "Even if you say that...", "placementRegion": [40, 50, 755, 135]}]
         cases += [{"skewX": -30}, {"skewY": 30}, {"rotation": 23, "skewX": 30, "skewY": -20},

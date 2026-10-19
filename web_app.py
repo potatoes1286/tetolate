@@ -5320,6 +5320,18 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return JSONResponse(await probe_vlm_connection(manager, endpoint_value, token_value,
                                                         category_value, job_id_value))
 
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/text-layout")
+    async def editor_v2_text_layout(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Text layout requires a placement record.")
+        text = await run_in_threadpool(manager.editor_v2_text_layout, code, job_id, page, data.get("record"))
+        return JSONResponse({"text": text}, headers={"Cache-Control": "private, no-store"})
+
     @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/text-layers")
     async def editor_v2_text_layers(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
         manager = manager_from_request(request)

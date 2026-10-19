@@ -139,9 +139,60 @@ function navigationSetup() {
     AVAILABLE_STAGES: ["ocr", "text", "placement"], setStatus: page.status,
     imageUrl: () => "original", loadRevisions: async () => {},
     byId: (id) => { if (!elements.has(id)) elements.set(id, {}); return elements.get(id); }});
-  for (const name of ["load", "navigate", "loadTypesettingView", "exactPreview"]) vm.runInContext(fn(name), context);
+  for (const name of ["load", "navigate", "selectPage", "loadTypesettingView", "exactPreview"]) vm.runInContext(fn(name), context);
   return {...page, context, pendingLoads};
 }
+
+test("page-number entry navigates to the first and last pages", async () => {
+  const page = navigationSetup(), input = page.context.byId("page-select");
+  input.reportValidity = () => true;
+  for (const number of [0, 9]) {
+    input.valueAsNumber = number;
+    const changed = page.context.selectPage();
+    assert.equal(page.pendingLoads.at(-1).number, number);
+    page.pendingLoads.at(-1).resolve(documentFor(number));
+    await changed;
+    assert.equal(page.store.page, number);
+    assert.equal(input.value, String(number));
+  }
+});
+
+test("page-number validation rejects empty, fractional and out-of-range values", async () => {
+  const page = navigationSetup(), input = page.context.byId("page-select");
+  input.reportValidity = () => false;
+  await page.context.selectPage();
+  for (const number of [NaN, 0.5, -1, 10, Infinity]) await page.context.navigate("placement", number);
+  assert.equal(page.pendingLoads.length, 0);
+  assert.equal(page.store.page, 3);
+});
+
+test("page-number entry keeps the current page when saving or loading fails", async () => {
+  const page = navigationSetup(), input = page.context.byId("page-select");
+  input.reportValidity = () => true; input.valueAsNumber = 7;
+  page.store.dirty = true; page.context.save = async () => {};
+  await page.context.selectPage();
+  assert.equal(input.value, "3");
+  assert.equal(page.pendingLoads.length, 0);
+  page.store.dirty = false;
+  const changed = page.context.selectPage();
+  page.pendingLoads[0].reject(new Error("Load failed"));
+  await changed;
+  assert.equal(input.value, "3");
+});
+
+test("page input accepts Enter without reloading the current page", async () => {
+  const page = navigationSetup(), listeners = {}, input = page.context.byId("page-select");
+  input.addEventListener = (event, callback) => { listeners[event] = callback; };
+  input.reportValidity = () => true; input.valueAsNumber = 3;
+  vm.runInContext(app.slice(app.indexOf('byId("page-select").addEventListener("change",'),
+    app.indexOf('byId("prev-page").addEventListener("click",')), page.context);
+  let prevented = false;
+  listeners.keydown({key: "Enter", preventDefault() { prevented = true; }});
+  await settle();
+  assert.equal(prevented, true);
+  assert.equal(page.pendingLoads.length, 0);
+  assert.equal(typeof listeners.change, "function");
+});
 
 test("page 3 → 4 → 5 navigation finishes while page 4 LaMa is still pending", async () => {
   const page = navigationSetup();

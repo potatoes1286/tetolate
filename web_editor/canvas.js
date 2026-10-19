@@ -18,6 +18,7 @@ export class EditorCanvas {
     this.onStatus = onStatus;
     this.image = new Image();
     this.showPlacementText = true;
+    this.hideBoxes = false;
     this.busy = false;
     this.drag = null;
     this.drawAction = null;
@@ -96,14 +97,15 @@ export class EditorCanvas {
   drawTextLayer(record, required) {
     const region = this.region(record, "placements");
     if (!region) return;
-    const text = record.manualLineBreaks || (this.store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
+    const manual = record.manualLineBreaks?.trim() ? record.manualLineBreaks : "";
+    const text = manual || (this.store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
     if (!text.trim()) return;
     const [left, top, right, bottom] = region.map((value, index) => roundPixel(Math.max(0,
       Math.min(index % 2 ? this.canvas.height : this.canvas.width, value))));
     const width = right - left, height = bottom - top;
     if (width <= 0 || height <= 0) return;
     const entry = {placementRegion: [0, 0, width, height], englishText: text};
-    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed", "rotation", "skewX", "skewY"])
+    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "manualLineBreaks", "lineSpacing", "minPointSize", "maxPointSize", "renderBleed", "rotation", "skewX", "skewY"])
       if (record[field] !== undefined) entry[field] = record[field];
     const page = this.store.page;
     const key = JSON.stringify([page, this.canvas.width, this.canvas.height, this.store.document?.defaultFont, entry]);
@@ -208,7 +210,7 @@ export class EditorCanvas {
       for (const record of this.store.records.placements || []) this.drawTextLayer(record, required);
     this.trimLayers(required);
     this.scheduleLayers();
-    for (const artifact of this.visibleArtifacts().slice().reverse()) {
+    for (const artifact of this.hideBoxes ? [] : this.visibleArtifacts().slice().reverse()) {
       for (const record of this.store.records[artifact] || []) {
         const region = this.region(record, artifact);
         if (!region) continue;
@@ -284,6 +286,7 @@ export class EditorCanvas {
     if (this.busy) { this.onStatus("Wait for the current OCR request to finish."); return; }
     const point = this.point(event);
     if (this.drawAction) { this.drag = { mode: "draw", start: point, current: point, action: this.drawAction }; return; }
+    if (this.hideBoxes) return;
     const hits = this.hits(point);
     const extend = event.ctrlKey || event.metaKey || event.shiftKey;
     if (this.store.stage === "ocr" && this.groupSelection && extend) {
@@ -318,7 +321,7 @@ export class EditorCanvas {
     else this.store.select(hit?.artifact || null, hit?.record.recordId || null);
   }
   doubleClick(event) {
-    if (this.busy || this.drawAction || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    if (this.busy || this.hideBoxes || this.drawAction || event.ctrlKey || event.metaKey || event.shiftKey) return;
     const hits = this.hits(this.point(event));
     if (hits.length < 2) return;
     event.preventDefault();

@@ -25,9 +25,12 @@ let ocrAreaRunning = false;
 let queuedAction = "";
 let tooltipAnchor = null;
 let tooltipTimer = null;
+let lineBreaksTimer = null;
+let lineBreaksController = null;
 const typesettingViewKey = `tetolate-editor-view:${config.category}:${config.jobId}`;
 const TYPESETTING_VIEWS = new Set(["current", "original", "preview", "render"]);
 let typesettingView = localStorage.getItem(typesettingViewKey) || "current";
+let hidePreviewBoxes = false;
 if (!TYPESETTING_VIEWS.has(typesettingView)) typesettingView = "current";
 const paneWidthKey = `tetolate-editor-panes:${config.category}:${config.jobId}`;
 const paneWidths = { record: 288, inspector: 352 };
@@ -109,19 +112,19 @@ function showTooltip(anchor) {
 }
 
 document.addEventListener("pointerover", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) showTooltip(anchor);
 });
 document.addEventListener("pointerout", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor && !anchor.contains(event.relatedTarget)) scheduleTooltipHide();
 });
 document.addEventListener("focusin", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) showTooltip(anchor);
 });
 document.addEventListener("focusout", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) scheduleTooltipHide();
 });
 byId("editor-tooltip").addEventListener("pointerenter", () => clearTimeout(tooltipTimer));
@@ -275,13 +278,22 @@ async function load(stage = store.stage, page = store.page) {
 }
 
 async function navigate(stage, page) {
-  if (page < 0 || page >= config.pageCount || !AVAILABLE_STAGES.includes(stage)) return;
+  if (!Number.isInteger(page) || page < 0 || page >= config.pageCount || !AVAILABLE_STAGES.includes(stage)) return;
   if (store.dirty) {
     setStatus("Saving changes before navigation...");
     await save();
     if (store.dirty) return;
   }
   await load(stage, page);
+}
+
+async function selectPage() {
+  const input = byId("page-select");
+  if (!input.reportValidity()) return;
+  const page = input.valueAsNumber;
+  if (page === (navigationPage ?? store.page)) return;
+  await navigate(store.stage, page);
+  input.value = String(navigationPage ?? store.page);
 }
 
 function recordsForList() {
@@ -380,6 +392,28 @@ function protectionFor(recordId, field) {
   return store.document?.protection?.records?.[recordId]?.[field];
 }
 
+function refreshLineBreaks(input, record) {
+  clearTimeout(lineBreaksTimer);
+  lineBreaksController?.abort();
+  if (record.manualLineBreaks?.trim()) return;
+  const pageDocument = store.document;
+  const page = store.page;
+  const translation = (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
+  const entry = {...record, englishText: translation};
+  lineBreaksTimer = setTimeout(async () => {
+    if (!input.isConnected || input.dataset.userEdited) return;
+    const controller = new AbortController();
+    lineBreaksController = controller;
+    try {
+      const text = await api.textLayout(page, entry, controller.signal);
+      if (!controller.signal.aborted && store.document === pageDocument && input.isConnected && !input.dataset.userEdited) input.value = text;
+    } catch (error) {
+      if (!controller.signal.aborted && store.document === pageDocument && input.isConnected && !input.dataset.userEdited)
+        setStatus(`Could not load automatic line breaks: ${error.message}`, true);
+    }
+  }, 200);
+}
+
 function renderInspector() {
   const form = byId("record-form");
   form.replaceChildren();
@@ -415,7 +449,12 @@ function renderInspector() {
     const isAngle = ["rotation", "skewX", "skewY"].includes(name);
     const wrapper = document.createElement(isAngle ? "div" : "label");
     wrapper.className = "field-row";
-    wrapper.append(document.createTextNode(labelText));
+    if (name === "manualLineBreaks") {
+      const help = document.createElement("span"); help.className = "field-help"; help.tabIndex = 0;
+      help.textContent = labelText;
+      help.dataset.tooltip = "Shows the current automatic line breaks as the box and text settings change. Editing this text fixes your chosen line breaks; resizing then shrinks the font rather than adding breaks. Clear the field to return to automatic wrapping. The saved translation is unchanged.";
+      wrapper.append(help);
+    } else wrapper.append(document.createTextNode(labelText));
     let input;
     if (type === "textarea") {
       input = document.createElement("textarea"); input.rows = 4; input.value = value;
@@ -432,6 +471,7 @@ function renderInspector() {
       if (type === "checkbox") input.checked = !!value;
       else input.value = value;
       if (name === "fontSizeWidthPercent") { input.min = "0.05"; input.max = "100"; input.step = "0.05"; }
+      if (name === "lineSpacing") { input.min = "-200"; input.max = "200"; input.step = "1"; }
       if (isAngle) {
         const limit = name === "rotation" ? 180 : 60;
         input.min = String(-limit); input.max = String(limit); input.step = "0.5";
@@ -459,6 +499,10 @@ function renderInspector() {
     } else {
       input.addEventListener("change", () => applyInspector(values, formTarget, name));
       wrapper.append(input);
+    }
+    if (name === "manualLineBreaks") {
+      input.addEventListener("input", () => { input.dataset.userEdited = "1"; });
+      refreshLineBreaks(input, record);
     }
 
     const overrideField = ["left", "top", "right", "bottom"].includes(name)
@@ -524,6 +568,7 @@ function applyInspector(inputs, target, changedField) {
   }
   const values = {};
   for (const [name, input] of Object.entries(inputs)) {
+    if (name === "manualLineBreaks" && changedField !== name) continue;
     values[name] = input.type === "checkbox" ? input.checked : input.value;
     if (input.type === "number" && input.value !== "") values[name] = Number(input.value);
   }
@@ -545,6 +590,8 @@ function addButton(target, text, handler, title = "", tooltip = "", shortcut = "
 
 function renderTools() {
   const target = byId("stage-tools"); target.replaceChildren();
+  const hideBoxes = store.stage === "placement" && typesettingView === "preview" && hidePreviewBoxes;
+  if (canvas.hideBoxes !== hideBoxes) { canvas.hideBoxes = hideBoxes; canvas.draw(); }
   if (store.stage === "ocr") {
     addButton(target, "Add raw box", () => canvas.startDraw(addRawBox), "Draw a missing OCR box", "Draw one raw OCR box manually.", "z");
     addButton(target, ocrAreaRunning ? "OCR running..." : "OCR area", () => canvas.startDraw(ocrArea), "OCR a selected region", "Draw a region to scan only that area. The result adds raw OCR boxes and merges the new boxes with one another.", "x");
@@ -585,6 +632,16 @@ function renderTools() {
     }
     addButton(target, "Add clean box", () => canvas.startDraw(addCleanBox), "Draw a clean-only area",
       "LaMa cleans this rectangle without adding text or calling the VLM. Preview refreshes automatically.", "b");
+    if (typesettingView === "preview") {
+      const label = document.createElement("label"); label.className = "preview-box-toggle";
+      const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = hidePreviewBoxes;
+      toggle.addEventListener("change", () => {
+        hidePreviewBoxes = toggle.checked;
+        canvas.hideBoxes = hidePreviewBoxes;
+        canvas.draw();
+      });
+      label.append(toggle, document.createTextNode(" Hide boxes")); target.append(label);
+    }
   }
   if (ocrAreaRunning) {
     for (const button of target.querySelectorAll("button")) button.disabled = true;
@@ -947,7 +1004,10 @@ function render() {
 
 store.addEventListener("change", render);
 document.querySelectorAll(".stage-tab").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.stage, store.page)));
-byId("page-select").addEventListener("change", (event) => navigate(store.stage, Number(event.target.value)));
+byId("page-select").addEventListener("change", selectPage);
+byId("page-select").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void selectPage(); }
+});
 byId("prev-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) - 1));
 byId("next-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) + 1));
 byId("record-filter").addEventListener("input", renderRecordList);

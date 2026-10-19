@@ -190,6 +190,15 @@ Current. Moving boxes reuses cached pixels; other edits refresh the affected
 layer after a short delay. Uncached layers share one request and one ImageMagick
 process (up to 256 boxes per batch); cached layers are not rendered again.
 New layers appear together when their batch finishes.
+Extra line spacing adds pixels between lines (-200 to 200). Zero keeps the
+font default; negative values tighten the gap. This manual setting affects only
+typesetting and uses the same renderer for Preview and final output.
+Manual line breaks overrides the box text without changing its saved translation.
+The field shows the current automatic breaks until you edit it. Edits fix the
+breaks; a smaller box shrinks the font instead of wrapping again. Clear the field
+to restore automatic wrapping. Its underlined label has a hover/focus tooltip.
+Unprotect lets reruns replace a saved field; Use
+generated removes its override.
 Preview refreshes cleaning automatically after clean-box edits, undo/redo, and
 reset. Navigation does not wait for LaMa; late results from another page are
 ignored. Current prepares an exact view when selected. Last Render shows the

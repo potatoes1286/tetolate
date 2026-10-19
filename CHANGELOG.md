@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added direct page-number entry in the editor.
+- Added a Hide boxes toggle to Typesetting Preview.
+- Added line-spacing control to Typesetting.
 - Added a 30-day Remember session login option that survives server restarts.
 - Added a manual GitHub release check beside the web UI version.
 - Added an editor stage reset to remove saved edits and protection flags on one page.
@@ -12,6 +15,7 @@
 
 ### Changed
 
+- Manual line breaks follow automatic wrapping until edited, then keep the chosen breaks.
 - Editor actions now regenerate one stage, one changed page, all changed pages, or finish edits without VLM calls; regeneration and export generation remove old CBZ exports.
 - Preview reuses saved cleaned pages, shows text before LaMa finishes, and refreshes clean-box edits without blocking navigation.
 - Renamed Render to Last Render, removed duplicate clean-box controls, and moved status below the editor actions.

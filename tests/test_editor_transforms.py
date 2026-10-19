@@ -38,7 +38,7 @@ class EditorTransformTests(unittest.TestCase):
                 record.pop("sourceBoxnos")
             write_json_atomic(self.output / "data" / artifact / "page_0000.json", [record])
         self.manager.initialize_editor_v2(self.code, self.job_id)
-        self.transform = {"rotation": 32.5, "skewX": -20, "skewY": 15}
+        self.transform = {"rotation": 32.5, "skewX": -20, "skewY": 15, "lineSpacing": 8}
 
     def save(self, fields):
         payload = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
@@ -87,6 +87,20 @@ class EditorTransformTests(unittest.TestCase):
         restored = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
         self.assertEqual({field: restored["recordsByArtifact"]["placements"][0][field]
                           for field in self.transform}, self.transform)
+
+    def test_line_spacing_validates_before_save_and_preview(self):
+        before = self.manager.editor_v2_manifest_path(self.code, self.job_id).read_bytes()
+        for value in (None, True, "10", float("nan"), float("inf"), -201, 201):
+            for operation in (lambda: self.save({"lineSpacing": value}),
+                              lambda: self.manager.editor_v2_render_entries(
+                                  self.code, self.job_id, 0, [{**self.record, "lineSpacing": value}])):
+                with self.subTest(value=value), self.assertRaises(HTTPException) as raised:
+                    operation()
+                self.assertEqual(raised.exception.status_code, 400)
+                self.assertIn("lineSpacing", str(raised.exception.detail))
+                self.assertEqual(self.manager.editor_v2_manifest_path(self.code, self.job_id).read_bytes(), before)
+        for value in (-200, -4, 0, 12, 200):
+            overlay_text.validate_line_spacing(0, {"lineSpacing": value})
 
     def test_zero_angles_replace_previously_saved_transforms(self):
         self.save(self.transform)

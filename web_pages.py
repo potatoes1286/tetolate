@@ -1670,9 +1670,6 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     available_stages = manager.editor_available_stages(status)
     ocr_review_checkpoint = status.get("reviewCheckpoint") == "ocr"
     page_count = len(manager.original_page_files(code, job_id))
-    page_options = "\n".join(
-        f'<option value="{index}">Page {index}</option>' for index in range(page_count)
-    )
     stage_labels = {
         "ocr": "OCR & Merge",
         "text": "Text & Translation",
@@ -1694,7 +1691,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     return base_page(
         f"Edit {code} {job_id}",
         f"""
-<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=7">
+<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=12">
 <div class="editor-app" id="editor-app">
   <header class="editor-header">
     <div>
@@ -1704,7 +1701,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     </div>
     <div class="page-nav">
       <button id="prev-page" type="button" title="Previous page (A)">Previous [A]</button>
-      <label>Page<select id="page-select">{page_options}</select></label>
+      <label>Page <input id="page-select" type="number" min="0" max="{max(0, page_count - 1)}" step="1" value="0" required></label>
       <button id="next-page" type="button" title="Next page (D)">Next [D]</button>
     </div>
   </header>
@@ -1765,6 +1762,6 @@ window.TETOLATE_EDITOR_V2 = {{
   reviewCheckpoint: {json.dumps(status.get("reviewCheckpoint"))},
 }};
 </script>
-<script type="module" src="/assets/editor-v2/app.js?v=8"></script>
+<script type="module" src="/assets/editor-v2/app.js?v=14"></script>
 """,
     )

@@ -91,6 +91,14 @@ export class EditorApi {
     });
   }
 
+  async textLayout(page, record, signal) {
+    const data = await request(`${this.root}/pages/${page}/text-layout`, {
+      method: "POST", headers: jsonHeaders, body: JSON.stringify({record}), signal,
+    });
+    if (typeof data.text !== "string") throw new Error("The text layout returned invalid text.");
+    return data.text;
+  }
+
   async textLayers(page, records, signal) {
     const data = await request(`${this.root}/pages/${page}/text-layers`, {
       method: "POST", headers: jsonHeaders, body: JSON.stringify({records}), signal,

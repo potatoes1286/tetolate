@@ -4644,7 +4644,11 @@ class EditorV2Tests(unittest.TestCase):
             for removed in ("structure", "erase", "translation"):
                 self.assertNotIn(f'data-stage="{removed}"', body)
             self.assertNotIn('data-stage="preview"', body)
-            self.assertIn('/assets/editor-v2/app.js?v=8', body)
+            self.assertIn('/assets/editor-v2/app.js?v=14', body)
+            self.assertIn('id="page-select" type="number" min="0"', body)
+            self.assertNotIn('id="page-list"', body)
+            self.assertNotIn('<datalist', body)
+            self.assertNotIn('<select id="page-select"', body)
             self.assertIn('Previous [A]', body)
             self.assertIn('Next [D]', body)
             self.assertIn('id="record-list"', body)

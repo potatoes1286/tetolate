@@ -45,10 +45,11 @@ export function fieldsFor(stage, record, fonts = [], artifact = null) {
     ["strokeWidth", "Outline width", "number", record.strokeWidth ?? 2],
     ["gravity", "Alignment", "select", record.gravity || "center", ["north", "center", "south", "west", "east", "northwest", "northeast", "southwest", "southeast"]],
     ["fontSizeWidthPercent", `Font size (wv; blank = auto; auto: ${Number(record._autoFontSizeWidthPercent || 0).toFixed(2)} wv)`, "number", record.fontSizeWidthPercent ?? ""],
+    ["lineSpacing", "Extra line spacing (px; 0 = default)", "number", record.lineSpacing ?? 0],
     ["rotation", "Rotation (degrees; positive = clockwise)", "number", record.rotation ?? 0],
     ["skewX", "Horizontal skew (degrees)", "number", record.skewX ?? 0],
     ["skewY", "Vertical skew (degrees)", "number", record.skewY ?? 0],
-    ["manualLineBreaks", "Manual line breaks", "textarea", record.manualLineBreaks || ""],
+    ["manualLineBreaks", `Manual line breaks (${record.manualLineBreaks?.trim() ? "fixed" : "automatic"})`, "textarea", (record.manualLineBreaks?.trim() ? record.manualLineBreaks : record._renderedText) || ""],
   ];
   return [];
 }
@@ -90,7 +91,7 @@ export function applyFields(stage, record, values, artifact = null) {
   for (const [key, value] of Object.entries(values)) {
     if (!["left", "top", "right", "bottom"].includes(key)) {
       if (key === "fontSizeWidthPercent" && value === "") delete result[key];
-      else if (["rotation", "skewX", "skewY"].includes(key) && value === "") result[key] = 0;
+      else if (["rotation", "skewX", "skewY", "lineSpacing"].includes(key) && value === "") result[key] = 0;
       else result[key] = value;
     }
   }

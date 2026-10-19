@@ -426,12 +426,11 @@ class EditorManagerMixin:
                 region_height = max(1, round(float(region[3]) - float(region[1])))
             except (TypeError, ValueError):
                 continue
-            text = str(
-                record.get("manualLineBreaks")
-                or translations.get(record.get("boxno"), "")
-            )
+            manual = record.get("manualLineBreaks", "")
+            text = str(manual if isinstance(manual, str) and manual.strip() else translations.get(record.get("boxno"), ""))
             entry = dict(record)
             entry["region"] = region
+            entry["englishText"] = text
             entry["font"] = translate_cbz.local_font_path(record.get("font"), default_font)
             outline_width = overlay_text.stroke_width(entry, image_height)
             padding = max(0, round(outline_width * 2))
@@ -454,6 +453,9 @@ class EditorManagerMixin:
                 automatic_size / max(1, image_width) * 100,
                 3,
             )
+            record["_renderedText"] = overlay_text.layout_entry_text(
+                overlay_text.clamp_entry_to_image(entry, image_width, image_height), image_width, image_height,
+            )[0]
 
     def editor_v2_protection_payload(self, manifest: dict[str, Any], page: int, stage: str) -> dict[str, Any]:
         if stage != "text":
@@ -669,6 +671,10 @@ class EditorManagerMixin:
                             continue
                         try:
                             overlay_text.validate_text_transform(0, record)
+                            overlay_text.validate_line_spacing(0, record)
+                            if "manualLineBreaks" in record and (not isinstance(record["manualLineBreaks"], str)
+                                                                  or len(record["manualLineBreaks"]) > 100_000):
+                                raise overlay_text.InputError("Manual line breaks must be a string of at most 100000 characters.")
                         except overlay_text.InputError as exc:
                             raise HTTPException(status_code=400, detail=str(exc)) from exc
                         try:
@@ -1365,9 +1371,8 @@ class EditorManagerMixin:
                 "page": page,
                 "boxno": boxno,
                 "region": region,
-                "englishText": str(
-                    record.get("manualLineBreaks") or text_by_box.get(boxno, "")
-                ),
+                "englishText": str(record["manualLineBreaks"] if isinstance(record.get("manualLineBreaks"), str)
+                                   and record["manualLineBreaks"].strip() else text_by_box.get(boxno, "")),
                 "font": translate_cbz.local_font_path(font_name, config.render_font),
                 "fill": fill,
                 "stroke": str(record.get("stroke", translate_cbz.outline_for_fill(fill))),
@@ -1378,7 +1383,7 @@ class EditorManagerMixin:
             if font_path.is_file() and not any(font_path.resolve().is_relative_to(directory.resolve())
                     for directory in (translate_cbz.FONT_DIR, translate_cbz.BUNDLED_FONT_DIR)):
                 raise HTTPException(400, "Font files must be inside a configured font directory.")
-            for field in ("fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed",
+            for field in ("fontSizeWidthPercent", "lineSpacing", "manualLineBreaks", "minPointSize", "maxPointSize", "renderBleed",
                           "rotation", "skewX", "skewY"):
                 if field in record:
                     entry[field] = record[field]
@@ -1393,7 +1398,7 @@ class EditorManagerMixin:
             entries.append(entry)
         return entries
 
-    def render_editor_v2_text_layers(self, code: str, job_id: str, page: int, records: list[dict[str, Any]]) -> list[Path]:
+    def prepare_editor_v2_text_entries(self, code: str, job_id: str, page: int, records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
         self.require_editable_job(code, job_id, "placement")
         if not isinstance(records, list) or not 1 <= len(records) <= 256 or any(not isinstance(record, dict) for record in records):
             raise HTTPException(400, "A text-layer batch requires 1 to 256 placement objects.")
@@ -1407,14 +1412,24 @@ class EditorManagerMixin:
             [{**record, "boxno": index} for index, record in enumerate(records)], texts)
         if len(entries) != len(records):
             raise HTTPException(400, "Each text layer requires a placement region.")
+        try:
+            entries = [overlay_text.clamp_entry_to_image(entry, image_width, image_height) for entry in entries]
+            for entry in entries:
+                overlay_text.rounded_region(entry["region"])
+        except overlay_text.InputError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return entries, image_width, image_height
+
+    def editor_v2_text_layout(self, code: str, job_id: str, page: int, record: Any) -> str:
+        entries, width, height = self.prepare_editor_v2_text_entries(code, job_id, page, [record])
+        return overlay_text.layout_entry_text(entries[0], width, height)[0]
+
+    def render_editor_v2_text_layers(self, code: str, job_id: str, page: int, records: list[dict[str, Any]]) -> list[Path]:
+        entries, image_width, image_height = self.prepare_editor_v2_text_entries(code, job_id, page, records)
         directory = self.editor_meta_dir(code, job_id) / "previews" / "text-layers"
         outputs, missing = [], {}
         for entry in entries:
-            try:
-                entry = overlay_text.clamp_entry_to_image(entry, image_width, image_height)
-                _, _, width, height = overlay_text.rounded_region(entry["region"])
-            except overlay_text.InputError as exc:
-                raise HTTPException(400, str(exc)) from exc
+            _, _, width, height = overlay_text.rounded_region(entry["region"])
             # Position and identity do not affect text pixels.
             entry["region"] = [0, 0, width, height]
             entry.pop("boxno", None)

@@ -59,6 +59,7 @@ STAGE_FIELDS: dict[str, dict[str, frozenset[str] | None]] = {
                 "gravity",
                 "fontSizeWidthPercent",
                 "manualLineBreaks",
+                "lineSpacing",
                 "minPointSize",
                 "maxPointSize",
                 "rotation",

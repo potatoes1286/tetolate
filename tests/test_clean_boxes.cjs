@@ -167,7 +167,7 @@ test("Last Render and current saved output never start cleaning", async () => {
 
 test("view controls include Last Render, with no Re-render or clean delete buttons", () => {
   const page = setup(), buttons = [];
-  Object.assign(page.context, {typesettingView: "current", ocrAreaRunning: false, queuedAction: "",
+  Object.assign(page.context, {typesettingView: "current", hidePreviewBoxes: false, canvas: page.canvas, ocrAreaRunning: false, queuedAction: "",
     byId: () => ({replaceChildren() {}}), selectTypesettingView() {},
     addButton: (_target, text, _handler, _title, _tooltip, shortcut) => {
       buttons.push({text, shortcut}); return {classList: {toggle() {}}};
@@ -177,6 +177,36 @@ test("view controls include Last Render, with no Re-render or clean delete butto
   assert.deepEqual(buttons.map((button) => button.text), ["Current", "Original", "Preview", "Last Render", "Add clean box"]);
   assert.equal(new Set(buttons.map((button) => button.shortcut)).size, buttons.length);
   assert.doesNotMatch(app, /addButton\([^\n]*"Delete clean box"/);
+});
+
+test("Preview Hide boxes toggle is reversible and is not applied to other views or stages", () => {
+  const page = setup();
+  const element = () => ({children: [], listeners: {}, append(...children) {this.children.push(...children);},
+    replaceChildren() {this.children = [];}, addEventListener(name, callback) {this.listeners[name] = callback;}});
+  const target = element();
+  Object.assign(page.context, {typesettingView: "preview", hidePreviewBoxes: false, canvas: page.canvas,
+    groupChecked() {}, splitGroup() {},
+    ocrAreaRunning: false, queuedAction: "", byId: () => target,
+    document: {createElement: element, createTextNode: (text) => ({text})},
+    addButton: () => ({classList: {toggle() {}}})});
+  vm.runInContext(fn("renderTools"), page.context);
+  const before = JSON.stringify(page.store.records);
+  page.context.renderTools();
+  const toggle = target.children[0].children[0];
+  assert.equal(toggle.type, "checkbox");
+  assert.equal(toggle.checked, false);
+  toggle.checked = true; toggle.listeners.change();
+  assert.equal(page.canvas.hideBoxes, true);
+  page.context.renderTools();
+  assert.equal(target.children[0].children[0].checked, true);
+  page.context.typesettingView = "current"; page.context.renderTools();
+  assert.equal(target.children.length, 0);
+  assert.equal(page.canvas.hideBoxes, false);
+  page.context.typesettingView = "preview"; page.context.renderTools();
+  assert.equal(page.canvas.hideBoxes, true);
+  page.store.stage = "ocr"; page.context.renderTools();
+  assert.equal(page.canvas.hideBoxes, false);
+  assert.equal(JSON.stringify(page.store.records), before);
 });
 
 test("Delete key still removes clean boxes, but not while typing", () => {

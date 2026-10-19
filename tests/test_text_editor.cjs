@@ -104,6 +104,14 @@ test("transforms are manual Typesetting fields, default to zero, and clear at ze
   }
 });
 
+test("line spacing is a manual Typesetting field and clears to default at zero or blank", () => {
+  for (const stage of ["ocr", "text"]) assert.ok(!screens.fieldsFor(stage, {}).some(([name]) => name === "lineSpacing"));
+  assert.equal(screens.fieldsFor("placement", {}).find(([name]) => name === "lineSpacing")[3], 0);
+  const record = screens.applyFields("placement", {}, {lineSpacing: -4});
+  assert.equal(record.lineSpacing, -4);
+  for (const value of [0, ""]) assert.equal(screens.applyFields("placement", record, {lineSpacing: value}).lineSpacing, 0);
+});
+
 test("OCR and Typesetting coordinates share one row with independent number inputs", () => {
   const render = app.match(/function renderInspector\(\) \{[\s\S]*?\n\}/)[0];
   class Element {
@@ -124,6 +132,7 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
       document: {createElement: (tag) => new Element(tag), createTextNode: (text) => ({text})},
       fieldsFor: screens.fieldsFor, ALIGNMENT_LABELS: {}, sourceRecord: () => null,
       protectionFor: () => undefined, applyInspector: (_values, target, field) => changes.push([target.stage, field]),
+      refreshLineBreaks: () => {},
     });
     const form = elements["record-form"];
     const row = form.children.find((child) => child.className === "field-grid");
@@ -135,6 +144,15 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     for (const input of inputs) { assert.equal(input.type, "number"); input.listeners.change(); }
     assert.deepEqual(changes, ["left", "top", "right", "bottom"].map((name) => [stage, name]));
     assert.ok(form.children.some((child) => child.tag === "label"), "other fields stay outside coordinate row");
+    if (stage === "placement") {
+      const children = (element) => [element, ...(element.children || []).flatMap(children)];
+      const help = children(form).find((child) => child.className === "field-help");
+      assert.equal(help.tabIndex, 0);
+      assert.match(help.dataset.tooltip, /Editing this text fixes your chosen line breaks/);
+      const manual = children(form).find((child) => child.name === "manualLineBreaks");
+      manual.listeners.input();
+      assert.equal(manual.dataset.userEdited, "1");
+    }
     if (stage === "placement") for (const name of ["rotation", "skewX", "skewY"]) {
       const children = (element) => [element, ...(element.children || []).flatMap(children)];
       const input = children(form).find((child) => child.name === name);

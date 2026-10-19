@@ -3950,6 +3950,7 @@ def apply_placements_to_records(
             "minPointSize",
             "maxPointSize",
             "rotation",
+            "lineSpacing",
             "skewX",
             "skewY",
         ):
@@ -4189,13 +4190,14 @@ def typeset_render_page(
                 "strokeWidth": DEFAULT_RENDER_STROKE_WIDTH,
                 "gravity": config.render_gravity,
                 **{field: record[field] for field in overlay_text.TEXT_TRANSFORM_LIMITS if field in record},
+                **({"lineSpacing": record["lineSpacing"]} if "lineSpacing" in record else {}),
                 **(
                     {"fontSizeWidthPercent": record["fontSizeWidthPercent"]}
                     if isinstance(record.get("fontSizeWidthPercent"), (int, float))
                     else {}
                 ),
                 **(
-                    {"englishText": record["manualLineBreaks"]}
+                    {"englishText": record["manualLineBreaks"], "manualLineBreaks": record["manualLineBreaks"]}
                     if isinstance(record.get("manualLineBreaks"), str)
                     and record["manualLineBreaks"].strip()
                     else {}

@@ -9,9 +9,11 @@ const screens = vm.runInNewContext(fs.readFileSync(path.join(root, "screens.js")
 const source = fs.readFileSync(path.join(root, "canvas.js"), "utf8").replace(/^import .*\n/, "").replace("export class", "class") + "\nEditorCanvas";
 
 function setup({failure = false, render = null, view = true} = {}) {
-  const requests = [], images = [], status = [], timers = new Map();
+  const requests = [], images = [], overlays = [], status = [], timers = new Map();
   let nextTimer = 0, closed = 0;
-  const ctx = {clearRect() {}, drawImage: (...args) => images.push(args), strokeRect() {}, fillRect() {}, fillText() {}};
+  const ctx = {clearRect() {}, drawImage: (...args) => images.push(args),
+    strokeRect: (...args) => overlays.push(["stroke", ...args]), fillRect: (...args) => overlays.push(["fill", ...args]),
+    fillText: (...args) => overlays.push(["label", ...args])};
   const canvas = {width: 200, height: 200, style: {}, getContext: () => ctx,
     addEventListener() {}, getBoundingClientRect: () => ({width: 200, height: 200})};
   const store = {stage: "placement", page: 0, document: {defaultFont: "Default.ttf"}, addEventListener() {},
@@ -30,8 +32,37 @@ function setup({failure = false, render = null, view = true} = {}) {
   const advance = async () => {
     for (const [id, callback] of [...timers]) { timers.delete(id); await callback(); }
   };
-  return {editor, store, canvas, requests, images, status, timers, advance, closed: () => closed};
+  return {editor, store, canvas, requests, images, overlays, status, timers, advance, closed: () => closed};
 }
+
+test("hiding boxes removes all guides but keeps cached text, selection and records", async () => {
+  const page = setup();
+  page.store.selection = {artifact: "placements", recordId: "zero"};
+  page.store.records.clean_boxes = [{recordId: "clean", boxno: 0, region: [5, 5, 30, 30]}];
+  const before = JSON.stringify(page.store);
+  page.editor.draw(); await page.advance();
+  assert.ok(page.overlays.some(([kind]) => kind === "label"));
+  page.editor.hideBoxes = true; page.overlays.length = 0; page.images.length = 0;
+  page.editor.draw(); await page.advance();
+  assert.equal(page.overlays.length, 0);
+  assert.ok(page.images.some(([image]) => image.entry?.englishText === "Hello"));
+  assert.equal(page.requests.length, 1, "visibility changes do not rerender text");
+  assert.equal(JSON.stringify(page.store), before);
+  page.editor.hideBoxes = false; page.editor.draw();
+  assert.ok(page.overlays.some(([kind]) => kind === "stroke"));
+});
+
+test("hidden boxes cannot be dragged or cycled, but drawing a new clean area still works", () => {
+  const page = setup(); page.editor.hideBoxes = true;
+  page.editor.hits = () => {throw new Error("Must not select invisible boxes");};
+  page.editor.point = () => ({x: 20, y: 20});
+  page.editor.pointerDown({}); page.editor.doubleClick({});
+  assert.equal(page.editor.drag, null);
+  page.editor.startDraw(() => {}); page.editor.pointerDown({});
+  assert.equal(page.editor.drag.mode, "draw");
+  page.editor.draw();
+  assert.equal(page.overlays.length, 1, "only the active drawing outline remains visible");
+});
 
 test("alignment labels are plain directions and renderer values stay unchanged", () => {
   assert.deepEqual(Object.values(screens.ALIGNMENT_LABELS), ["Up", "Center", "Down", "Left", "Right", "Up left", "Up right", "Down left", "Down right"]);
@@ -139,7 +170,8 @@ test("font, outline, text, wrapping and alignment changes render new layers", as
   page.editor.draw();
   await page.advance();
   const patches = [{font: "Other.ttf"}, {strokeWidth: 0}, {manualLineBreaks: "One\nTwo"},
-    {fontSizeWidthPercent: 50}, {rotation: 25}, {skewX: -15}, {skewY: 10},
+    {fontSizeWidthPercent: 50}, {lineSpacing: 12}, {lineSpacing: -3}, {lineSpacing: 0},
+    {rotation: 25}, {skewX: -15}, {skewY: 10},
     ...Object.keys(screens.ALIGNMENT_LABELS).map((gravity) => ({gravity}))];
   for (const patch of patches) {
     Object.assign(page.store.records.placements[0], patch);
