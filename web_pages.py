@@ -431,6 +431,8 @@ def admin_login_page(message: str = "") -> HTMLResponse:
 {message_html}
 <form action="/admin/login" method="post">
   <label>Password<br><input name="password" type="password" required autocomplete="current-password"></label>
+  <label><input name="remember_session" type="checkbox" value="1"> Remember session (30 days)</label>
+  <p class="muted">Use only on a device you trust. Log out to remove the remembered session.</p>
   <button type="submit">Log in</button>
 </form>
 """,

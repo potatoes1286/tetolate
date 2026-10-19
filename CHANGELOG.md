@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a 30-day Remember session login option that survives server restarts.
 - Added a manual GitHub release check beside the web UI version.
 - Added an editor stage reset to remove saved edits and protection flags on one page.
 - Added manual rotation and skew controls with sliders and keyboard-friendly inputs.

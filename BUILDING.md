@@ -54,6 +54,10 @@ Start the web interface with:
 
 Both launchers install the OCR and LaMa dependencies automatically.
 
+Login offers Remember session for 30 days, including server restarts. Leave it
+unchecked on shared devices. Logout revokes that session; a password change
+revokes all browser sessions. Only token hashes are saved in the private web state.
+
 Stopped jobs save Advanced Options automatically. Opening the editor waits for
 pending saves; a failed save keeps you on the job page. OCR checks the inference
 server's model list before local model setup. When Tetolate runs on the host,

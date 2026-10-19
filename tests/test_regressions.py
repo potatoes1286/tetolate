@@ -763,6 +763,7 @@ class WebAuthenticationTests(unittest.TestCase):
         manager = object.__new__(web_app.JobManager)
         manager._lock = threading.RLock()
         manager._admin_sessions = {}
+        manager._remembered_admin_sessions = {}
 
         first = manager.create_admin_session()
         second = manager.create_admin_session()
@@ -1832,7 +1833,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     self.assertIn("httponly", cookie_header)
                     self.assertIn("samesite=strict", cookie_header)
 
-                    self.assertIn("max-age=", cookie_header)
+                    self.assertNotIn("max-age=", cookie_header)
 
                     response = await client.get("/admin")
                     self.assertEqual(response.status_code, 200)

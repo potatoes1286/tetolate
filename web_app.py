@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -105,6 +106,7 @@ DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PAGE_SELECTION_ITEMS = 10_000
 ADMIN_COOKIE_NAME = "tetolate_admin"
 ADMIN_SESSION_SECONDS = 12 * 60 * 60
+REMEMBERED_ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60
 ADMIN_LOGIN_FAILURE_LIMIT = 5
 ADMIN_LOGIN_FAILURE_WINDOW_SECONDS = 60
 WEB_STATE_FILENAME = ".tetolate-web-state.json"
@@ -1425,6 +1427,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         self._local_cli_token = ""
         self._categories: set[str] = set()
         self._admin_sessions: dict[str, float] = {}
+        self._remembered_admin_sessions: dict[str, float] = {}
         self._admin_login_failures: dict[str, list[float]] = {}
         self._password_workers = threading.BoundedSemaphore(2)
         self._editor_lama_lock = threading.Lock()
@@ -1541,6 +1544,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         return {
             "version": 1,
             "adminPasswordHash": self._password_hash,
+            "rememberedAdminSessions": dict(self._remembered_admin_sessions),
             "categories": sorted(self._categories, key=str.casefold),
             "updatedAt": now_utc(),
         }
@@ -1567,6 +1571,15 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 web_security.parse_password_hash(password_hash)
             except ValueError as exc:
                 raise RuntimeError(f"Web state has an invalid admin password hash: {exc}") from exc
+
+        remembered_sessions = state.get("rememberedAdminSessions", {})
+        if not isinstance(remembered_sessions, dict) or any(
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry)
+            for digest, expiry in remembered_sessions.items()
+        ):
+            raise RuntimeError("Web state rememberedAdminSessions must contain session hashes and finite expiry times.")
+        remembered_sessions = {digest: expiry for digest, expiry in remembered_sessions.items() if expiry > time.time()}
 
         configured_categories = state.get("categories", [])
         if not isinstance(configured_categories, list):
@@ -1604,6 +1617,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
 
         with self._lock:
             self._password_hash = password_hash
+            self._remembered_admin_sessions = remembered_sessions if not default_password else {}
             self._categories = categories
             if new_installation:
                 self.category_dir(DEFAULT_CATEGORY).mkdir(parents=True, exist_ok=True)
@@ -1622,7 +1636,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             password_hash = self._password_hash
         return self.password_matches_hash(password, password_hash)
 
-    def authenticate_admin(self, password: str) -> str | None:
+    def authenticate_admin(self, password: str, remember_session: bool = False) -> str | None:
         with self._lock:
             password_hash = self._password_hash
         if not self.password_matches_hash(password, password_hash):
@@ -1630,7 +1644,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         with self._lock:
             if self._password_hash != password_hash:
                 return None
-            return self.create_admin_session()
+            return self.create_admin_session(remember_session=remember_session)
 
     def session_digest(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1640,14 +1654,25 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         expired = [digest for digest, expiry in self._admin_sessions.items() if expiry <= now]
         for digest in expired:
             self._admin_sessions.pop(digest, None)
+        now = time.time()
+        for digest, expiry in list(self._remembered_admin_sessions.items()):
+            if expiry <= now:
+                self._remembered_admin_sessions.pop(digest, None)
 
-    def create_admin_session(self) -> str:
+    def create_admin_session(self, *, remember_session: bool = False) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self.purge_expired_admin_sessions()
-            self._admin_sessions[self.session_digest(token)] = (
-                time.monotonic() + ADMIN_SESSION_SECONDS
-            )
+            digest = self.session_digest(token)
+            if remember_session:
+                self._remembered_admin_sessions[digest] = time.time() + REMEMBERED_ADMIN_SESSION_SECONDS
+                try:
+                    self.save_web_state()
+                except Exception:
+                    self._remembered_admin_sessions.pop(digest, None)
+                    raise
+            else:
+                self._admin_sessions[digest] = time.monotonic() + ADMIN_SESSION_SECONDS
         return token
 
     def admin_session_is_valid(self, token: str) -> bool:
@@ -1655,13 +1680,22 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             return False
         with self._lock:
             self.purge_expired_admin_sessions()
-            return self.session_digest(token) in self._admin_sessions
+            digest = self.session_digest(token)
+            return digest in self._admin_sessions or digest in self._remembered_admin_sessions
 
     def revoke_admin_session(self, token: str) -> None:
         if not token:
             return
         with self._lock:
             self._admin_sessions.pop(self.session_digest(token), None)
+            digest = self.session_digest(token)
+            expiry = self._remembered_admin_sessions.pop(digest, None)
+            if expiry is not None:
+                try:
+                    self.save_web_state()
+                except Exception:
+                    self._remembered_admin_sessions[digest] = expiry
+                    raise
 
     def admin_login_retry_after(self, client_key: str) -> int:
         now = time.monotonic()
@@ -1709,10 +1743,13 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             if self._password_hash != previous_hash:
                 raise ValueError("Admin password changed during this request; try again.")
             self._password_hash = new_hash
+            previous_sessions = self._remembered_admin_sessions
+            self._remembered_admin_sessions = {}
             try:
                 self.save_web_state()
             except Exception:
                 self._password_hash = previous_hash
+                self._remembered_admin_sessions = previous_sessions
                 raise
             self._admin_sessions.clear()
         return self.create_admin_session()
@@ -4726,11 +4763,12 @@ def set_admin_session_cookie(
     response: RedirectResponse,
     request: Request,
     token: str,
+    *, remember_session: bool = False,
 ) -> None:
     response.set_cookie(
         ADMIN_COOKIE_NAME,
         token,
-        max_age=ADMIN_SESSION_SECONDS,
+        max_age=REMEMBERED_ADMIN_SESSION_SECONDS if remember_session else None,
         httponly=True,
         secure=request.url.scheme == "https",
         samesite="strict",
@@ -4870,7 +4908,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return admin_dashboard_page(manager, message)
 
     @app.post("/admin/login")
-    async def admin_login(request: Request, password: str = Form(...)) -> Any:
+    async def admin_login(request: Request, password: str = Form(...), remember_session: str | None = Form(None)) -> Any:
         manager = manager_from_request(request)
         client_key = request.client.host if request.client is not None else "unknown"
         retry_after = manager.admin_login_retry_after(client_key)
@@ -4881,13 +4919,14 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             response.status_code = 429
             response.headers["Retry-After"] = str(retry_after)
             return response
-        token = await run_in_threadpool(manager.authenticate_admin, password)
+        remember = parse_checkbox(remember_session)
+        token = await run_in_threadpool(manager.authenticate_admin, password, remember)
         if token is None:
             manager.record_admin_login_failure(client_key)
             return admin_login_page("Invalid password.")
         manager.clear_admin_login_failures(client_key)
         response = RedirectResponse("/admin", status_code=303)
-        set_admin_session_cookie(response, request, token)
+        set_admin_session_cookie(response, request, token, remember_session=remember)
         return response
 
     @app.post("/admin/logout")
