@@ -24,6 +24,7 @@ export class EditorCanvas {
     this.layers = new Map();
     this.layerTimer = null;
     this.renderingLayers = false;
+    this.layerRequest = null;
     this.renderTextLayers = renderTextLayers;
     this.groupSelection = groupSelection;
     this.image.onload = () => { this.resize(); this.draw(); };
@@ -41,9 +42,35 @@ export class EditorCanvas {
       clearTimeout(this.layerTimer);
       this.layerTimer = null;
       this.trimLayers(new Set());
+      this.cancelTextLayers();
     }
+    const image = new Image();
+    this.image = image;
+    const ready = new Promise((resolve) => {
+      image.onload = () => {
+        if (this.image === image) { this.resize(); this.draw(); }
+        resolve(this.image === image);
+      };
+      image.onerror = () => {
+        if (this.image === image) this.onStatus("Could not load the page image.", true);
+        resolve(false);
+      };
+    });
     const separator = url.includes("?") ? "&" : "?";
-    this.image.src = `${url}${separator}v=${Date.now()}`;
+    image.src = `${url}${separator}v=${Date.now()}`;
+    return ready;
+  }
+
+  cancelTextLayers() {
+    for (const layer of this.layers.values()) {
+      if (layer.request === this.layerRequest && layer.state === "pending") {
+        layer.state = "queued";
+        delete layer.request;
+      }
+    }
+    this.layerRequest?.controller.abort();
+    this.layerRequest = null;
+    this.renderingLayers = false;
   }
   setBusy(busy) {
     this.busy = !!busy;
@@ -102,30 +129,57 @@ export class EditorCanvas {
     const batch = [...this.layers].filter(([_key, layer]) => layer.state === "queued").slice(0, 256);
     if (!batch.length || this.renderingLayers) return;
     this.renderingLayers = true;
-    for (const [_key, layer] of batch) layer.state = "pending";
+    const request = {controller: new AbortController()};
+    this.layerRequest = request;
+    for (const [_key, layer] of batch) { layer.state = "pending"; layer.request = request; }
     this.onStatus(`Rendering ${batch.length} preview text layers...`);
     try {
-      const bitmaps = await this.renderTextLayers(batch[0][1].page, batch.map(([_key, layer]) => layer.entry));
+      const pending = this.renderTextLayers(batch[0][1].page, batch.map(([_key, layer]) => layer.entry), request.controller.signal);
+      request.done = pending;
+      const bitmaps = await pending;
       if (!Array.isArray(bitmaps) || bitmaps.length !== batch.length) {
         for (const bitmap of bitmaps || []) bitmap.close();
         throw new Error("The preview batch returned an incorrect layer count.");
       }
       batch.forEach(([key, layer], index) => {
-        if (this.layers.get(key) === layer) { layer.bitmap = bitmaps[index]; layer.state = "ready"; }
+        if (this.layers.get(key) === layer && layer.request === request && this.layerRequest === request) {
+          layer.bitmap = bitmaps[index]; layer.state = "ready";
+        }
         else bitmaps[index].close();
       });
-      if (batch.some(([key, layer]) => this.layers.get(key) === layer))
+      if (this.layerRequest === request && batch.some(([key, layer]) => this.layers.get(key) === layer))
         this.onStatus("Preview text rendered with ImageMagick.");
     } catch (error) {
       let active = false;
       for (const [key, layer] of batch) {
-        if (this.layers.get(key) === layer) { layer.state = "failed"; active = true; }
+        if (this.layers.get(key) === layer && layer.request === request && this.layerRequest === request) {
+          layer.state = "failed"; active = true;
+        }
       }
-      if (active) this.onStatus(`Could not render preview text: ${error.message}`, true);
+      if (active && error.name !== "AbortError") this.onStatus(`Could not render preview text: ${error.message}`, true);
     } finally {
-      this.renderingLayers = false;
-      this.draw();
+      if (this.layerRequest === request) {
+        this.layerRequest = null;
+        this.renderingLayers = false;
+        this.draw();
+      }
     }
+  }
+
+  async prepareTextLayers() {
+    const document = this.store.document;
+    this.draw();
+    while (this.store.document === document && this.showPlacementText) {
+      clearTimeout(this.layerTimer); this.layerTimer = null;
+      if (this.layerRequest) {
+        try { await this.layerRequest.done; } catch { /* flushLayers reports active errors. */ }
+        await Promise.resolve();
+      } else if ([...this.layers.values()].some((layer) => layer.state === "queued")) {
+        await this.flushLayers();
+      } else break;
+    }
+    if (this.store.document === document && [...this.layers.values()].some((layer) => layer.state === "failed"))
+      throw new Error("Some ImageMagick text layers could not be rendered.");
   }
 
   trimLayers(required) {
@@ -139,6 +193,7 @@ export class EditorCanvas {
 
   draw() {
     if (this.layerDocument !== this.store.document) {
+      this.cancelTextLayers();
       for (const layer of this.layers.values()) {
         layer.bitmap?.close();
       }

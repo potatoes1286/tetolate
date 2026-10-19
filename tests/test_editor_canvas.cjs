@@ -17,11 +17,11 @@ function setup({failure = false, render = null, view = true} = {}) {
   const store = {stage: "placement", page: 0, document: {defaultFont: "Default.ttf"}, addEventListener() {},
     records: {translations: [{boxno: 0, englishText: "Hello"}],
       placements: [{recordId: "zero", boxno: 0, font: "Comic.ttf", gravity: "center", placementRegion: [20, 20, 180, 180], fontSizeWidthPercent: 10}]}};
-  const Canvas = vm.runInNewContext(source, {SCREEN: screens.SCREEN, Image: class {},
+  const Canvas = vm.runInNewContext(source, {SCREEN: screens.SCREEN, Image: class {}, AbortController,
     setTimeout: (callback, delay) => { assert.equal(delay, 200); timers.set(++nextTimer, callback); return nextTimer; },
     clearTimeout: (id) => timers.delete(id)});
-  const editor = new Canvas(canvas, store, (...args) => status.push(args), async (page, entries) => {
-    requests.push([page, structuredClone(entries)]);
+  const editor = new Canvas(canvas, store, (...args) => status.push(args), async (page, entries, signal) => {
+    requests.push([page, structuredClone(entries), signal]);
     if (failure) throw new Error("Missing ImageMagick");
     return render ? render(page, entries) : entries.map((entry) => ({entry: structuredClone(entry), width: entry.placementRegion[2] + 16, height: entry.placementRegion[3] + 16, close() { closed++; }}));
   });
@@ -38,6 +38,46 @@ test("alignment labels are plain directions and renderer values stay unchanged",
   const field = screens.fieldsFor("placement", {gravity: "west"}).find(([name]) => name === "gravity");
   assert.equal(field[3], "west");
   assert.equal(screens.ALIGNMENT_LABELS[field[3]], "Left");
+});
+
+test("prepareTextLayers starts Magick immediately and waits for it, then reuses cached layers", async () => {
+  let finish;
+  const page = setup({render: () => new Promise((resolve) => { finish = resolve; })});
+  let ready = false;
+  const prepared = page.editor.prepareTextLayers().then(() => { ready = true; });
+  assert.equal(page.requests.length, 1);
+  assert.equal(ready, false);
+  finish([{width: 50, height: 50, close() {}}]); await prepared;
+  assert.equal(ready, true);
+  await page.editor.prepareTextLayers(); assert.equal(page.requests.length, 1);
+});
+
+test("a previous page's pending Magick batch does not block the new page", async () => {
+  let finish, closed = 0;
+  const page = setup({render: (number, entries) => number === 0
+    ? new Promise((resolve) => { finish = resolve; })
+    : entries.map(() => ({width: 50, height: 50, close() {}}))});
+  page.editor.draw(); const previous = page.advance();
+  assert.equal(page.requests.length, 1);
+  page.store.page = 1; page.store.document = {...page.store.document};
+  page.editor.draw(); await page.advance();
+  assert.equal(page.requests[0][2].aborted, true);
+  assert.equal(page.requests.length, 2);
+  assert.equal(page.requests[1][0], 1);
+  finish([{width: 50, height: 50, close() { closed++; }}]); await previous;
+  assert.equal(closed, 1);
+  assert.equal(page.editor.renderingLayers, false);
+});
+
+test("late source-image loads cannot paint an older page", async () => {
+  const page = setup(); let painted = 0;
+  page.editor.draw = () => { painted++; };
+  const old = page.editor.load("page-4"), oldImage = page.editor.image;
+  const current = page.editor.load("page-5"), currentImage = page.editor.image;
+  oldImage.onload(); assert.equal(await old, false); assert.equal(painted, 0);
+  currentImage.naturalWidth = 200; currentImage.naturalHeight = 300;
+  currentImage.onload(); assert.equal(await current, true); assert.equal(painted, 1);
+  assert.equal(page.canvas.height, 300);
 });
 
 test("Preview debounces rendering and draws exact layer pixels with bleed, without scaling", async () => {

@@ -4648,6 +4648,8 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('Next [D]', body)
             self.assertIn('id="record-list"', body)
             self.assertIn('id="record-form"', body)
+            self.assertLess(body.index('id="stage-tools"'), body.index('id="editor-status"'))
+            self.assertLess(body.index('id="editor-status"'), body.index('id="canvas-wrap"'))
             self.assertIn('id="record-resizer"', body)
             self.assertIn('id="inspector-resizer"', body)
             self.assertIn(

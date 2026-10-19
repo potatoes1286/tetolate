@@ -102,11 +102,11 @@ class EditorManagerMixin:
     def editor_v2_preview_path(self, code: str, job_id: str, page: int) -> Path:
         return self.editor_meta_dir(code, job_id) / "previews" / f"page_{page:04d}.png"
 
-    def editor_v2_clean_preview_path(self, code: str, job_id: str, page: int) -> Path:
+    def editor_v2_clean_preview_path(self, code: str, job_id: str, page: int, key: str) -> Path:
         return (
             self.editor_meta_dir(code, job_id)
             / "previews"
-            / f"page_{page:04d}.cleaned.png"
+            / f"page_{page:04d}.{key}.cleaned.png"
         )
 
     def has_editor_v2(self, code: str, job_id: str) -> bool:
@@ -362,6 +362,7 @@ class EditorManagerMixin:
         self.add_editor_layout_hints(artifacts, width, height, default_font)
         notes = manifest.get("translationNotes", {})
         page_notes = notes.get("pages", {}) if isinstance(notes, dict) else {}
+        cleaned_path = translate_cbz.cleaned_pages_dir(self.output_dir(code, job_id)) / f"{page_path.stem}.png"
         return {
             "schemaVersion": editor_v2.SCHEMA_VERSION,
             "revision": manifest["revision"],
@@ -380,6 +381,8 @@ class EditorManagerMixin:
             "image": {
                 "name": page_path.name,
                 "url": f"/job/{code}/{job_id}/image/{page}",
+                "cleanedUrl": (f"/api/job/{code}/{job_id}/editor/v2/image/cleaned/{page}"
+                               if cleaned_path.is_file() else None),
                 "width": width,
                 "height": height,
             },
@@ -1125,23 +1128,20 @@ class EditorManagerMixin:
             for record in structured_records
             if isinstance(record, dict) and not bool(record.get("openLettering"))
         ]
-        preview = self.editor_v2_clean_preview_path(code, job_id, page)
-        preview.parent.mkdir(parents=True, exist_ok=True)
-        current_mask = preview.with_name(f"page_{page:04d}.mask.png")
         try:
-            clean_text_regions.build_mask(
-                clean_entries,
-                original,
-                current_mask,
-                clean_text_regions.DEFAULT_PADDING,
-            )
+            # Each request builds its own mask. Concurrent drafts must not share
+            # a mutable image or mask filename.
+            with tempfile.TemporaryDirectory(prefix="editor-clean-mask-") as directory:
+                temporary_mask = Path(directory) / "mask.png"
+                clean_text_regions.build_mask(clean_entries, original, temporary_mask, clean_text_regions.DEFAULT_PADDING)
+                mask_bytes = temporary_mask.read_bytes()
         except clean_text_regions.InputError as exc:
             raise HTTPException(
                 status_code=400,
                 detail=f"Cannot build the current cleaning mask: {exc}",
             ) from exc
 
-        mask_digest = hashlib.sha256(current_mask.read_bytes()).hexdigest()
+        mask_digest = hashlib.sha256(mask_bytes).hexdigest()
         output_dir = self.output_dir(code, job_id)
         pipeline_mask = output_dir / "debug" / "masks" / f"{original.stem}.png"
         pipeline_cleaned = output_dir / "pages" / "cleaned" / f"{original.stem}.png"
@@ -1166,18 +1166,18 @@ class EditorManagerMixin:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
+        preview = self.editor_v2_clean_preview_path(code, job_id, page, cache_key)
+        preview.parent.mkdir(parents=True, exist_ok=True)
+        current_mask = preview.with_suffix(".mask.png")
         cache_path = preview.with_suffix(".json")
         if preview.is_file() and cache_path.is_file():
-            try:
-                cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                cache_data = None
-            if isinstance(cache_data, dict) and cache_data.get("key") == cache_key:
-                return preview, False
+            return preview, False
 
         try:
             with self._editor_lama_lock:
-                if self._editor_lama_session is None:
+                if preview.is_file() and cache_path.is_file():
+                    return preview, False
+                if clean_entries and self._editor_lama_session is None:
                     self._editor_lama_session = lama_inpaint.LaMaSession(
                         clean_text_regions.DEFAULT_DEVICE
                     )
@@ -1193,13 +1193,37 @@ class EditorManagerMixin:
                     current_mask,
                     self._editor_lama_session,
                 )
+                write_json_atomic(cache_path, {"key": cache_key})
         except (clean_text_regions.InputError, lama_inpaint.LaMaError) as exc:
             raise HTTPException(
                 status_code=500,
                 detail=f"LaMa could not create the current preview: {exc}",
             ) from exc
-        write_json_atomic(cache_path, {"key": cache_key})
         return preview, bool(clean_entries)
+
+    def render_editor_v2_clean_preview(self, code: str, job_id: str, page: int,
+                                      records: list[Any], boxes: list[Any]) -> dict[str, Any]:
+        self.require_editable_job(code, job_id, "placement")
+        if len(records) > 4096:
+            raise HTTPException(400, "Too many source cleaning regions.")
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise HTTPException(400, "Each cleaning region must be an object.")
+            try:
+                clean_text_regions.validate_entry(index, record)
+            except clean_text_regions.InputError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        clean_boxes = self.normalize_clean_boxes(code, job_id, page, boxes)
+        path, cleaned = self.current_editor_clean_source(code, job_id, page, [*records, *clean_boxes])
+        root = f"/api/job/{code}/{job_id}/editor/v2"
+        original = self.original_page_path(code, job_id, page)
+        pipeline = self.output_dir(code, job_id) / "pages/cleaned" / f"{original.stem}.png"
+        if path == pipeline:
+            url = f"{root}/image/cleaned/{page}"
+        else:
+            key = path.name.split(".")[1]
+            url = f"{root}/clean-preview-image/{page}/{key}"
+        return {"url": url, "cleanedWithLama": cleaned}
 
     def editor_v2_render_entries(
         self,
@@ -1323,7 +1347,7 @@ class EditorManagerMixin:
         boxes = self.normalize_clean_boxes(code, job_id, page, clean_boxes or [])
         entries = self.editor_v2_render_entries(code, job_id, page, placement_records)
         source, cleaned_with_lama = self.current_editor_clean_source(
-            code, job_id, page, [*structured_records, *boxes]
+            code, job_id, page, [*structured_records, *boxes],
         )
         output = self.editor_v2_preview_path(code, job_id, page)
         output.parent.mkdir(parents=True, exist_ok=True)

@@ -1634,8 +1634,8 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <div id="record-resizer" class="pane-resizer" role="separator" aria-label="Resize records pane" aria-orientation="vertical" tabindex="0"></div>
     <section class="canvas-pane">
       <div id="stage-tools" class="stage-tools"></div>
-      <div class="canvas-wrap" id="canvas-wrap"><canvas id="page-canvas"></canvas></div>
       <p id="editor-status" class="status-line muted" role="status"></p>
+      <div class="canvas-wrap" id="canvas-wrap"><canvas id="page-canvas"></canvas></div>
     </section>
     <div id="inspector-resizer" class="pane-resizer" role="separator" aria-label="Resize inspector pane" aria-orientation="vertical" tabindex="0"></div>
     <aside class="inspector-pane">

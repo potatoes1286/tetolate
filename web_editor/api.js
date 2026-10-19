@@ -26,8 +26,8 @@ export class EditorApi {
     this.root = `/api/job/${encodeURIComponent(category)}/${encodeURIComponent(jobId)}/editor/v2`;
   }
 
-  load(stage, page) {
-    return request(`${this.root}/pages/${page}/stages/${stage}`);
+  load(stage, page, signal) {
+    return request(`${this.root}/pages/${page}/stages/${stage}`, {signal});
   }
 
   save(stage, page, body) {
@@ -68,16 +68,23 @@ export class EditorApi {
     });
   }
 
-  preview(stage, page, records, cleanRecords, cleanBoxes = []) {
+  preview(stage, page, records, cleanRecords, cleanBoxes = [], signal) {
     return request(`${this.root}/pages/${page}/stages/${stage}/preview`, {
-      method: "POST", headers: jsonHeaders,
+      method: "POST", headers: jsonHeaders, signal,
       body: JSON.stringify({ records, cleanRecords, cleanBoxes }),
     });
   }
 
-  async textLayers(page, records) {
+  cleanPreview(page, cleanRecords, cleanBoxes, signal) {
+    return request(`${this.root}/pages/${page}/clean-preview`, {
+      method: "POST", headers: jsonHeaders, signal,
+      body: JSON.stringify({cleanRecords, cleanBoxes}),
+    });
+  }
+
+  async textLayers(page, records, signal) {
     const data = await request(`${this.root}/pages/${page}/text-layers`, {
-      method: "POST", headers: jsonHeaders, body: JSON.stringify({records}),
+      method: "POST", headers: jsonHeaders, body: JSON.stringify({records}), signal,
     });
     if (!Array.isArray(data.layers) || data.layers.length !== records.length)
       throw new Error("The preview batch returned an incorrect layer count.");

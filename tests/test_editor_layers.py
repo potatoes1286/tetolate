@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+from concurrent.futures import ThreadPoolExecutor
+import io
+import os
+import re
 from pathlib import Path
 import shutil
 import tempfile
@@ -11,10 +15,11 @@ from unittest import mock
 
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 from tests import test_regressions
 import overlay_text
+import clean_text_regions
 import translate_cbz
 import web_app
 
@@ -36,6 +41,56 @@ class EditorLayerTests(unittest.TestCase):
 
     def layer(self, record=None):
         return self.manager.render_editor_v2_text_layers(self.code, self.job_id, 0, [record or self.record])[0]
+
+    def test_payload_exposes_saved_cleaned_background_only_when_available(self):
+        payload = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
+        self.assertIsNone(payload["image"]["cleanedUrl"])
+        original = self.manager.original_page_path(self.code, self.job_id, 0)
+        cleaned = translate_cbz.cleaned_pages_dir(self.manager.output_dir(self.code, self.job_id)) / f"{original.stem}.png"
+        cleaned.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (100, 120), "white").save(cleaned)
+        payload = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
+        url = f"/api/job/{self.code}/{self.job_id}/editor/v2/image/cleaned/0"
+        self.assertEqual(payload["image"]["cleanedUrl"], url)
+        self.assertEqual(payload["image"]["url"], f"/job/{self.code}/{self.job_id}/image/0")
+
+        app = web_app.create_app(self.root / "config/web_config.json"); app.state.manager = self.manager
+
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+                self.assertEqual((await client.get(url)).status_code, 401)
+                client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin("changeme"))
+                response = await client.get(url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.content, cleaned.read_bytes())
+
+        async def direct(function, *args, **kwargs):
+            return function(*args)
+
+        with mock.patch("anyio.to_thread.run_sync", new=direct):
+            asyncio.run(exercise())
+
+    def test_all_editor_module_imports_are_served_after_login(self):
+        app = web_app.create_app(self.root / "config/web_config.json"); app.state.manager = self.manager
+        source = (web_app.REPO_DIR / "web_editor/app.js").read_text()
+        modules = set(re.findall(r'from "\./([^\"]+)"', source))
+        self.assertIn("preview.js", modules)
+
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+                self.assertEqual((await client.get("/assets/editor-v2/preview.js")).status_code, 303)
+                client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin("changeme"))
+                for module in modules:
+                    response = await client.get(f"/assets/editor-v2/{module}")
+                    self.assertEqual(response.status_code, 200, module)
+                    self.assertIn("application/javascript", response.headers["content-type"])
+                self.assertEqual((await client.get("/assets/editor-v2/missing.js")).status_code, 404)
+
+        async def direct(function, *args, **kwargs):
+            return function(*args)
+
+        with mock.patch("anyio.to_thread.run_sync", new=direct):
+            asyncio.run(exercise())
 
     def layers(self, records):
         return self.manager.render_editor_v2_text_layers(self.code, self.job_id, 0, records)
@@ -172,6 +227,136 @@ class EditorLayerTests(unittest.TestCase):
             with self.subTest(patch=str(patch)[:100]), self.assertRaises(HTTPException) as raised:
                 self.layer({**self.record, **patch})
             self.assertEqual(raised.exception.status_code, 400)
+
+    def test_background_preview_has_immutable_cache_paths_and_never_typesets_or_changes_job_data(self):
+        original = self.manager.original_page_path(self.code, self.job_id, 0)
+        output = self.manager.output_dir(self.code, self.job_id)
+        final = output / "pages/final" / original.name
+        final.parent.mkdir(parents=True, exist_ok=True)
+        final.write_bytes(b"last pipeline render")
+        manifest_before = self.manager.editor_v2_manifest_path(self.code, self.job_id).read_bytes()
+        records = [{"region": [20, 20, 50, 50], "openLettering": False}]
+
+        def clean(entries, source, target, padding, _device, _model, _trigger, _margin, mask, _session):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            mask.parent.mkdir(parents=True, exist_ok=True)
+            clean_text_regions.build_mask(entries, source, mask, padding)
+
+        def render(_entries, source, target):
+            shutil.copyfile(source, target)
+
+        with mock.patch.object(self.manager, "_editor_lama_session", mock.Mock()), \
+             mock.patch.object(clean_text_regions, "clean_text_regions", side_effect=clean) as cleaning, \
+             mock.patch.object(overlay_text, "overlay_text", side_effect=render) as rendering:
+            result = self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, records, [])
+            first_path, _ = self.manager.current_editor_clean_source(self.code, self.job_id, 0, records)
+            first_bytes = first_path.read_bytes()
+            self.assertEqual(self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, records, [])["url"], result["url"])
+            self.assertEqual(cleaning.call_count, 1)
+            changed = [{**records[0], "region": [40, 40, 80, 80]}]
+            other = self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, changed, [])
+            self.assertNotEqual(result["url"], other["url"])
+            self.assertEqual(first_path.read_bytes(), first_bytes)
+            self.assertEqual(self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, records, [])["url"], result["url"])
+            self.assertEqual(cleaning.call_count, 2, "returning to an older draft reuses its own cached mask")
+            pipeline_cleaned = output / "pages/cleaned" / original.name
+            pipeline_mask = output / "debug/masks" / original.name
+            pipeline_cleaned.parent.mkdir(parents=True, exist_ok=True)
+            pipeline_mask.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, pipeline_cleaned)
+            clean_text_regions.build_mask(records, original, pipeline_mask, clean_text_regions.DEFAULT_PADDING)
+            matched = self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, records, [])
+            self.assertEqual(cleaning.call_count, 2)
+            self.assertTrue(matched["url"].endswith("/image/cleaned/0"))
+            rendering.assert_not_called()
+        self.assertEqual(final.read_bytes(), b"last pipeline render")
+        self.assertEqual(self.manager.editor_v2_manifest_path(self.code, self.job_id).read_bytes(), manifest_before)
+
+    def test_background_preview_http_validates_regions_and_keeps_auth_checks(self):
+        app = web_app.create_app(self.root / "config/web_config.json")
+        app.state.manager = self.manager
+        url = f"/api/job/{self.code}/{self.job_id}/editor/v2/pages/0/clean-preview"
+        body = {"cleanRecords": [], "cleanBoxes": []}
+
+        async def direct(function, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        async def exercise(render):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+                self.assertEqual((await client.post(url, json=body)).status_code, 401)
+                client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin("changeme"))
+                self.assertEqual((await client.post(url, json=body, headers={"Origin": "http://other"})).status_code, 403)
+                for value in (None, "true", 1, {}):
+                    self.assertEqual((await client.post(url, json={**body, "cleanBoxes": value})).status_code, 400)
+                render.assert_not_called()
+                response = await client.post(url, json=body)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["url"], "cleaned.png")
+                self.assertEqual(render.call_args.args[-2:], ([], []))
+
+        with mock.patch("anyio.to_thread.run_sync", new=direct), \
+             mock.patch.object(self.manager, "render_editor_v2_clean_preview", return_value={"url": "cleaned.png"}) as render:
+            asyncio.run(exercise(render))
+
+    def test_background_preview_rejects_invalid_regions_before_inpainting(self):
+        invalid = [None, {"region": [False, 0, 10, 10]}, {"region": [0, 0, float("nan"), 10]},
+                   {"region": [10, 10, 0, 0]}, {"region": [200, 200, 250, 250]}]
+        with mock.patch.object(clean_text_regions, "clean_text_regions") as clean:
+            for record in invalid:
+                with self.subTest(record=str(record)), self.assertRaises(HTTPException) as raised:
+                    self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, [record], [])
+                self.assertEqual(raised.exception.status_code, 400)
+            clean.assert_not_called()
+
+    def test_concurrent_background_drafts_have_distinct_images_and_masks(self):
+        def clean(entries, source, target, padding, _device, _model, _trigger, _margin, mask, _session):
+            image = Image.open(source).convert("RGB")
+            image.paste("red" if entries[0]["region"][0] == 20 else "blue", (0, 0, 100, 120))
+            image.save(target)
+            clean_text_regions.build_mask(entries, source, mask, padding)
+
+        with mock.patch.object(self.manager, "_editor_lama_session", mock.Mock()), \
+             mock.patch.object(clean_text_regions, "clean_text_regions", side_effect=clean) as cleaning:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.manager.render_editor_v2_clean_preview, self.code, self.job_id, 0,
+                    [{"region": [left, 20, left + 20, 60]}], []) for left in (20, 50)]
+                results = [future.result() for future in futures]
+            self.assertNotEqual(results[0]["url"], results[1]["url"])
+            for result, color in zip(results, ((255, 0, 0), (0, 0, 255))):
+                key = result["url"].rsplit("/", 1)[1]
+                image = self.manager.editor_v2_clean_preview_path(self.code, self.job_id, 0, key)
+                with Image.open(image) as pixels:
+                    self.assertEqual(pixels.getpixel((0, 0)), color)
+                self.assertTrue(image.with_suffix(".mask.png").is_file())
+            self.assertEqual(cleaning.call_count, 2)
+
+    @unittest.skipUnless(os.environ.get("TETOLATE_LAMA_MODEL_PATH"), "Requires the isolated runtime LaMa model")
+    def test_native_background_preview_serves_cleaned_pixels_without_magick(self):
+        original = self.manager.original_page_path(self.code, self.job_id, 0)
+        image = Image.new("RGB", (100, 120), "white")
+        ImageDraw.Draw(image).rectangle((48, 48, 58, 58), fill="black")
+        image.save(original)
+        with mock.patch.object(overlay_text, "overlay_text", side_effect=AssertionError("Background endpoint must not typeset")):
+            result = self.manager.render_editor_v2_clean_preview(self.code, self.job_id, 0, [{"region": [40, 40, 70, 70]}], [])
+        if self.manager._editor_lama_session is not None:
+            self.addCleanup(self.manager._editor_lama_session.close)
+        app = web_app.create_app(self.root / "config/web_config.json"); app.state.manager = self.manager
+
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+                self.assertEqual((await client.get(result["url"])).status_code, 401)
+                client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.authenticate_admin("changeme"))
+                response = await client.get(result["url"])
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers["content-type"], "image/png")
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                with Image.open(io.BytesIO(response.content)) as cleaned:
+                    self.assertGreater(min(cleaned.convert("RGB").getpixel((53, 53))), 200)
+                invalid = result["url"].rsplit("/", 1)[0] + "/invalid"
+                self.assertEqual((await client.get(invalid)).status_code, 404)
+
+        asyncio.run(exercise())
 
     def test_failed_render_does_not_leave_a_cached_image(self):
         with mock.patch.object(overlay_text, "ensure_magick", side_effect=overlay_text.InputError("missing magick")):

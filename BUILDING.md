@@ -43,7 +43,7 @@ The default output is `book_translated/`. Available resume, page regeneration,
 language, OCR, and output controls are listed by:
 
 ```bash
-uv run --locked --extra inpaint python translate_cbz.py --help
+uv run --locked --extra inpaint --extra ocr python translate_cbz.py --help
 ```
 
 Start the web interface with:
@@ -52,8 +52,7 @@ Start the web interface with:
 ./run_server.sh
 ```
 
-Set `TETOLATE_LOCAL_PADDLEOCR=1` when either launcher should synchronize the OCR
-extra as well as the smaller default LaMa environment.
+Both launchers install the OCR and LaMa dependencies automatically.
 
 The first render downloads the SHA-256-verified `big-lama.pt` model to the Torch
 cache. LaMa uses the bundled runner's fixed settings and needs no configuration.
@@ -175,16 +174,21 @@ raw rows), then use Group checked. Double-click cycles overlapping boxes.
 Deleting a source box hides its linked boxes in later tabs. Saved downstream
 edits are kept; resetting the source stage restores them. Rendered pages still
 need regeneration.
-Typesetting Preview uses cached ImageMagick text layers on the current cleaned
-page. Fonts, wrapping, sizing, outlines, and alignment use the same renderer as
+Typesetting Preview starts with the saved cleaned page when available, shows
+ImageMagick text layers, then updates the background with LaMa.
+Fonts, wrapping, sizing, outlines, and alignment use the same renderer as
 Current. Moving boxes reuses cached pixels; other edits refresh the affected
 layer after a short delay. Uncached layers share one request and one ImageMagick
 process (up to 256 boxes per batch); cached layers are not rendered again.
 New layers appear together when their batch finishes.
-Current and Preview update the cleaning mask when selected.
+Preview refreshes cleaning automatically after clean-box edits, undo/redo, and
+reset. Navigation does not wait for LaMa; late results from another page are
+ignored. Current prepares an exact view when selected. Last Render shows the
+last pipeline output. These views do not save edits or update final pages/exports;
+use Save and Regenerate downstream for those. Press Delete to remove a selected clean box.
 Use Add clean box in Typesetting to draw an area for LaMa to clean without
-adding text. Move, resize, or delete the box, then select Current or Preview
-to refresh cleaning. Save and Regenerate downstream apply it to final pages
+adding text. Move, resize, or delete the box; Preview refreshes automatically.
+Save and Regenerate downstream apply it to final pages
 and CBZ exports without OCR or VLM calls. Undo/redo includes clean boxes;
 Reset stage removes them on that page. Cleaning can alter artwork in the area.
 Typesetting also has manual rotation (±180°) and horizontal/vertical skew
@@ -214,7 +218,7 @@ Rendered text pixels were identical between the serial and batch versions.
 Run the deterministic regression suite without live OCR or VLM services:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv run --locked --extra inpaint \
+UV_CACHE_DIR=/tmp/uv-cache uv run --locked --extra inpaint --extra ocr \
   python -m unittest discover -s tests -v
 ```
 

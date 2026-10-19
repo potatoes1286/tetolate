@@ -4827,6 +4827,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             "api.js",
             "store.js",
             "canvas.js",
+            "preview.js",
             "screens.js",
             "editor.css",
         }
@@ -5410,6 +5411,29 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 "url": f"/api/job/{code}/{job_id}/editor/v2/preview-image/{page}?v={int(time.time())}",
             }
         )
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/clean-preview")
+    async def clean_editor_v2_preview(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        data = await request.json()
+        records = data.get("cleanRecords") if isinstance(data, dict) else None
+        boxes = data.get("cleanBoxes") if isinstance(data, dict) else None
+        if not isinstance(records, list) or not isinstance(boxes, list):
+            raise HTTPException(400, "cleanRecords and cleanBoxes must be arrays.")
+        result = await run_in_threadpool(manager.render_editor_v2_clean_preview, code, job_id, page, records, boxes)
+        return JSONResponse(result)
+
+    @app.get("/api/job/{code}/{job_id}/editor/v2/clean-preview-image/{page}/{key}")
+    async def editor_v2_clean_image(request: Request, code: str, job_id: str, page: int, key: str) -> FileResponse:
+        manager = manager_from_request(request)
+        manager.require_editable_job(code, job_id, "placement")
+        manager.original_page_path(code, job_id, page)
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise HTTPException(404, "Unknown cleaned preview.")
+        path = manager.editor_v2_clean_preview_path(code, job_id, page, key)
+        if not path.is_file():
+            raise HTTPException(404, "Cleaned preview is unavailable.")
+        return FileResponse(path, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/preview-image/{page}")
     async def editor_v2_preview_image(

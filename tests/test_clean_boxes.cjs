@@ -106,18 +106,20 @@ test("clean boxes are drawn and listed but never request text layers", async () 
 
 test("Current and Preview send clean boxes while Preview keeps cached text layers", async () => {
   const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
-  const requests = [], loads = [];
-  Object.assign(page.context, {typesettingView: "preview", api: {preview: async (...args) => { requests.push(args); return {url: "clean-preview", cleanedWithLama: true}; }},
+  const requests = [], loads = [], shown = [];
+  Object.assign(page.context, {typesettingView: "preview", AbortController, currentPreviewRequest: null,
+    preview: {hide() {}, show: () => shown.push(true)},
+    api: {preview: async (...args) => { requests.push(args); return {url: "clean-preview", cleanedWithLama: true}; }},
     canvas: {load: (...args) => loads.push(args)}, imageUrl: () => "original"});
   vm.runInContext(fn("exactPreview") + "\n" + fn("loadTypesettingView"), page.context);
   await page.context.loadTypesettingView();
-  assert.equal(requests[0][2].length, 0);
-  assert.equal(requests[0][4][0].recordId, page.store.records.clean_boxes[0].recordId);
-  assert.equal(loads[0].length, 1, "Preview enables cached layers");
+  assert.equal(shown.length, 1);
+  assert.equal(requests.length, 0, "Preview uses its independent background controller");
+  page.context.typesettingView = "current";
   await page.context.exactPreview();
-  assert.equal(requests[1][2].length, 1);
-  assert.equal(requests[1][4].length, 1);
-  assert.equal(loads[1][1].showPlacementText, false);
+  assert.equal(requests[0][2].length, 1);
+  assert.equal(requests[0][4].length, 1);
+  assert.equal(loads[0][1].showPlacementText, false);
 });
 
 test("save and preview API serialize clean boxes separately from text", async () => {
@@ -138,4 +140,69 @@ test("save and preview API serialize clean boxes separately from text", async ()
   vm.runInContext(fn("save"), page.context);
   await page.context.save();
   assert.equal(page.store.dirty, false);
+});
+
+test("Last Render and current saved output never start cleaning", async () => {
+  const page = setup(), requests = [], loads = [];
+  const before = JSON.stringify(page.store.snapshot());
+  Object.assign(page.context, {typesettingView: "render", AbortController, currentPreviewRequest: null,
+    preview: {hide() {}, show() {}}, api: {preview: async (...args) => {
+    requests.push(args); return {url: "fresh-render", cached: false, cleanedWithLama: true};
+  }}, canvas: {load: (...args) => loads.push(args)}, imageUrl: () => "last-render"});
+  vm.runInContext(fn("exactPreview") + "\n" + fn("loadTypesettingView"), page.context);
+  await page.context.loadTypesettingView();
+  assert.equal(requests.length, 0);
+  assert.equal(loads[0][0], "last-render");
+  assert.equal(loads[0][1].showPlacementText, false);
+  assert.equal(JSON.stringify(page.store.snapshot()), before);
+  assert.equal(page.store.dirty, false);
+  page.context.typesettingView = "render";
+  await page.context.loadTypesettingView();
+  assert.equal(requests.length, 0, "Last Render does not run anything");
+  assert.equal(loads.at(-1)[0], "last-render");
+  page.context.typesettingView = "current";
+  await page.context.loadTypesettingView();
+  assert.equal(requests.length, 0, "Current keeps its saved-render fast path");
+});
+
+test("view controls include Last Render, with no Re-render or clean delete buttons", () => {
+  const page = setup(), buttons = [];
+  Object.assign(page.context, {typesettingView: "current", ocrAreaRunning: false, queuedAction: "",
+    byId: () => ({replaceChildren() {}}), selectTypesettingView() {},
+    addButton: (_target, text, _handler, _title, _tooltip, shortcut) => {
+      buttons.push({text, shortcut}); return {classList: {toggle() {}}};
+    }});
+  vm.runInContext(fn("renderTools"), page.context);
+  page.context.renderTools();
+  assert.deepEqual(buttons.map((button) => button.text), ["Current", "Original", "Preview", "Last Render", "Add clean box"]);
+  assert.equal(new Set(buttons.map((button) => button.shortcut)).size, buttons.length);
+  assert.doesNotMatch(app, /addButton\([^\n]*"Delete clean box"/);
+});
+
+test("Delete key still removes clean boxes, but not while typing", () => {
+  const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
+  let keydown;
+  Object.assign(page.context, {resetting: false, ocrAreaRunning: false, AVAILABLE_STAGES: ["ocr", "text", "placement"],
+    document: {addEventListener: (_event, callback) => { keydown = callback; }}});
+  const handler = app.slice(app.indexOf('document.addEventListener("keydown",'), app.indexOf('window.addEventListener("beforeunload",'));
+  vm.runInContext(handler, page.context);
+  keydown({target: {tagName: "INPUT"}, key: "Delete", preventDefault() { assert.fail("typing must not delete a box"); }});
+  assert.equal(page.store.records.clean_boxes.length, 1);
+  let prevented = false;
+  keydown({target: {tagName: "DIV"}, key: "Delete", preventDefault() { prevented = true; }});
+  assert.equal(prevented, true);
+  assert.equal(page.store.records.clean_boxes.length, 0);
+  page.store.undo(); assert.equal(page.store.records.clean_boxes.length, 1);
+});
+
+test("background API sends only cleaning records and an abort signal", async () => {
+  let body, url, signal;
+  const Api = vm.runInNewContext(read("api.js").replace("export class", "class") + "\nEditorApi", {
+    fetch: async (target, options) => { url = target; signal = options.signal; body = JSON.parse(options.body); return {ok: true, json: async () => ({ok: true})}; },
+  });
+  const controller = new AbortController();
+  await new Api("default", "test").cleanPreview(0, [], [], controller.signal);
+  assert.match(url, /pages\/0\/clean-preview$/);
+  assert.deepEqual(Object.keys(body).sort(), ["cleanBoxes", "cleanRecords"]);
+  assert.equal(signal, controller.signal);
 });

@@ -11,6 +11,8 @@
 
 ### Changed
 
+- Preview reuses saved cleaned pages, shows text before LaMa finishes, and refreshes clean-box edits without blocking navigation.
+- Renamed Render to Last Render, removed duplicate clean-box controls, and moved status below the editor actions.
 - Local CLI access no longer needs login; remote access still requires a token.
 - Combined the Structure, Erase, and Translation editor tabs, with reruns based on changed fields.
 - Typesetting Preview batches uncached layers in one ImageMagick process, keeping per-box caches.
@@ -19,6 +21,7 @@
 
 ### Fixed
 
+- Source launchers include required OCR dependencies by default.
 - Clearing the editor font size restores automatic sizing and stays cleared after saving.
 - Typesetting saves preserve pending OCR and translation changes.
 - Manual OCR additions reach later editor tabs; canvas multi-selection, grouping, and overlap selection work together.

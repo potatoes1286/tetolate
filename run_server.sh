@@ -33,10 +33,7 @@ fi
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
-uv_args=(--locked --extra inpaint --project "$repo_dir")
-if [[ "${TETOLATE_LOCAL_PADDLEOCR:-0}" == "1" ]]; then
-  uv_args+=(--extra ocr)
-fi
+uv_args=(--locked --extra inpaint --extra ocr --project "$repo_dir")
 
 uv run "${uv_args[@]}" \
   python "$web_script" --config "$config_path" "$@"

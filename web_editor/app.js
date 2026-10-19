@@ -1,6 +1,7 @@
 import { EditorApi } from "./api.js";
 import { EditorStore } from "./store.js";
 import { EditorCanvas } from "./canvas.js";
+import { PreviewController } from "./preview.js";
 import { STAGES, SCREEN, ALIGNMENT_LABELS, recordLabel, fieldsFor, applyFields, textFieldTarget, updateTextField } from "./screens.js";
 
 const config = window.TETOLATE_EDITOR_V2;
@@ -10,10 +11,15 @@ const AVAILABLE_STAGES = Array.isArray(config.availableStages)
 const api = new EditorApi(config.category, config.jobId);
 const store = new EditorStore(config);
 const byId = (id) => document.getElementById(id);
-const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus, (page, records) => api.textLayers(page, records),
+const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus, (page, records, signal) => api.textLayers(page, records, signal),
   {select: selectOcrBoxes, has: ocrBoxesChecked});
+const preview = new PreviewController(store, canvas, api, setStatus);
 const mergeSelection = new Set();
 let loading = false;
+let loadRequest = 0;
+let loadController = null;
+let currentPreviewRequest = null;
+let navigationPage = null;
 let resetting = false;
 let ocrAreaRunning = false;
 let queuedAction = "";
@@ -227,17 +233,13 @@ function downstreamRegenerationTooltip() {
 }
 
 async function loadTypesettingView() {
+  preview.hide();
+  currentPreviewRequest?.abort();
   if (typesettingView === "original") {
     canvas.load(imageUrl("original"), { showPlacementText: false });
     setStatus("Original page loaded.");
   } else if (typesettingView === "preview") {
-    try {
-      setStatus("Checking the cleaning mask for Preview...");
-      const result = await api.preview("placement", store.page, [],
-        store.records.ocr_structured || [], store.records.clean_boxes || []);
-      canvas.load(result.url);
-      setStatus("Preview uses the current cleaning mask and cached ImageMagick text layers.");
-    } catch (error) { setStatus(error.message, true); }
+    preview.show();
   } else if (typesettingView === "render") {
     canvas.load(imageUrl("final"), { showPlacementText: false });
     setStatus("Last saved render loaded.");
@@ -255,23 +257,32 @@ async function selectTypesettingView(view) {
 }
 
 async function load(stage = store.stage, page = store.page) {
-  if (loading) return;
+  const request = ++loadRequest;
+  loadController?.abort();
+  const controller = new AbortController();
+  loadController = controller;
+  currentPreviewRequest?.abort();
+  preview.hide();
+  navigationPage = page;
   loading = true;
   byId("save-state").textContent = "Loading...";
   try {
-    const document = await api.load(stage, page);
+    const document = await api.load(stage, page, controller.signal);
+    if (request !== loadRequest) return;
     store.setDocument(document);
     mergeSelection.clear();
     byId("page-select").value = String(page);
-    if (stage === "placement") await loadTypesettingView();
-    else canvas.load(document.image.url);
     setStatus(store.dirty ? "Recovered an unsaved browser draft." : "");
-    await loadRevisions();
+    if (stage === "placement") void loadTypesettingView();
+    else canvas.load(document.image.url);
+    void loadRevisions();
   } catch (error) {
-    setStatus(error.message, true);
-    byId("save-state").textContent = "Load failed";
+    if (request === loadRequest && error.name !== "AbortError") {
+      setStatus(error.message, true);
+      byId("save-state").textContent = "Load failed";
+    }
   } finally {
-    loading = false;
+    if (request === loadRequest) { loading = false; navigationPage = null; }
   }
 }
 
@@ -493,9 +504,8 @@ function renderInspector() {
     : [record.recordId];
   if (cleanOnly) {
     const note = document.createElement("p");
-    note.textContent = "LaMa cleans this area without adding text. It can alter artwork. Select Current or Preview to refresh cleaning.";
+    note.textContent = "LaMa cleans this area without adding text. It can alter artwork. Preview refreshes automatically. Press Delete to remove this box.";
     form.append(note);
-    addButton(form, "Delete clean box", deleteSelected);
   } else if (relatedIds.some((rid) => store.document?.protection?.recordStates?.[rid] || store.document?.protection?.records?.[rid])) {
     const row = document.createElement("div"); row.className = "field-protection";
     const toggle = document.createElement("button"); toggle.type = "button"; toggle.textContent = "Toggle record protection";
@@ -577,8 +587,8 @@ function renderTools() {
     const views = [
       ["current", "Current", "Show the exact current draft. This uses the saved render when it is current, or creates a cached ImageMagick preview when needed."],
       ["original", "Original", "Show the original source page without translated text."],
-      ["preview", "Preview", "Show the last cleaned page with ImageMagick text layers. Moving boxes reuses cached text; resizing or style changes refresh the affected layer."],
-      ["render", "Render", "Show the last page produced by the pipeline Render pass."],
+      ["preview", "Preview", "Show ImageMagick text layers first, then clean the background with LaMa. Clean-box edits refresh automatically."],
+      ["render", "Last Render", "Show the last page produced by the pipeline Render pass."],
     ];
     const shortcuts = ["z", "x", "c", "v"];
     for (const [index, [view, label, tooltip]] of views.entries()) {
@@ -586,8 +596,7 @@ function renderTools() {
       button.classList.toggle("active", typesettingView === view);
     }
     addButton(target, "Add clean box", () => canvas.startDraw(addCleanBox), "Draw a clean-only area",
-      "LaMa cleans this rectangle without adding text or calling the VLM. Select Current or Preview to refresh cleaning.", "b");
-    addButton(target, "Delete clean box", deleteSelected, "Delete the selected clean box");
+      "LaMa cleans this rectangle without adding text or calling the VLM. Preview refreshes automatically.", "b");
   }
   if (ocrAreaRunning) {
     for (const button of target.querySelectorAll("button")) button.disabled = true;
@@ -613,7 +622,7 @@ function addCleanBox(region) {
     boxes.push(record);
     store.selection = {artifact: "clean_boxes", recordId: record.recordId};
   });
-  setStatus("Clean box added. Select Current or Preview to refresh cleaning.");
+  setStatus("Clean box added. Preview refreshes automatically.");
 }
 
 function addRawBox(region) {
@@ -699,7 +708,7 @@ function deleteSelected() {
   if (store.stage === "placement") {
     if (store.selection.artifact !== "clean_boxes") return setStatus("Select a clean box to delete it. Reject text in Text & Translation.", true);
     store.deleteSelected();
-    setStatus("Clean box deleted. Select Current or Preview to refresh cleaning.");
+    setStatus("Clean box deleted. Preview refreshes automatically.");
     return;
   }
   if (store.stage === "text") {
@@ -880,6 +889,9 @@ async function retranslate(scope) {
 }
 
 async function exactPreview() {
+  const document = store.document, page = store.page;
+  const controller = new AbortController();
+  currentPreviewRequest = controller;
   try {
     const placementState = store.document?.stageStates?.placement || {};
     const renderIsCurrent = !store.dirty && !placementState.pending && !placementState.stale;
@@ -888,6 +900,7 @@ async function exactPreview() {
       setStatus("Saved render loaded. No preview generation was needed.");
       return;
     }
+    canvas.load(imageUrl("original"), {showPlacementText: false});
     setStatus("Checking the cleaning mask and preparing Current...");
     const result = await api.preview(
       "placement",
@@ -895,20 +908,27 @@ async function exactPreview() {
       store.records.placements || [],
       store.records.ocr_structured || [],
       store.records.clean_boxes || [],
+      controller.signal,
     );
+    if (controller.signal.aborted || store.document !== document || store.page !== page || typesettingView !== "current") return;
     canvas.load(result.url, { showPlacementText: false });
     if (result.cleanedWithLama) {
       setStatus("Current was cleaned with LaMa and rendered with ImageMagick.");
     } else {
       setStatus(result.cached ? "Cached Current preview loaded." : "Current preview rendered with ImageMagick.");
     }
-  } catch (error) { setStatus(error.message, true); }
+  } catch (error) {
+    if (!controller.signal.aborted && store.document === document && error.name !== "AbortError") setStatus(error.message, true);
+  }
 }
 
 async function loadRevisions() {
+  const pageDocument = store.document;
   const target = byId("revision-list"); target.textContent = "Loading...";
   try {
-    const data = await api.revisions(); target.replaceChildren();
+    const data = await api.revisions();
+    if (store.document !== pageDocument) return;
+    target.replaceChildren();
     for (const item of (data.revisions || []).slice(0, 50)) {
       const row = document.createElement("div"); row.className = "history-row";
       row.append(document.createTextNode(`#${item.revision} ${item.updatedAt ? new Date(item.updatedAt).toLocaleString() : ""}`));
@@ -921,7 +941,7 @@ async function loadRevisions() {
       row.append(button); target.append(row);
     }
     if (!target.childElementCount) target.textContent = "No saved revisions.";
-  } catch (error) { target.textContent = error.message; }
+  } catch (error) { if (store.document === pageDocument) target.textContent = error.message; }
 }
 
 function render() {
@@ -946,8 +966,8 @@ function render() {
 store.addEventListener("change", render);
 document.querySelectorAll(".stage-tab").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.stage, store.page)));
 byId("page-select").addEventListener("change", (event) => navigate(store.stage, Number(event.target.value)));
-byId("prev-page").addEventListener("click", () => navigate(store.stage, store.page - 1));
-byId("next-page").addEventListener("click", () => navigate(store.stage, store.page + 1));
+byId("prev-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) - 1));
+byId("next-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) + 1));
 byId("record-filter").addEventListener("input", renderRecordList);
 byId("undo").addEventListener("click", () => store.undo());
 byId("redo").addEventListener("click", () => store.redo());
@@ -981,10 +1001,10 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault(); navigate(AVAILABLE_STAGES[stageIndex], store.page); return;
   }
   if (key === "a") {
-    event.preventDefault(); navigate(store.stage, store.page - 1); return;
+    event.preventDefault(); navigate(store.stage, (navigationPage ?? store.page) - 1); return;
   }
   if (key === "d") {
-    event.preventDefault(); navigate(store.stage, store.page + 1); return;
+    event.preventDefault(); navigate(store.stage, (navigationPage ?? store.page) + 1); return;
   }
   if (event.key === "Delete") {
     event.preventDefault(); deleteSelected(); return;

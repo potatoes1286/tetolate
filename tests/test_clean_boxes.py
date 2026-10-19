@@ -173,7 +173,7 @@ class CleanBoxTests(unittest.TestCase):
         with mock.patch.object(clean_text_regions, "clean_text_regions", side_effect=clean) as cleaning, \
              mock.patch.object(self.manager, "_editor_lama_session", mock.Mock()):
             preview, _ = self.manager.current_editor_clean_source(self.code, self.job_id, 0, structured + [self.box])
-            first_mask = preview.with_name("page_0000.mask.png").read_bytes()
+            first_mask = preview.with_suffix(".mask.png").read_bytes()
             self.manager.current_editor_clean_source(self.code, self.job_id, 0, structured + [self.box])
             self.assertEqual(cleaning.call_count, 1)
             translate_cbz.clean_render_page(page, structured, output, None, [self.box])
