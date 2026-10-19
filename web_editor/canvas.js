@@ -5,50 +5,13 @@ const DRAG_UNLOCK_PIXELS = 7;
 const RESIZE_HANDLE_VISUAL_PIXELS = 10;
 const RESIZE_HANDLE_HIT_RADIUS_PIXELS = 14;
 
-function oppositeColour(fill) { return fill === "white" ? "black" : "white"; }
-
-function splitWord(ctx, word, maxWidth) {
-  const parts = [];
-  let current = "";
-  for (const character of word) {
-    const candidate = current + character;
-    if (current && ctx.measureText(`${candidate}-`).width > maxWidth) {
-      parts.push(`${current}-`);
-      current = character;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) parts.push(current);
-  return parts;
-}
-
-function wrapText(ctx, text, maxWidth) {
-  const lines = [];
-  for (const paragraph of String(text).split("\n")) {
-    const words = paragraph.trim().split(/\s+/).filter(Boolean);
-    if (!words.length) { lines.push(""); continue; }
-    let line = "";
-    for (const rawWord of words) {
-      const parts = ctx.measureText(rawWord).width <= maxWidth
-        ? [rawWord]
-        : splitWord(ctx, rawWord, maxWidth);
-      for (const word of parts) {
-        const candidate = line ? `${line} ${word}` : word;
-        if (line && ctx.measureText(candidate).width > maxWidth) {
-          lines.push(line); line = word;
-        } else {
-          line = candidate;
-        }
-      }
-    }
-    if (line) lines.push(line);
-  }
-  return lines;
+function roundPixel(value) {
+  const floor = Math.floor(value);
+  return value - floor === 0.5 ? floor + Math.abs(floor % 2) : Math.round(value);
 }
 
 export class EditorCanvas {
-  constructor(canvas, store, onStatus) {
+  constructor(canvas, store, onStatus, renderTextLayers) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.store = store;
@@ -58,6 +21,10 @@ export class EditorCanvas {
     this.busy = false;
     this.drag = null;
     this.drawAction = null;
+    this.layers = new Map();
+    this.layerTimer = null;
+    this.renderingLayers = false;
+    this.renderTextLayers = renderTextLayers;
     this.image.onload = () => { this.resize(); this.draw(); };
     canvas.addEventListener("pointerdown", (event) => this.pointerDown(event));
     canvas.addEventListener("pointermove", (event) => this.pointerMove(event));
@@ -68,6 +35,11 @@ export class EditorCanvas {
 
   load(url, options = {}) {
     this.showPlacementText = options.showPlacementText !== false;
+    if (!this.showPlacementText) {
+      clearTimeout(this.layerTimer);
+      this.layerTimer = null;
+      this.trimLayers(new Set());
+    }
     const separator = url.includes("?") ? "&" : "?";
     this.image.src = `${url}${separator}v=${Date.now()}`;
   }
@@ -92,10 +64,93 @@ export class EditorCanvas {
   }
   visibleArtifacts() { return SCREEN[this.store.stage].artifacts; }
 
+  drawTextLayer(record, required) {
+    const region = this.region(record, "placements");
+    if (!region) return;
+    const text = record.manualLineBreaks || (this.store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
+    if (!text.trim()) return;
+    const [left, top, right, bottom] = region.map((value, index) => roundPixel(Math.max(0,
+      Math.min(index % 2 ? this.canvas.height : this.canvas.width, value))));
+    const width = right - left, height = bottom - top;
+    if (width <= 0 || height <= 0) return;
+    const entry = {placementRegion: [0, 0, width, height], englishText: text};
+    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "minPointSize", "maxPointSize", "renderBleed"])
+      if (record[field] !== undefined) entry[field] = record[field];
+    const page = this.store.page;
+    const key = JSON.stringify([page, this.canvas.width, this.canvas.height, this.store.document?.defaultFont, entry]);
+    required.add(key);
+    let layer = this.layers.get(key);
+    if (!layer) {
+      layer = {entry, page, state: "queued"};
+      this.layers.set(key, layer);
+    }
+    if (layer.bitmap) this.ctx.drawImage(layer.bitmap,
+      left - (layer.bitmap.width - width) / 2, top - (layer.bitmap.height - height) / 2);
+  }
+
+  scheduleLayers() {
+    clearTimeout(this.layerTimer);
+    this.layerTimer = null;
+    if (this.renderingLayers || ![...this.layers.values()].some((layer) => layer.state === "queued")) return;
+    this.layerTimer = setTimeout(() => this.flushLayers(), 200);
+  }
+
+  async flushLayers() {
+    this.layerTimer = null;
+    const batch = [...this.layers].filter(([_key, layer]) => layer.state === "queued").slice(0, 256);
+    if (!batch.length || this.renderingLayers) return;
+    this.renderingLayers = true;
+    for (const [_key, layer] of batch) layer.state = "pending";
+    this.onStatus(`Rendering ${batch.length} preview text layers...`);
+    try {
+      const bitmaps = await this.renderTextLayers(batch[0][1].page, batch.map(([_key, layer]) => layer.entry));
+      if (!Array.isArray(bitmaps) || bitmaps.length !== batch.length) {
+        for (const bitmap of bitmaps || []) bitmap.close();
+        throw new Error("The preview batch returned an incorrect layer count.");
+      }
+      batch.forEach(([key, layer], index) => {
+        if (this.layers.get(key) === layer) { layer.bitmap = bitmaps[index]; layer.state = "ready"; }
+        else bitmaps[index].close();
+      });
+      if (batch.some(([key, layer]) => this.layers.get(key) === layer))
+        this.onStatus("Preview text rendered with ImageMagick.");
+    } catch (error) {
+      let active = false;
+      for (const [key, layer] of batch) {
+        if (this.layers.get(key) === layer) { layer.state = "failed"; active = true; }
+      }
+      if (active) this.onStatus(`Could not render preview text: ${error.message}`, true);
+    } finally {
+      this.renderingLayers = false;
+      this.draw();
+    }
+  }
+
+  trimLayers(required) {
+    for (const [key, layer] of this.layers) {
+      if (!required.has(key) && (!layer.bitmap || this.layers.size > 128)) {
+        layer.bitmap?.close();
+        this.layers.delete(key);
+      }
+    }
+  }
+
   draw() {
+    if (this.layerDocument !== this.store.document) {
+      for (const layer of this.layers.values()) {
+        layer.bitmap?.close();
+      }
+      this.layers.clear();
+      this.layerDocument = this.store.document;
+    }
     if (!this.image.complete || !this.canvas.width) return;
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.drawImage(this.image, 0, 0);
+    const required = new Set();
+    if (this.store.stage === "placement" && this.showPlacementText)
+      for (const record of this.store.records.placements || []) this.drawTextLayer(record, required);
+    this.trimLayers(required);
+    this.scheduleLayers();
     for (const artifact of this.visibleArtifacts().slice().reverse()) {
       for (const record of this.store.records[artifact] || []) {
         const region = this.region(record, artifact);
@@ -129,36 +184,6 @@ export class EditorCanvas {
             handle.x,
             handle.y,
           );
-        }
-        if (artifact === "placements" && this.showPlacementText) {
-          const translation = (this.store.records.translations || []).find((item) => item.boxno === record.boxno);
-          const text = record.manualLineBreaks || translation?.englishText || "";
-          if (text) {
-            const size = record.fontSizeWidthPercent
-              ? Math.max(1, this.canvas.width * Number(record.fontSizeWidthPercent) / 100)
-              : Math.max(1, Number(record._roughPointSize) || Math.min((region[2] - region[0]) / 8, (region[3] - region[1]) / 5));
-            const fontFamily = "sans-serif";
-            const maxWidth = Math.max(1, (region[2] - region[0]) * 0.9);
-            const fill = record.fill || "black";
-            this.ctx.font = `${size}px ${fontFamily}`;
-            const lines = record.manualLineBreaks
-              ? String(record.manualLineBreaks).split("\n")
-              : (record._roughText ? String(record._roughText).split("\n") : wrapText(this.ctx, text, maxWidth));
-            this.ctx.fillStyle = fill;
-            this.ctx.strokeStyle = record.stroke || oppositeColour(fill);
-            this.ctx.lineWidth = Math.max(1, Number(record.strokeWidth) || 2);
-            this.ctx.lineJoin = "round";
-            this.ctx.textAlign = "center";
-            const lineHeight = size * 1.15;
-            const startY = (region[1] + region[3] - lines.length * lineHeight) / 2 + size;
-            lines.forEach((line, index) => {
-              const x = (region[0] + region[2]) / 2;
-              const y = startY + index * lineHeight;
-              this.ctx.strokeText(line, x, y, maxWidth);
-              this.ctx.fillText(line, x, y, maxWidth);
-            });
-            this.ctx.textAlign = "start";
-          }
         }
       }
     }
@@ -240,7 +265,7 @@ export class EditorCanvas {
     const region = this.drag.mode === "move" ? [l + dx, t + dy, r + dx, b + dy] : [l, t, Math.max(l + 2, r + dx), Math.max(t + 2, b + dy)];
     const key = this.drag.artifact === "placements" ? "placementRegion" : "region";
     this.store.updateSelected(
-      { [key]: region.map(Math.round), _roughText: null, _roughPointSize: null },
+      { [key]: region.map(Math.round) },
       { history: false },
     );
   }

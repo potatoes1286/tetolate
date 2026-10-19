@@ -1,6 +1,6 @@
 const jsonHeaders = { "Content-Type": "application/json" };
 
-async function request(url, options = {}) {
+async function checkedResponse(url, options = {}) {
   const response = await fetch(url, { cache: "no-store", ...options });
   if (!response.ok) {
     let message = response.statusText;
@@ -14,7 +14,11 @@ async function request(url, options = {}) {
     error.status = response.status;
     throw error;
   }
-  return response.json();
+  return response;
+}
+
+async function request(url, options = {}) {
+  return (await checkedResponse(url, options)).json();
 }
 
 export class EditorApi {
@@ -29,6 +33,12 @@ export class EditorApi {
   save(stage, page, body) {
     return request(`${this.root}/pages/${page}/stages/${stage}`, {
       method: "POST", headers: jsonHeaders, body: JSON.stringify(body),
+    });
+  }
+
+  reset(stage, page, baseRevision) {
+    return request(`${this.root}/pages/${page}/stages/${stage}/reset`, {
+      method: "POST", headers: jsonHeaders, body: JSON.stringify({baseRevision}),
     });
   }
 
@@ -63,6 +73,24 @@ export class EditorApi {
       method: "POST", headers: jsonHeaders,
       body: JSON.stringify({ records, cleanRecords }),
     });
+  }
+
+  async textLayers(page, records) {
+    const data = await request(`${this.root}/pages/${page}/text-layers`, {
+      method: "POST", headers: jsonHeaders, body: JSON.stringify({records}),
+    });
+    if (!Array.isArray(data.layers) || data.layers.length !== records.length)
+      throw new Error("The preview batch returned an incorrect layer count.");
+    const decoded = await Promise.allSettled(data.layers.map(async (png) => {
+      const bytes = Uint8Array.from(atob(png), (character) => character.charCodeAt(0));
+      return createImageBitmap(new Blob([bytes], {type: "image/png"}));
+    }));
+    const failed = decoded.find((item) => item.status === "rejected");
+    if (failed) {
+      for (const item of decoded) if (item.status === "fulfilled") item.value.close();
+      throw failed.reason;
+    }
+    return decoded.map((item) => item.value);
   }
 
   cropOcr(page, region, rawBoxnoStart) {

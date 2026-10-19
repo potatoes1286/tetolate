@@ -44,7 +44,9 @@ body { margin: 0; max-width: none; background: #f7f7f7; color: #181818; }
 .status-line.error { color: #a40000; }
 #record-form label, #notes-panel label { margin-bottom: 0.65rem; }
 #record-form input:not([type="checkbox"]), #record-form select, #record-form textarea, #notes-panel textarea { box-sizing: border-box; width: 100%; }
-.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; }
+.field-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.4rem; }
+.field-grid > label { min-width: 0; }
+.field-grid .field-protection { flex-wrap: wrap; }
 .field-row { position: relative; }
 .field-protection { display: flex; gap: 0.3rem; margin-top: 0.2rem; font-size: 0.78rem; }
 .danger { color: #a40000; }

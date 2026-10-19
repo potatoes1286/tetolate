@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
@@ -5250,6 +5251,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return JSONResponse(await probe_vlm_connection(manager, endpoint_value, token_value,
                                                         category_value, job_id_value))
 
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/text-layers")
+    async def editor_v2_text_layers(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "A text-layer batch requires a records array.")
+        def render_batch() -> dict[str, Any]:
+            paths = manager.render_editor_v2_text_layers(code, job_id, page, data.get("records"))
+            return {"layers": [base64.b64encode(path.read_bytes()).decode("ascii") for path in paths]}
+        return JSONResponse(await run_in_threadpool(render_batch), headers={"Cache-Control": "private, no-store"})
+
     @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
     async def editor_v2_data(
         request: Request, code: str, job_id: str, stage: str, page: int
@@ -5269,6 +5284,16 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             manager.save_editor_v2_update(code, job_id, page, stage, data)
         )
 
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/reset")
+    async def reset_editor_v2_stage(
+        request: Request, code: str, job_id: str, stage: str, page: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        return JSONResponse(manager.reset_editor_v2_stage(code, job_id, page, stage, data))
+
     @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/protection")
     async def editor_v2_protection(
         request: Request, code: str, job_id: str, stage: str, page: int
@@ -5286,11 +5311,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         request: Request, code: str, job_id: str, stage: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
-        try:
-            resume_from = editor_v2.RERUN_FROM[editor_v2.validate_stage(stage)]
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        manager.rerun_completed_job_pages(code, job_id, [page], resume_from)
+        resume_from = manager.rerun_editor_v2_page(code, job_id, stage, page)
         return JSONResponse(
             {"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": resume_from}
         )

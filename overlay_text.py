@@ -635,14 +635,12 @@ def explicit_pointsize_args(
     return ["-pointsize", f"{point_size:g}"]
 
 
-def render_text_layer(
-    magick: str,
+def text_layer_args(
     entry: dict[str, Any],
-    layer_path: Path,
     text_path: Path,
     image_width: int,
     image_height: int,
-) -> None:
+) -> list[str]:
     left, top, width, height = rounded_region(entry["region"])
     del left, top
 
@@ -670,8 +668,7 @@ def render_text_layer(
     point_size_args = explicit_pointsize_args(entry, point_size, estimated_fit_size, image_height)
     text_path.write_text(rendered_text, encoding="utf-8")
 
-    command = [
-        magick,
+    return [
         "(",
             "-size",
             f"{layer_inner_width}x{layer_inner_height}",
@@ -719,9 +716,30 @@ def render_text_layer(
             f"{layer_width}x{layer_height}",
         ")",
         "-composite",
-        str(layer_path),
     ]
+
+
+def render_text_layer(
+    magick: str, entry: dict[str, Any], layer_path: Path, text_path: Path,
+    image_width: int, image_height: int,
+) -> None:
+    command = [magick, *text_layer_args(entry, text_path, image_width, image_height), str(layer_path)]
     run_magick(command, f"rendering text layer for region {entry['region']}")
+
+
+def render_text_layers(
+    magick: str, layers: list[tuple[dict[str, Any], Path, Path]],
+    image_width: int, image_height: int,
+) -> None:
+    if not layers:
+        return
+    # Restore settings between boxes and discard each image after writing it.
+    command = [magick, "-respect-parentheses", "-size", "1x1", "xc:none"]
+    for entry, output, text_path in layers:
+        command.extend(["(", *text_layer_args(entry, text_path, image_width, image_height),
+                        "-write", str(output), "+delete", ")"])
+    command.append("null:")
+    run_magick(command, f"rendering {len(layers)} text layers")
 
 
 def composite_layer(

@@ -34,7 +34,7 @@ View translated pages in the browser. Generate an optional PNG, WebP, or JXL CBZ
 
 Web UI + password to upload, view jobs, and download.
 
-Editor to fix minor errors, primarily OCR misses.
+Editor with OCR & Merge, Text & Translation, and Typesetting tabs to correct page text and layout.
 
 ## Requirements
 
@@ -157,7 +157,7 @@ Local access has full control and does not create a saved login.
 Remote access still needs `login --server http://HOST:8088` or a control token.
 Login saves the token in `~/.config/tetolate/cli.json` (or under `XDG_CONFIG_HOME`).
 Use `login --read-only` for read access and `logout` to revoke a saved token.
-Tokens can also be created and revoked under **Terminal access** on the admin page.
+Tokens can also be created and revoked under **Login settings → Remote CLI access** on the admin page.
 
 For agents, use `--json`, `--help`, and `schema --json`. Credentials can come from
 `TETOLATE_SERVER_URL` and `TETOLATE_CONTROL_TOKEN`; environment values override saved

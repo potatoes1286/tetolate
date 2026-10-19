@@ -179,7 +179,12 @@ class ControlAPITests(unittest.TestCase):
             self.assertIn("only shown once", response.text)
             self.assertIn("no-store", response.headers["cache-control"])
             response = await client.get("/admin")
-            self.assertIn("Terminal access", response.text)
+            self.assertNotIn("<summary>Terminal access</summary>", response.text)
+            login_settings = response.text.split('<details><summary>Login settings</summary>', 1)[1].split('</details>', 1)[0]
+            self.assertIn("<h2>Remote CLI access</h2>", login_settings)
+            self.assertIn("Local CLI access does not need a token or login.", login_settings)
+            self.assertIn('action="/admin/control-tokens"', login_settings)
+            self.assertIn('action="/admin/password"', login_settings)
             self.assertNotIn(self.token, response.text)
             token_id = next(item["id"] for item in self.manager.list_control_tokens() if item["name"] == "browser")
             response = await client.post(f"/admin/control-tokens/{token_id}/revoke")

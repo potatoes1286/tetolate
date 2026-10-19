@@ -37,6 +37,16 @@ import web_security
 
 
 class RepositoryHygieneTests(unittest.TestCase):
+    def test_shared_footer_has_an_on_demand_update_check(self) -> None:
+        page = web_pages.base_page("Test", "<h1>Test</h1>").body.decode()
+        footer = page.split('<footer class="muted">', 1)[1].split("</footer>", 1)[0]
+        self.assertIn(f"tetolate {web_pages.VERSION}", footer)
+        self.assertIn(f'data-version="{web_pages.VERSION}"', footer)
+        self.assertIn('id="check-updates"', footer)
+        self.assertIn('>Check for updates</a>', footer)
+        self.assertIn('id="update-status" role="status"', footer)
+        self.assertIn(web_pages.UPDATE_CHECK_SCRIPT, page)
+
     def test_checked_in_examples_do_not_contain_credentials(self) -> None:
         repo_dir = Path(__file__).resolve().parents[1]
         config_dir = repo_dir / "data" / "config"
@@ -4618,20 +4628,20 @@ class EditorV2Tests(unittest.TestCase):
         self.assertNotIn("/api/job/{code}/{job_id}/edit/{stage}/{page}", paths)
         self.assertNotIn("/api/job/{code}/{job_id}/edit/regenerate", paths)
 
-    def test_editor_page_uses_five_stage_module_shell(self) -> None:
+    def test_editor_page_uses_three_tab_module_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manager, code, job_id = self.create_job(Path(temp_dir))
             manager.initialize_editor_v2(code, job_id)
             body = web_pages.editor_page(manager, code, job_id).body.decode("utf-8")
             for label in (
                 "OCR &amp; Merge",
-                "Structure",
-                "Erase &amp; Alternate Placement",
-                "Translation",
+                "Text &amp; Translation",
                 "Typesetting",
             ):
                 self.assertIn(label, body)
-            self.assertEqual(body.count('class="stage-tab"'), 5)
+            self.assertEqual(body.count('class="stage-tab"'), 3)
+            for removed in ("structure", "erase", "translation"):
+                self.assertNotIn(f'data-stage="{removed}"', body)
             self.assertNotIn('data-stage="preview"', body)
             self.assertIn('/assets/editor-v2/app.js?v=8', body)
             self.assertIn('Previous [A]', body)
@@ -4641,7 +4651,7 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('id="record-resizer"', body)
             self.assertIn('id="inspector-resizer"', body)
             self.assertIn(
-                "The current stage is used as input and is not regenerated.",
+                "rerun only the pipeline steps required by its changed fields.",
                 body,
             )
             self.assertIn(
@@ -4900,8 +4910,8 @@ class EditorV2Tests(unittest.TestCase):
             placement = payload["recordsByArtifact"]["placements"][0]
 
             self.assertGreater(placement["_autoFontSizeWidthPercent"], 0)
-            self.assertGreater(placement["_roughPointSize"], 0)
-            self.assertTrue(placement["_roughText"])
+            self.assertNotIn("_roughPointSize", placement)
+            self.assertNotIn("_roughText", placement)
 
 
 if __name__ == "__main__":

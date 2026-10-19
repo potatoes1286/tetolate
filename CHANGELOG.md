@@ -2,9 +2,23 @@
 
 ## Unreleased
 
+### Added
+
+- Added a manual GitHub release check beside the web UI version.
+- Added an editor stage reset to remove saved edits and protection flags on one page.
+
 ### Changed
 
 - Local CLI access no longer needs login; remote access still requires a token.
+- Combined the Structure, Erase, and Translation editor tabs, with reruns based on changed fields.
+- Typesetting Preview batches uncached layers in one ImageMagick process, keeping per-box caches.
+- Simplified editor alignment labels and box-coordinate inputs.
+- Grouped password and remote CLI controls under Login settings.
+
+### Fixed
+
+- Resetting editor stages clears discarded pending edits and their out-of-date flags.
+- Deleted source boxes stay hidden in later editor tabs; reset restores their saved data.
 
 ## 1.0.0 - 2026-09-04
 

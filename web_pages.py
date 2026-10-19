@@ -39,6 +39,66 @@ CATEGORY_DELETE_CONFIRM = (
     "Delete this category and every job, input, output, log, and download inside it?"
 )
 JOB_NAME_MAX_LENGTH = 256
+UPDATE_CHECK_SCRIPT = r"""
+<script>
+(() => {
+  const check = document.getElementById("check-updates");
+  const status = document.getElementById("update-status");
+  let checking = false;
+  function versionParts(value) {
+    if (typeof value !== "string" || !/^v?\d+\.\d+\.\d+$/.test(value)) {
+      throw new Error("Invalid release version.");
+    }
+    const parts = value.replace(/^v/, "").split(".").map(Number);
+    if (!parts.every(Number.isSafeInteger)) throw new Error("Invalid release version.");
+    return parts;
+  }
+  check.addEventListener("click", async (event) => {
+    event.preventDefault();
+    if (checking) return;
+    checking = true;
+    check.setAttribute("aria-disabled", "true");
+    status.textContent = "Checking...";
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch("https://api.github.com/repos/potatoes1286/tetolate/releases/latest", {
+        headers: {"Accept": "application/vnd.github+json"},
+        credentials: "omit",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (response.status === 404) {
+        status.textContent = "No published releases found.";
+        return;
+      }
+      if (!response.ok) throw new Error(`GitHub returned HTTP ${response.status}.`);
+      const release = await response.json();
+      const latest = versionParts(release.tag_name);
+      const current = versionParts(check.dataset.version);
+      if (release.draft || release.prerelease) throw new Error("Not a stable release.");
+      const difference = latest.findIndex((part, index) => part !== current[index]);
+      if (difference !== -1 && latest[difference] > current[difference]) {
+        const link = document.createElement("a");
+        link.href = `https://github.com/potatoes1286/tetolate/releases/tag/${encodeURIComponent(release.tag_name)}`;
+        link.textContent = release.tag_name;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        status.replaceChildren("Newer update: ", link);
+      } else {
+        status.textContent = "Up to date.";
+      }
+    } catch {
+      status.textContent = "Could not check for updates. Try again.";
+    } finally {
+      clearTimeout(timeout);
+      checking = false;
+      check.removeAttribute("aria-disabled");
+    }
+  });
+})();
+</script>
+"""
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
 TERMINATE_JOB_CONFIRM = (
@@ -185,7 +245,8 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
 </head>
 <body{body_class}>
 {body}
-<footer class="muted">tetolate {escape(VERSION)}</footer>
+<footer class="muted">tetolate {escape(VERSION)} · <a id="check-updates" href="https://github.com/potatoes1286/tetolate/releases" target="_blank" rel="noopener noreferrer" data-version="{escape(VERSION)}">Check for updates</a> <span id="update-status" role="status"></span></footer>
+{UPDATE_CHECK_SCRIPT}
 </body>
 </html>"""
     )
@@ -306,7 +367,9 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
 {categories_html}
 <h2>Active Job</h2>
 {active_html}
-<details><summary>Terminal access</summary>
+<details><summary>Login settings</summary>
+<h2>Remote CLI access</h2>
+<p>Local CLI access does not need a token or login. Create a control token only for remote CLI or agent access.</p>
 <p>Control tokens are separate from VLM API keys and stay valid until revoked.</p>
 <form action="/admin/control-tokens" method="post">
   <label>Token name<br><input name="name" type="text" maxlength="100" required></label>
@@ -314,7 +377,6 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
   <button type="submit">Create control token</button>
 </form>
 <ul>{''.join(f'<li>{escape(item["name"])} ({"read-only" if item["readOnly"] else "read/write"}) <form action="/admin/control-tokens/{escape(item["id"])}/revoke" method="post"><button type="submit">Revoke</button></form></li>' for item in manager.list_control_tokens())}</ul>
-</details>
 <h2>Change Admin Password</h2>
 <form action="/admin/password" method="post">
   <label>Current password<br><input name="current_password" type="password" required autocomplete="current-password"></label>
@@ -322,6 +384,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
   <label>Confirm new password<br><input name="confirm_password" type="password" required autocomplete="new-password"></label>
   <button type="submit">Change password</button>
 </form>
+</details>
 """,
     )
 
@@ -1430,9 +1493,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     )
     stage_labels = {
         "ocr": "OCR & Merge",
-        "structure": "Structure",
-        "erase": "Erase & Alternate Placement",
-        "translation": "Translation",
+        "text": "Text & Translation",
         "placement": "Typesetting",
     }
     stage_buttons = "\n".join(
@@ -1471,9 +1532,10 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <button id="undo" type="button" title="Undo (Ctrl+Z)" disabled>Undo</button>
     <button id="redo" type="button" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
     <button id="save" type="button" title="Save changes (Ctrl+S)">Save</button>
+    <button id="reset-stage" type="button" data-tooltip="Restore the generated records for this stage on this page. Remove saved and unsaved edits and protection flags. Other stages, pages, and saved translation notes are kept.">Reset stage</button>
     <button id="freeze-stage" type="button" data-tooltip="Protect all current values in this stage on this page. Later reruns keep them until you unprotect the stage.">Protect stage</button>
     <button id="freeze-page" type="button" data-tooltip="Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page."{complete_only}>Protect page</button>
-    <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the stages after the current stage for this page. The current stage is used as input and is not regenerated."{complete_only}>Regenerate downstream</button>
+    <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the pipeline steps required by its changed fields."{complete_only}>Regenerate downstream</button>
     <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rendered pages."{complete_only}>Regenerate all changes</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>

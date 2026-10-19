@@ -156,6 +156,41 @@ docker compose -f compose.yaml -f compose.build.yaml --profile paddleocr-vl up -
 The LaMa model and PaddleOCR models are downloaded into the shared persistent cache,
 not embedded in either image.
 
+## Editor
+
+The editor has OCR & Merge, Text & Translation, and Typesetting tabs. The middle
+tab combines source text, erase settings, and English text without merging the
+pipeline steps. Regeneration uses the earliest pending change on each page:
+source edits start at erase decisions, erase edits start at translation, and
+English-text edits start at typesetting. Notes-only edits do not rerun the pipeline.
+Reset and Protect stage apply to all three groups in Text & Translation.
+Deleting a source box hides its linked boxes in later tabs. Saved downstream
+edits are kept; resetting the source stage restores them. Rendered pages still
+need regeneration.
+Typesetting Preview uses cached ImageMagick text layers on the last cleaned
+page. Fonts, wrapping, sizing, outlines, and alignment use the same renderer as
+Current. Moving boxes reuses cached pixels; other edits refresh the affected
+layer after a short delay. Uncached layers share one request and one ImageMagick
+process (up to 256 boxes per batch); cached layers are not rendered again.
+New layers appear together when their batch finishes.
+Current also updates the cleaning mask when needed.
+
+To compare a pre-batch source snapshot with the batch endpoint:
+
+```bash
+python scripts/benchmark_editor_layers.py --baseline-root /path/to/pre-batch-source --rounds 5
+```
+
+This uses synthetic pages and in-process HTTP, not live jobs or models. It
+measures cold renders, warm cache reads, and a single changed box. It excludes
+browser work, network latency, and the editor's debounce delay.
+Automatic sizing is the default; use `--sizing fixed` to test explicit font sizes.
+
+Measured with five trials on synthetic 30-box pages (4 CPU limit, ImageMagick
+7.1.2-13): automatic sizing took 8.36 → 6.36 s; fixed sizing took 5.63 → 3.60 s.
+Warm reads took about 57 → 20 ms. One-box automatic edits took 343 → 359 ms.
+Rendered text pixels were identical between the serial and batch versions.
+
 ## Tests
 
 Run the deterministic regression suite without live OCR or VLM services:
@@ -163,6 +198,15 @@ Run the deterministic regression suite without live OCR or VLM services:
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv run --locked --extra inpaint \
   python -m unittest discover -s tests -v
+```
+
+Run the browser editor and update-check tests with Node.js:
+
+```bash
+node tests/test_update_check.cjs
+node tests/test_editor_reset.cjs
+node tests/test_text_editor.cjs
+node tests/test_editor_canvas.cjs
 ```
 
 Basic repository checks used during development are:
