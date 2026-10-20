@@ -56,7 +56,7 @@ class QueueSettingsTests(unittest.TestCase):
         originals = {state: self.job(f"{index:08x}", state) for index, state in enumerate(
             ("queued", "running", "paused", "failed", "complete", "cancelled", "terminating"), 1)}
         self.job("00000008", code="other")
-        self.job("00000009", seriesId="series", chapterOrder="14", pendingResumeFrom="placements")
+        self.job("00000009", chapter="14", volume="", pendingResumeFrom="placements")
         self.manager.set_initial_translation_notes("default", "00000009", "Keep chapter notes")
         self.manager._queued_jobs.update({("default", "00000001"), ("default", "00000009")})
         options = web_app.resolve_control_settings(self.manager, "default", {
@@ -79,8 +79,7 @@ class QueueSettingsTests(unittest.TestCase):
                 self.assertEqual(self.manager.load_status("default", f"{index:08x}"), originals[state])
         self.assertEqual(self.manager.load_status("other", "00000008")["ocrPageWorkers"], 1)
         series = self.manager.load_status("default", "00000009")
-        self.assertEqual(series["chapterOrder"], "14")
-        self.assertTrue(series["writeTranslationNotes"])
+        self.assertEqual(series["chapter"], "14")
         self.assertEqual(series["pendingResumeFrom"], "placements")
         self.assertEqual(json.loads(self.manager.translation_notes_path("default", "00000009").read_text())["job"], "Keep chapter notes")
         self.assertEqual(self.manager.category_advanced_options_path("default").read_bytes(), defaults)

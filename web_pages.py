@@ -550,7 +550,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         url = str(item.get("url") or f"/category/{category}")
         category_rows.append(
             "<tr>"
-            f'<td><a href="{escape(url)}">{escape(category)}</a></td>'
+            f'<td><a href="{escape(url)}">{escape(category)}</a>{" <span class=muted>(series)</span>" if item.get("isSeries") else ""}</td>'
             f'<td>{escape(item.get("jobCount", 0))}</td>'
             f'<td><a class="button" href="/admin/categories/{escape(category)}/rename">Rename...</a> '
             f'<a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
@@ -592,6 +592,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
 <h2>Job Categories</h2>
 <form action="/admin/categories" method="post">
   <label>New category<br><input name="category" type="text" required pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" autocomplete="off"></label>
+  <label><input name="is_series" type="checkbox" value="1"> Is series <abbr title="A series category keeps chapters in volume/chapter order and shares translation notes and ComicInfo metadata between them." tabindex="0">[?]</abbr></label>
   <button type="submit">Create category</button>
 </form>
 {categories_html}
@@ -1087,7 +1088,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         actions_html = " ".join(item for item in (view_html, delete_html) if item)
         rows.append(
             "<tr>"
-            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(job_name)}</a>{title_html}<br>'
+            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape((str(job.get("chapterLabel") or "") + " " + job_name).strip())}</a>{title_html}<br>'
             f'<span class="muted">{escape(job_id)}</span></td>'
             f'<td>{escape(job.get("status"))}</td>'
             f'<td>{escape(job.get("phase"))}</td>'
@@ -1116,20 +1117,12 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         f"""
 <h1>Category: {escape(code)}</h1>
 <p><a href="/admin">Admin</a></p>
-<details>
-  <summary>Series</summary>
-  {series_list_markup(code, data.get("series", []))}
-  <form action="/category/{escape(code)}/series" method="post">
-    <label>New series<br><input name="name" type="text" maxlength="256" required></label>
-    <button type="submit">Create series</button>
-  </form>
-</details>
+{series_settings_markup(code, data)}
 <form action="/upload" method="post" enctype="multipart/form-data" data-category-options="{escape(code)}">
   <input name="category" type="hidden" value="{escape(code)}">
-  <label>Series<br><select name="series_id">{series_options(data.get("series", []))}</select></label>
-  <label>Chapter order (for series)<br><input name="chapter" type="number" min="0.000001" step="any"></label>
   <label>CBZ or ZIP archive<br><input name="cbz" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}"></label>
   <label>Page image files<br><input name="page_images" type="file" accept="{UPLOAD_PAGE_IMAGE_ACCEPT}" multiple></label>
+  {chapter_fields() if data.get("series") else ""}
   <p class="muted">Upload one CBZ or ZIP archive, or upload multiple image pages. A ZIP archive must contain image pages and can contain metadata. Separate images use the picker order and are converted to PNG.</p>
   {advanced_options_fields(
       default_thinking_budget_tokens,
@@ -1613,132 +1606,99 @@ const statusTimer = window.setInterval(refreshStatus, 5000);
     )
 
 
-def series_options(series: list[dict[str, Any]], selected: str = "") -> str:
-    return '<option value="">Standalone job</option>' + "".join(
-        f'<option value="{escape(item["id"])}"{" selected" if item["id"] == selected else ""}>{escape(item["name"])}</option>'
-        for item in series
-    )
-
-
-def series_list_markup(code: str, series: list[dict[str, Any]]) -> str:
-    return "<ul>" + "".join(
-        f'<li><a href="/category/{escape(code)}/series/{escape(item["id"])}">{escape(item["name"])}</a></li>'
-        for item in series
-    ) + "</ul>" if series else '<p class="muted">No series yet.</p>'
+def chapter_fields(chapter: str = "", volume: str = "") -> str:
+    return f"""
+<div style="display:flex;gap:1em">
+  <label>Volume (optional)<br><input name="volume" type="number" min="0" max="1000000" step="any" style="width:9em" value="{escape(volume)}"></label>
+  <label>Chapter<br><input name="chapter" type="number" min="0" max="1000000" step="any" style="width:9em" value="{escape(chapter)}" required></label>
+</div>
+"""
 
 
 def job_series_markup(code: str, job_id: str, status: dict[str, Any]) -> str:
-    series_id = str(status.get("seriesId") or "")
-    order = str(status.get("chapterOrder") or "")
-    series = status.get("series", [])
-    current = next((item for item in series if item["id"] == series_id), None)
-    link = (f'<p>Series: <a href="/category/{escape(code)}/series/{escape(series_id)}">'
-            f'{escape(current["name"])}</a> — chapter {escape(order)}</p>') if current else ""
-    warning = str(status.get("seriesNotesWarning") or "")
-    warning_html = f'<p>{escape(warning)}</p>' if warning else ""
+    if not status.get("isSeries"):
+        return ""
+    link = f'<p>Series: <a href="/category/{escape(code)}">{escape(code)}</a> — {escape(status.get("chapterLabel"))}</p>'
+    warning = f'<p>{escape(status["seriesNotesWarning"])}</p>' if status.get("seriesNotesWarning") else ""
     if status.get("status") in {"queued", "running", "terminating"}:
-        return link + warning_html
+        return link + warning
     publish = (
         f'<form action="/job/{escape(code)}/{escape(job_id)}/publish-series-notes" method="post">'
         '<p>This replaces the current series notes, including notes from later chapters.</p>'
         f'<button type="submit"{"" if status.get("hasGeneratedTranslationNotes") else " disabled"}>Use this chapter\'s notes for the series</button> '
         '<button type="submit" name="use_current" value="1">Keep current series notes and continue</button></form>'
-        if series_id and status.get("status") == "complete" else ""
+        if status.get("status") == "complete" else ""
     )
-    if status.get("seriesContextSaved"):
-        return link + warning_html + (
-            '<details><summary>Series settings</summary><p>The saved series and chapter order are fixed for retries.</p>'
-            + publish + '</details>'
-        )
-    return link + warning_html + f"""
-<details><summary>Series settings</summary>
-<form action="/job/{escape(code)}/{escape(job_id)}/series" method="post">
-  <label>Series<br><select name="series_id">{series_options(series, series_id)}</select></label>
-  <label>Chapter order<br><input name="chapter" type="number" min="0.000001" step="any" value="{escape(order)}"></label>
-  <button type="submit">Set series</button>
-</form>
-{publish}
-</details>
+    fields = '<p>Chapter and volume are fixed because this job has saved context.</p>' if status.get("seriesContextSaved") else f"""
+<form action="/job/{escape(code)}/{escape(job_id)}/chapter" method="post">
+{chapter_fields(str(status.get("chapter") or ""), str(status.get("volume") or ""))}
+<button type="submit">Set chapter</button></form>
 """
+    return link + warning + '<details><summary>Series settings</summary>' + fields + publish + '</details>'
 
 
-def series_page(code: str, series_id: str, series: dict[str, Any], chapters: list[dict[str, Any]], options: dict[str, Any]) -> HTMLResponse:
-    next_order = str(Decimal(chapters[-1]["chapterOrder"]) + 1) if chapters else "1"
-    rows = "".join(
-        f'<tr><td>{escape(item["chapterOrder"])}</td><td><a href="/job/{escape(code)}/{escape(item["jobId"])}">'
-        f'{escape(item.get("jobName") or item["jobId"])}</a></td><td>{escape(item.get("status"))}</td>'
-        f'<td>{escape(item.get("seriesNotesWarning") or item.get("message"))}</td></tr>' for item in chapters
-    )
-    endpoint = str(options.get("defaultVlmBaseUrl") or "")
-    advanced = advanced_options_fields(
-        options.get("defaultThinkingBudgetTokens", DEFAULT_THINKING_BUDGET_TOKENS), endpoint,
-        vlm_model=str(options.get("defaultVlmModel") or ""), test_category=code,
-        has_vlm_auth_token=bool(options.get("hasVlmAuthToken")),
-        include_translation_notes=True, translation_notes=str(options.get("translationNotes") or ""),
-        pause_after_ocr=bool(options.get("pauseAfterOcr")), write_translation_notes=True,
-        proofread_translations=bool(options.get("proofreadTranslations", True)),
-        alt_placement_enabled=bool(options.get("defaultAltPlacementEnabled", True)),
-        source_language=str(options.get("defaultSourceLanguage") or DEFAULT_SOURCE_LANGUAGE),
-        ocr_engine=str(options.get("defaultOcrEngine") or DEFAULT_OCR_ENGINE),
-        paddleocr_vl_server_url=str(options.get("defaultPaddleocrVlServerUrl") or DEFAULT_PADDLEOCR_VL_SERVER_URL),
-        paddleocr_vl_model=str(options.get("defaultPaddleocrVlModel") or DEFAULT_PADDLEOCR_VL_MODEL),
-        ocr_page_workers=options.get("defaultOcrPageWorkers", 1),
-        lama_workers=options.get("defaultLamaWorkers", 1),
-        imagemagick_workers=options.get("defaultImagemagickWorkers", 1),
-        auto_translate_comicinfo_title=bool(options.get("autoTranslateComicInfoTitle", True)),
-    )
-    return base_page(series["name"], f"""
-<h1>{escape(series["name"])}</h1>
-<p><a href="/category/{escape(code)}">Back to category</a></p>
-<details><summary>Series instructions and notes</summary>
-<form action="/category/{escape(code)}/series/{escape(series_id)}" method="post">
-  <label>Name<br><input name="name" type="text" maxlength="256" required value="{escape(series['name'])}"></label>
-  <label>Fixed translation instructions (highest priority)<br><textarea name="instructions" rows="4" maxlength="100000">{escape(series['instructions'])}</textarea></label>
-  <label>Series notes<br><textarea name="notes" rows="12" maxlength="100000">{escape(series['notes'])}</textarea></label>
-  <button type="submit">Save series</button>
+def series_settings_markup(code: str, data: dict[str, Any]) -> str:
+    series = data.get("series")
+    if not series:
+        return ""
+    state = data.get("seriesExport") or {}
+    download = "" if state.get("status") != "complete" else f'<a href="/api/v1/categories/{escape(code)}/exports/download">Download CBZ collection</a>'
+    return f"""
+<details id="series-settings"><summary>Series settings</summary>
+<form action="/category/{escape(code)}/series" method="post">
+  <label>Series name<br><input name="name" maxlength="256" required value="{escape(series['name'])}"></label>
+  <label>Fixed translation instructions<br><textarea name="instructions" rows="4" maxlength="100000">{escape(series['instructions'])}</textarea></label>
+  <label>Series notes<br><textarea name="notes" rows="8" maxlength="100000">{escape(series['notes'])}</textarea></label>
+  <label>Common ComicInfo XML<br><textarea name="comic_info_xml" rows="8" maxlength="100000" placeholder="&lt;ComicInfo&gt;...&lt;/ComicInfo&gt;">{escape(series['comicInfoXml'])}</textarea></label>
+  <p class="muted">Common XML replaces matching source fields. Each export sets its own title, volume, chapter, and page count. Leave XML blank to keep source metadata.</p>
+  <button type="submit">Save series settings</button>
 </form>
-<p>Notes through chapter: {escape(series.get('notesThroughOrder') or 'none')}. Changes apply to chapters that have not started. If changed during a run, review that chapter's notes before continuing.</p>
-</details>
-<h2>Chapters</h2>
-<table><thead><tr><th>Order</th><th>Job</th><th>Status</th><th>Message</th></tr></thead><tbody>{rows}</tbody></table>
-<p>Chapters run in order. A failed chapter or missing notes stops later chapters. Retries keep their saved notes.</p>
-<details><summary>Upload chapters</summary>
-<form action="/category/{escape(code)}/series/{escape(series_id)}/upload" method="post" enctype="multipart/form-data">
-  <label>CBZ or ZIP chapters<br><input id="series-chapters" name="chapters" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}" multiple required></label>
-  <label>First chapter order<br><input id="series-first-chapter" name="first_chapter" type="number" min="0.000001" step="any" value="{escape(next_order)}" required></label>
-  <p>Files use filename order (2 before 10). Each next chapter adds 1. Review the order before queuing.</p>
-  <ol id="series-upload-order"></ol>
-  {advanced}
-  <p>Series chapters always generate translation notes.</p>
-  <button type="submit">Queue chapters</button>
+<p class="muted">Chapters run in volume/chapter order and share translation notes. Retries keep their saved context.</p>
+<form action="/category/{escape(code)}/exports" method="post">
+  <label>Export all CBZ as <select name="variant">{''.join(f'<option value="{v}"' + (' selected' if state.get('format', 'png') == v else '') + f'>{label}</option>' for v, label in (('png', 'PNG'), ('webp', 'WebP'), ('jxl', 'JXL')))}</select></label>
+  <label>Group <select name="grouping"><option value="chapters"{' selected' if state.get('grouping', 'chapters') == 'chapters' else ''}>Individual chapters</option><option value="volumes"{' selected' if state.get('grouping') == 'volumes' else ''}>Volumes</option></select></label>
+  <button type="submit">Export all CBZ</button>
 </form>
-</details>
-{VLM_CONNECTION_TEST_SCRIPT}
+<p class="muted">Exports completed chapters only, as a ZIP of CBZ files. Volume mode combines chapters in each volume; chapters without a volume stay separate. Export does not use the VLM.</p>
+<p id="series-export-status" role="status">{escape(state.get('message') or '')}</p>
+<p id="series-export-download">{download}</p>
+<details><summary>Upload multiple chapters</summary>
+<form action="/category/{escape(code)}/series/upload" method="post" enctype="multipart/form-data">
+<label>CBZ or ZIP chapters<br><input name="chapters" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}" multiple required></label>
+<label>Volume (optional)<br><input name="volume" type="number" min="0" max="1000000" step="any"></label>
+<label>First chapter<br><input name="first_chapter" type="number" min="0" max="1000000" step="any" value="1" required></label>
+<p class="muted">Uses saved category Advanced Options. Files use filename order (2 before 10); each next chapter adds 1.</p>
+<button type="submit">Queue chapters</button></form>
+</details></details>
 <script>
-const chaptersInput = document.getElementById("series-chapters");
-const firstInput = document.getElementById("series-first-chapter");
-function showChapterOrder() {{
-  const list = document.getElementById("series-upload-order");
-  list.replaceChildren();
-  const key = name => name.split(/([0-9]+)/).map(part => /^[0-9]+$/.test(part) ? Number(part) : part.toLowerCase());
-  const compare = (a, b) => {{
-    const left = key(a.name), right = key(b.name);
-    for (let i = 0; i < Math.min(left.length, right.length); i++) {{
-      if (left[i] === right[i]) continue;
-      return left[i] < right[i] ? -1 : 1;
+(() => {{
+  let timer;
+  if (window.location.hash === "#series-settings") document.getElementById("series-settings").open = true;
+  async function refreshExport() {{
+    try {{
+      const response = await fetch("/api/v1/categories/{escape(code)}/exports", {{cache: "no-store"}});
+      if (!response.ok) throw new Error("Could not read export status.");
+      const data = await response.json();
+      document.getElementById("series-export-status").textContent = data.message || "";
+      const download = document.getElementById("series-export-download");
+      download.replaceChildren();
+      if (data.status === "complete") {{
+        const link = document.createElement("a");
+        link.href = "/api/v1/categories/{escape(code)}/exports/download";
+        link.textContent = "Download CBZ collection";
+        download.append(link);
+      }}
+      if (data.status === "generating") timer = setTimeout(refreshExport, 2000);
+    }} catch (error) {{
+      document.getElementById("series-export-status").textContent = error.message;
+      timer = setTimeout(refreshExport, 5000);
     }}
-    return left.length - right.length;
-  }};
-  Array.from(chaptersInput.files).sort(compare).forEach((file, index) => {{
-    const item = document.createElement("li");
-    item.textContent = `Chapter ${{Number(firstInput.value) + index}}: ${{file.name}}`;
-    list.append(item);
-  }});
-}}
-chaptersInput.addEventListener("change", showChapterOrder);
-firstInput.addEventListener("input", showChapterOrder);
+  }}
+  refreshExport();
+  window.addEventListener("beforeunload", () => clearTimeout(timer));
+}})();
 </script>
-""")
+"""
 
 
 def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:

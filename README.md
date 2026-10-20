@@ -111,15 +111,21 @@ If you have your own, better, private fonts, put your files in `data/fonts` and 
 
 #### Series
 
-Create a series from a category's **Series** section. Set its translation instructions,
-then upload chapters from the series page and check their order before queuing.
-Chapters run in order and pass updated notes to the next chapter automatically.
+Select **Is series** when creating a category. Set its translation instructions
+and common ComicInfo XML under **Series settings**. Upload chapters with a chapter
+number and optional volume; decimal chapter numbers are supported. Chapters run
+in volume/chapter order and pass updated notes to the next chapter automatically.
 Failed chapters, OCR review, or missing notes hold later chapters.
 
 Each chapter keeps the notes it started with for retries. Edit shared notes on the
-series page. To replace them with notes from an older chapter, use **Series settings**
+category page. To replace them with notes from an older chapter, use **Series settings**
 on that job and select **Use this chapter's notes for the series**.
 You can also keep your current edited notes and continue from that chapter.
+
+**Export all CBZ** downloads a ZIP of PNG, WebP, or JXL CBZ files for completed
+chapters. Choose individual chapters or combine chapters by volume. Chapters
+without a volume stay separate. Common XML overrides matching source fields;
+exports set their own title, volume, chapter number, and page count. No VLM is used.
 
 #### Terminal access
 
@@ -141,7 +147,8 @@ The CLI also supports the non-editor web actions:
 ```bash
 python3 tetolate_cli.py vlm test --category default
 python3 tetolate_cli.py jobs submit --images page1.png page2.png
-python3 tetolate_cli.py series upload SERIES_ID chapter1.cbz chapter2.cbz --first-chapter 1
+python3 tetolate_cli.py categories create my-series --series
+python3 tetolate_cli.py series upload my-series chapter1.cbz chapter2.cbz --first-chapter 1
 python3 tetolate_cli.py jobs set-translated-title JOB_ID "English title"
 python3 tetolate_cli.py jobs translate-title JOB_ID
 python3 tetolate_cli.py jobs retry-title-translation JOB_ID

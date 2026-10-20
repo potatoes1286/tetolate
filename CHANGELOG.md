@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added category-series ComicInfo templates and ZIP collection exports by chapter or volume, in PNG, WebP, or JXL.
 - Added Advanced Options editing for queued jobs and a category action to apply saved settings to all queued jobs.
 - Added Copy to Category Settings and Copy from Category Settings buttons to each job's Advanced Options.
 - Added direct page-number entry in the editor.
@@ -17,6 +18,8 @@
 
 ### Changed
 
+- Series are now categories, with optional volume and decimal chapter numbers. Removed separate series records and selectors.
+- Series API and CLI actions now use category names instead of series IDs.
 - CBZ exports run independently of the translation queue, with separate progress and errors.
 - Manual line breaks follow automatic wrapping until edited, then keep the chosen breaks.
 - Editor actions now regenerate one stage, one changed page, all changed pages, or finish edits without VLM calls; regeneration and export generation remove old CBZ exports.

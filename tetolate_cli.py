@@ -249,20 +249,20 @@ def parser() -> argparse.ArgumentParser:
         parent = command(groups, group)
         actions = parent.add_subparsers(dest="action", required=True)
         names = {
-            "jobs": ("list", "show", "submit", "wait", "logs", "restart", "terminate", "rename", "delete", "rerun", "settings", "export", "download", "series", "publish-notes", "set-translated-title", "translate-title", "retry-title-translation", "pages", "page"),
+            "jobs": ("list", "show", "submit", "wait", "logs", "restart", "terminate", "rename", "delete", "rerun", "settings", "export", "download", "chapter", "publish-notes", "set-translated-title", "translate-title", "retry-title-translation", "pages", "page"),
             "categories": ("list", "create", "rename", "delete", "settings", "apply-to-queued"),
-            "series": ("list", "create", "show", "rename", "notes", "instructions", "upload"),
+            "series": ("list", "show", "rename", "notes", "instructions", "comic-info-xml", "upload", "export", "download"),
             "tokens": ("list", "revoke", "create"),
         }[group]
         for action in names:
             leaf = command(actions, action)
-            if group in {"jobs", "series"}:
+            if group == "jobs":
                 leaf.add_argument("--category", default="default" if action in {"submit", "create"} else None)
             if group == "jobs":
                 if action == "submit":
                     leaf.add_argument("archive", type=Path, nargs="?")
                     leaf.add_argument("--images", type=Path, nargs="+", help="Page files in the required page order, instead of an archive")
-                    leaf.add_argument("--series", default="")
+                    leaf.add_argument("--volume", default="")
                     leaf.add_argument("--chapter", default="")
                     leaf.add_argument("--notes-file", type=Path)
                 elif action != "list":
@@ -298,14 +298,16 @@ def parser() -> argparse.ArgumentParser:
                     leaf.add_argument("--title", choices=["original", "translated"], default="original")
                     leaf.add_argument("--alt-title-in-notes", action="store_true")
                     leaf.add_argument("--regenerate", action="store_true")
-                if action == "series":
-                    leaf.add_argument("series_id", help="Series ID, or an empty string to detach")
-                    leaf.add_argument("--chapter", default="")
+                if action == "chapter":
+                    leaf.add_argument("--chapter", required=True)
+                    leaf.add_argument("--volume", default="")
                 if action == "publish-notes":
                     leaf.add_argument("--use-current", action="store_true")
             elif group == "categories":
                 if action != "list":
                     leaf.add_argument("name")
+                if action == "create":
+                    leaf.add_argument("--series", action="store_true", help="Make this category a series")
                 if action == "rename":
                     leaf.add_argument("new_name")
                 if action == "delete":
@@ -314,22 +316,28 @@ def parser() -> argparse.ArgumentParser:
                     leaf.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
                     leaf.add_argument("--settings-file", type=Path)
             elif group == "series":
-                if action == "create":
-                    leaf.add_argument("name")
-                elif action != "list":
-                    leaf.add_argument("series_id")
+                if action != "list":
+                    leaf.add_argument("category")
                 if action == "rename":
                     leaf.add_argument("name")
-                if action in {"notes", "instructions"}:
+                if action in {"notes", "instructions", "comic-info-xml"}:
                     source = leaf.add_mutually_exclusive_group()
                     source.add_argument("--file", type=Path)
                     source.add_argument("--stdin", action="store_true")
                 if action == "upload":
                     leaf.add_argument("archives", type=Path, nargs="+", help="1-200 CBZ/ZIP files; sorted by filename (2 before 10)")
                     leaf.add_argument("--first-chapter", default="1")
+                    leaf.add_argument("--volume", default="")
                     leaf.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
                     leaf.add_argument("--settings-file", type=Path)
                     leaf.add_argument("--notes-file", type=Path)
+                if action in {"export", "download"}:
+                    leaf.add_argument("--output", type=Path, required=True)
+                if action == "export":
+                    leaf.add_argument("--format", choices=["png", "webp", "jxl"], default="png")
+                    leaf.add_argument("--grouping", choices=["chapters", "volumes"], default="chapters")
+                    leaf.add_argument("--timeout", type=positive_float, default=3600)
+                    leaf.add_argument("--interval", type=positive_float, default=2)
             elif group == "tokens" and action == "revoke":
                 leaf.add_argument("token_id")
             elif group == "tokens" and action == "create":
@@ -445,15 +453,6 @@ def read_logs(client: Client, args):
         time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
 
 
-def resolve_series(client: Client, args) -> str:
-    if args.category:
-        code = args.category
-    else:
-        matches = [item for item in client.request("GET", "/series")["series"] if item["id"] == args.series_id]
-        if len(matches) != 1:
-            raise ClientError("Series ID not found or ambiguous. Specify --category.", 1, "not_found")
-        code = matches[0]["category"]
-    return "/categories/" + quote(code, safe="") + "/series/" + quote(args.series_id, safe="")
 
 
 def execute(client: Client, args, config_path: Path, config: dict):
@@ -505,7 +504,7 @@ def execute(client: Client, args, config_path: Path, config: dict):
             return client.request("GET", "/categories")
         path = "/categories/" + quote(args.name, safe="")
         if action == "create":
-            return client.request("POST", "/categories", {"name": args.name})
+            return client.request("POST", "/categories", {"name": args.name, "is_series": args.series})
         if action == "rename":
             return client.request("PATCH", path, {"name": args.new_name})
         if action == "delete":
@@ -516,10 +515,9 @@ def execute(client: Client, args, config_path: Path, config: dict):
         return client.request("PATCH" if changes else "GET", path + "/settings", changes if changes else None)
     if group == "series":
         if action == "list":
-            return client.request("GET", "/series" + ("?" + urlencode({"category": args.category}) if args.category else ""))
-        if action == "create":
-            return client.request("POST", "/categories/" + quote(args.category, safe="") + "/series", {"name": args.name})
-        path = resolve_series(client, args)
+            return client.request("GET", "/series")
+        base = "/categories/" + quote(args.category, safe="")
+        path = base + "/series"
         if action == "show":
             return client.request("GET", path)
         if action == "rename":
@@ -527,12 +525,29 @@ def execute(client: Client, args, config_path: Path, config: dict):
         if action == "upload":
             if len(args.archives) > 200:
                 raise ClientError("Select 1-200 CBZ or ZIP chapters.", 2)
-            fields = {"first_chapter": args.first_chapter, "settings": json.dumps(settings_changes(args)),
+            fields = {"first_chapter": args.first_chapter, "volume": args.volume, "settings": json.dumps(settings_changes(args)),
                       "translation_notes": args.notes_file.read_text(encoding="utf-8") if args.notes_file else ""}
             return client.request("POST", path + "/upload", multipart=Multipart([("chapters", file) for file in args.archives], fields))
+        if action in {"export", "download"}:
+            if action == "export":
+                deadline = time.monotonic() + args.timeout
+                client.request("POST", base + "/exports", {"format": args.format, "grouping": args.grouping})
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ClientError("Timed out waiting for the collection export.", EXIT_TIMEOUT, "timeout")
+                    state = client.request("GET", base + "/exports", timeout=min(client.timeout, remaining))
+                    if state.get("status") == "complete":
+                        break
+                    if state.get("status") != "generating":
+                        raise ClientError(state.get("message") or "Collection export failed.", 1, "export_failed")
+                    time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
+            return client.download(base + "/exports/download", args.output)
+        key = "comic_info_xml" if action == "comic-info-xml" else action
+        field = "comicInfoXml" if action == "comic-info-xml" else action
         value = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read() if args.stdin else None
-        result = client.request("GET" if value is None else "PATCH", path, None if value is None else {action: value})
-        return {"id": result["id"], "category": result["category"], action: result[action], "revision": result["revision"]}
+        result = client.request("GET" if value is None else "PATCH", path, None if value is None else {key: value})
+        return {"category": args.category, field: result[field], "revision": result["revision"]}
     if action == "list":
         filters = {key: value for key, value in {"category": args.category, "state": args.state}.items() if value}
         return client.request("GET", "/jobs" + ("?" + urlencode(filters) if filters else ""))
@@ -540,7 +555,7 @@ def execute(client: Client, args, config_path: Path, config: dict):
         if bool(args.archive) == bool(args.images):
             raise ClientError("Supply an archive or --images, not both.", 2)
         fields = {"category": args.category, "settings": json.dumps(settings_changes(args)),
-                  "series_id": args.series, "chapter": args.chapter,
+                  "volume": args.volume, "chapter": args.chapter,
                   "translation_notes": args.notes_file.read_text(encoding="utf-8") if args.notes_file else ""}
         files = [("page_images", path) for path in args.images] if args.images else args.archive
         return client.request("POST", "/jobs", multipart=Multipart(files, fields))
@@ -572,8 +587,8 @@ def execute(client: Client, args, config_path: Path, config: dict):
     if action == "rerun":
         pages = page_selection(args.pages)
         return client.request("POST", job_path(args, "/rerun"), {"stage": args.stage, "pages": pages})
-    if action == "series":
-        return client.request("PATCH", job_path(args, "/series"), {"series_id": args.series_id, "chapter": args.chapter})
+    if action == "chapter":
+        return client.request("PATCH", job_path(args, "/chapter"), {"volume": args.volume, "chapter": args.chapter})
     if action == "publish-notes":
         return client.request("POST", job_path(args, "/series-notes"), {"use_current": args.use_current})
     deadline = None

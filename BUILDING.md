@@ -109,8 +109,11 @@ keep other settings. For example:
 ```bash
 python tetolate_cli.py categories settings default --set vlm_model=YOUR_MODEL
 python tetolate_cli.py jobs settings JOB_ID --set thinking_budget_tokens=2048
-python tetolate_cli.py jobs submit chapter.cbz --series SERIES_ID --chapter 2
-python tetolate_cli.py series notes SERIES_ID --file notes.txt
+python tetolate_cli.py categories create my-series --series
+python tetolate_cli.py jobs submit chapter.cbz --category my-series --chapter 2 --volume 1
+python tetolate_cli.py series notes my-series --file notes.txt
+python tetolate_cli.py series comic-info-xml my-series --file ComicInfo.xml
+python tetolate_cli.py series export my-series --format webp --grouping volumes --output volumes.zip
 ```
 
 `--json` writes results to stdout and errors to stderr. `logs --follow --json`
@@ -134,6 +137,12 @@ keeps file order and converts pages to PNG. `series upload` validates the whole
 batch, sorts filenames naturally (2 before 10), and assigns chapter orders from
 `--first-chapter`, adding 1 per file. It accepts 1-200 CBZ/ZIP files and the same
 `--set`, `--settings-file`, and `--notes-file` options as job submission.
+Series are categories created with `--series`; series commands take the category
+name. `--volume` is optional, and chapters accept decimal numbers including 0.
+`series export` returns a ZIP of CBZ files, grouped by chapter or volume. It uses
+completed chapters only and runs outside the translation queue without VLM calls.
+`series download` downloads the latest completed collection. Settings and exports
+are under `/categories/{code}/series` and `/categories/{code}/exports`.
 
 `vlm test` returns the endpoint's model list. It uses `--job`, `--category`, or
 the server default; `--endpoint` overrides the address. Supply a key through
@@ -156,7 +165,7 @@ sessions; control tokens remain valid until revoked. For non-interactive use,
 three lines. Passwords and keys are not command-line arguments.
 
 These actions use `/api/v1/auth/password`, `/vlm/test`, job title and page
-routes, and `/categories/{code}/series/{series_id}/upload`. Read-only tokens
+routes, and `/categories/{code}/series/upload`. Read-only tokens
 cannot change passwords, probe endpoints, or submit work. Page-editor actions
 are not exposed through the control API or CLI.
 

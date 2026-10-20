@@ -196,19 +196,16 @@ class ControlAPITests(unittest.TestCase):
     def test_categories_and_series_json_actions(self):
         async def exercise(client):
             self.assertEqual((await client.get("/api/v1/status")).json()["apiVersion"], 1)
-            response = await client.post("/api/v1/categories", json={"name": "books"})
+            response = await client.post("/api/v1/categories", json={"name": "books", "is_series": True})
             self.assertEqual(response.status_code, 201)
-            response = await client.post("/api/v1/categories/books/series", json={"name": "Example"})
-            self.assertEqual(response.status_code, 201)
-            series_id = response.json()["id"]
-            response = await client.patch(f"/api/v1/categories/books/series/{series_id}", json={"notes": "Aki is the captain.", "instructions": "Keep names."})
+            response = await client.patch("/api/v1/categories/books/series", json={"name": "Example", "notes": "Aki is the captain.", "instructions": "Keep names."})
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.json()["notes"], "Aki is the captain.")
             response = await client.get("/api/v1/series")
             self.assertEqual(response.json()["series"][0]["category"], "books")
             response = await client.patch("/api/v1/categories/books", json={"name": "manga"})
             self.assertEqual(response.status_code, 200)
-            self.assertEqual((await client.get(f"/api/v1/categories/manga/series/{series_id}")).status_code, 200)
+            self.assertEqual((await client.get("/api/v1/categories/manga/series")).status_code, 200)
             response = await client.delete("/api/v1/categories/manga", follow_redirects=False)
             self.assertEqual(response.status_code, 422)
             response = await client.request("DELETE", "/api/v1/categories/manga", json={"confirmation": "manga"})
@@ -418,22 +415,53 @@ class ControlAPITests(unittest.TestCase):
         self.run_http(exercise)
 
     def test_series_membership_and_publication_actions(self):
+        self.manager.initialize_series("default")
         async def exercise(client):
-            response = await client.post("/api/v1/categories/default/series", json={"name": "Example"})
-            series_id = response.json()["id"]
-            response = await client.post("/api/v1/jobs", data={"series_id": series_id, "chapter": "1.5"}, files={"file": ("input.cbz", archive_bytes(), "application/zip")})
+            response = await client.post("/api/v1/jobs", data={"volume": "2", "chapter": "1.5"}, files={"file": ("input.cbz", archive_bytes(), "application/zip")})
             self.assertEqual(response.status_code, 201)
             job_id = response.json()["jobId"]
-            self.assertEqual(response.json()["chapterOrder"], "1.5")
+            self.assertEqual(response.json()["chapter"], "1.5")
+            self.assertEqual(response.json()["volume"], "2")
             status = self.manager.load_status("default", job_id)
             status["status"] = "complete"
             self.manager.save_status("default", job_id, status)
             response = await client.post(f"/api/v1/jobs/{job_id}/series-notes", json={"use_current": True})
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual(self.manager.get_series("default", series_id)["notesThroughOrder"], "1.5")
-            response = await client.get(f"/api/v1/categories/default/series/{series_id}")
+            self.assertEqual(self.manager.get_series("default")["notesThrough"], {"chapter": "1.5", "volume": "2"})
+            response = await client.get("/api/v1/categories/default/series")
             self.assertEqual(len(response.json()["chapters"]), 1)
 
+        self.run_http(exercise)
+
+    def test_category_collection_export_and_download(self):
+        job_id = self.stopped_job()
+        self.manager.initialize_series("default")
+        status = self.manager.load_status("default", job_id)
+        status.update(chapter="1.5", volume="2")
+        self.manager.save_status("default", job_id, status)
+        final = self.manager.final_pages_dir("default", job_id)
+        final.mkdir(parents=True)
+        Image.new("RGB", (10, 10), "white").save(final / "page.png")
+        async def exercise(client):
+            response = await client.patch("/api/v1/categories/default/series", json={
+                "comic_info_xml": "<ComicInfo><Writer>Test writer</Writer></ComicInfo>"})
+            self.assertEqual(response.status_code, 200, response.text)
+            response = await client.post("/api/v1/categories/default/exports", json={"format": "png", "grouping": "volumes"})
+            self.assertEqual(response.status_code, 200, response.text)
+            for thread in list(self.manager._export_threads):
+                thread.join(10)
+                self.assertFalse(thread.is_alive())
+            response = await client.get("/api/v1/categories/default/exports")
+            self.assertEqual(response.json()["status"], "complete", response.text)
+            self.assertNotIn("inputs", response.json())
+            response = await client.get("/api/v1/categories/default/exports/download")
+            self.assertEqual(response.status_code, 200)
+            with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+                self.assertEqual(len(archive.namelist()), 1)
+            self.assertEqual((await client.get("/api/v1/categories/default/series/old-series-id")).status_code, 404)
+            response = await client.patch("/api/v1/categories/default/series", json={"comic_info_xml": "bad XML"})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("ComicInfo", response.json()["error"]["message"])
         self.run_http(exercise)
 
     def test_logs_cursor_keeps_repeated_lines_and_resets_on_rotation(self):
@@ -619,8 +647,8 @@ class ControlAPITests(unittest.TestCase):
         self.run_http(exercise)
 
     def test_batch_upload_natural_order_and_atomic_rollback(self):
-        series_id = self.manager.create_series("default", "Books")
-        url = f"/api/v1/categories/default/series/{series_id}/upload"
+        self.manager.initialize_series("default")
+        url = "/api/v1/categories/default/series/upload"
 
         async def exercise(client):
             files = [("chapters", (name, archive_bytes())) for name in ("ch10.cbz", "ch2.zip")]
@@ -628,7 +656,7 @@ class ControlAPITests(unittest.TestCase):
             self.assertEqual(response.status_code, 201, response.text)
             jobs = response.json()["jobs"]
             self.assertEqual([job["inputFilename"] for job in jobs], ["ch2.zip", "ch10.cbz"])
-            self.assertEqual([job["chapterOrder"] for job in jobs], ["1.5", "2.5"])
+            self.assertEqual([job["chapter"] for job in jobs], ["1.5", "2.5"])
             self.assertEqual(self.manager._queued_jobs, {("default", jobs[0]["jobId"])})
             before = set(self.manager.iter_job_ids("default"))
             for data, uploads, expected in (({"first_chapter": "3"}, [("chapters", ("3.cbz", archive_bytes())), ("chapters", ("4.cbz", b"bad"))], 400),
@@ -707,7 +735,10 @@ class ControlAPITests(unittest.TestCase):
 
     def test_read_only_tokens_cannot_use_new_mutations(self):
         job_id = self.stopped_job()
-        series_id = self.manager.create_series("default", "Example")
+        self.manager.initialize_series("default")
+        status = self.manager.load_status("default", job_id)
+        status.update(chapter="1", volume="")
+        self.manager.save_status("default", job_id, status)
 
         async def exercise(client):
             client.headers["Authorization"] = "Bearer " + self.manager.create_control_token("reader", True)["token"]
@@ -715,7 +746,7 @@ class ControlAPITests(unittest.TestCase):
                                  ("PATCH", f"/jobs/{job_id}/translated-title"),
                                  ("POST", f"/jobs/{job_id}/translate-title"),
                                  ("POST", f"/jobs/{job_id}/retry-title-translation"),
-                                 ("POST", f"/categories/default/series/{series_id}/upload"), ("POST", "/jobs")):
+                                 ("POST", "/categories/default/series/upload"), ("POST", "/categories/default/exports"), ("POST", "/jobs")):
                 response = await client.request(method, "/api/v1" + path)
                 self.assertEqual(response.status_code, 403, path)
             self.assertEqual((await client.get(f"/api/v1/jobs/{job_id}/pages?kind=original")).status_code, 200)

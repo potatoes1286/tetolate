@@ -56,10 +56,9 @@ from web_pages import (
     editor_page,
     job_page,
     job_viewer_page,
-    series_page,
 )
 import web_security
-from web_series import SeriesManagerMixin, chapter_filename_key, chapter_order
+from web_series import SERIES_FILENAME, SeriesManagerMixin, chapter_filename_key, chapter_number, chapter_label, chapter_key
 from web_storage import write_json_atomic
 from web_control_auth import ControlAuthMixin
 from web_exports import ExportManagerMixin
@@ -1184,20 +1183,20 @@ async def write_uploaded_images_as_cbz(
     return total_written, upload_names_summary(names)
 
 
-async def submit_uploaded_series(manager, code, series_id, chapters, first_chapter, options):
+async def submit_uploaded_series(manager, code, chapters, first_chapter, options, volume=""):
     """Validate and register a whole chapter batch before queueing any chapter."""
     prepared = []
     committed = []
     try:
-        manager.get_series(code, series_id)
+        manager.get_series(code)
         uploads = non_empty_uploads(chapters)
         if not uploads or len(uploads) > 200:
             raise HTTPException(400, "Select 1-200 CBZ or ZIP chapters.")
-        first = Decimal(chapter_order(first_chapter))
+        first = Decimal(chapter_number(first_chapter))
         ordered = sorted(uploads, key=lambda item: chapter_filename_key(upload_filename(item)))
-        orders = [chapter_order(str(first + index)) for index in range(len(ordered))]
+        orders = [chapter_number(str(first + index)) for index in range(len(ordered))]
         for item, order in zip(ordered, orders):
-            manager.validate_series_chapter(code, series_id, order)
+            manager.validate_series_chapter(code, order, volume)
             filename = upload_filename(item)
             if Path(filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
                 raise HTTPException(400, "Chapters must use .cbz or .zip extensions.")
@@ -1210,8 +1209,8 @@ async def submit_uploaded_series(manager, code, series_id, chapters, first_chapt
         with manager._lock:
             try:
                 for job_id, filename, order in prepared:
-                    manager.submit_job(code, job_id, filename, **options, series_id=series_id,
-                                       chapter=order, enqueue_job=False)
+                    manager.submit_job(code, job_id, filename, **options,
+                                       chapter=order, volume=volume, enqueue_job=False)
             except Exception:
                 for job_id, _, _ in prepared:
                     shutil.rmtree(manager.job_dir(code, job_id))
@@ -1763,7 +1762,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         with self._lock:
             return tuple(sorted(self._categories, key=str.casefold))
 
-    def create_category(self, category: str) -> str:
+    def create_category(self, category: str, is_series: bool = False) -> str:
         category = category.strip()
         if not CATEGORY_PATTERN.fullmatch(category):
             raise HTTPException(
@@ -1779,9 +1778,12 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             path.mkdir(parents=True)
             self._categories.add(category)
             try:
+                if is_series:
+                    self.initialize_series(category)
                 self.save_web_state()
             except Exception:
                 self._categories.remove(category)
+                (path / SERIES_FILENAME).unlink(missing_ok=True)
                 path.rmdir()
                 raise
         return category
@@ -2104,6 +2106,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                     "category": category,
                     "url": f"/category/{category}",
                     "jobCount": len(self.iter_job_ids(category)),
+                    "isSeries": self.is_series(category),
                 }
                 for category in self.categories()
             ]
@@ -2843,9 +2846,10 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
             "vlmModel": vlm_model,
             "defaultVlmModel": self.config.default_vlm_model,
-            "seriesId": str(status.get("seriesId") or ""),
-            "chapterOrder": str(status.get("chapterOrder") or ""),
-            "series": self.public_series(code),
+            "chapter": str(status.get("chapter") or ""),
+            "volume": str(status.get("volume") or ""),
+            "chapterLabel": chapter_label(status),
+            "isSeries": self.is_series(code),
             "seriesNotesWarning": str(status.get("seriesNotesWarning") or ""),
             "seriesContextSaved": bool(status.get("seriesContextSaved")),
             "autoTranslateComicInfoTitle": bool(
@@ -2907,11 +2911,12 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                 jobs.append(self.public_status(code, job_id, include_log=False))
             except HTTPException:
                 continue
-        jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+        jobs.sort(key=chapter_key if self.is_series(code) else lambda item: str(item.get("createdAt") or ""), reverse=True)
         return {
             "category": code,
             "jobs": jobs,
-            "series": self.public_series(code),
+            "series": self.get_series(code) if self.is_series(code) else None,
+            "seriesExport": self.public_category_export_status(code),
             "translationNotes": options["translationNotes"],
             "defaultThinkingBudgetTokens": options["thinkingBudgetTokens"],
             "defaultVlmBaseUrl": options["vlmBaseUrl"],
@@ -3043,13 +3048,13 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         vlm_auth_token: str | None = None,
         paddleocr_vl_auth_token: str | None = None,
         auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
-        series_id: str = "",
         chapter: str = "",
+        volume: str = "",
         enqueue_job: bool = True,
     ) -> None:
         created_at = now_utc()
-        chapter = self.validate_series_chapter(code, series_id, chapter, job_id)
-        if series_id:
+        chapter, volume = self.validate_series_chapter(code, chapter, volume, job_id)
+        if self.is_series(code):
             write_translation_notes = True
         if thinking_budget_tokens is None:
             thinking_budget_tokens = self.config.default_thinking_budget_tokens
@@ -3079,8 +3084,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         status = {
             "category": code,
             "jobId": job_id,
-            "seriesId": series_id,
-            "chapterOrder": chapter,
+            "chapter": chapter,
+            "volume": volume,
             "status": "queued",
             "phase": "Queued",
             "page": None,
@@ -3207,7 +3212,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             status["autoTranslateComicInfoTitle"] = bool(auto_translate_comicinfo_title)
             status["pauseAfterOcr"] = bool(pause_after_ocr)
             status["proofreadTranslations"] = bool(proofread_translations)
-            status["writeTranslationNotes"] = bool(write_translation_notes or status.get("seriesId"))
+            status["writeTranslationNotes"] = bool(write_translation_notes or self.is_series(code))
             status["altPlacementEnabled"] = bool(alt_placement_enabled)
             status["sourceLanguage"] = source_language
             status["ocrEngine"] = ocr_engine
@@ -4728,9 +4733,9 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return RedirectResponse("/admin", status_code=303)
 
     @app.post("/admin/categories")
-    async def create_category(request: Request, category: str = Form(...)) -> RedirectResponse:
+    async def create_category(request: Request, category: str = Form(...), is_series: str | None = Form(None)) -> RedirectResponse:
         manager = require_admin(request)
-        category = manager.create_category(category)
+        category = manager.create_category(category, parse_checkbox(is_series))
         return RedirectResponse(f"/category/{category}", status_code=303)
 
     @app.get("/admin/categories/{category}/delete", response_class=HTMLResponse)
@@ -4809,8 +4814,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         imagemagick_workers: str = Form("1"),
         vlm_auth_token: str = Form(""),
         paddleocr_vl_auth_token: str = Form(""),
-        series_id: str = Form(""),
         chapter: str = Form(""),
+        volume: str = Form(""),
     ) -> Any:
         manager = manager_from_request(request)
         code = manager.validate_category(category)
@@ -4908,8 +4913,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 parse_auth_token_form(vlm_auth_token),
                 parse_auth_token_form(paddleocr_vl_auth_token),
                 auto_translate_comicinfo_title=parse_checkbox(auto_translate_comicinfo_title),
-                series_id=series_id,
                 chapter=chapter,
+                volume=volume,
             )
         except Exception:
             try:
@@ -4923,32 +4928,20 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.post("/category/{code}/series")
-    async def create_series(request: Request, code: str, name: str = Form(...)) -> RedirectResponse:
-        manager = require_admin(request)
-        series_id = manager.create_series(code, name)
-        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
-
-    @app.get("/category/{code}/series/{series_id}", response_class=HTMLResponse)
-    async def view_series(request: Request, code: str, series_id: str) -> HTMLResponse:
-        manager = require_admin(request)
-        return series_page(code, series_id, manager.get_series(code, series_id),
-                           manager.series_chapters(code, series_id), manager.public_category_jobs(code))
-
-    @app.post("/category/{code}/series/{series_id}")
     async def update_series(
-        request: Request, code: str, series_id: str, name: str = Form(...),
-        instructions: str = Form(""), notes: str = Form(""),
+        request: Request, code: str, name: str = Form(...),
+        instructions: str = Form(""), notes: str = Form(""), comic_info_xml: str = Form(""),
     ) -> RedirectResponse:
         manager = require_admin(request)
-        manager.update_series(code, series_id, name, instructions, notes)
-        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
+        manager.update_series(code, name, instructions, notes, comic_info_xml)
+        return RedirectResponse(f"/category/{code}#series-settings", status_code=303)
 
-    @app.post("/job/{code}/{job_id}/series")
-    async def assign_series(
-        request: Request, code: str, job_id: str, series_id: str = Form(""), chapter: str = Form(""),
+    @app.post("/job/{code}/{job_id}/chapter")
+    async def assign_chapter(
+        request: Request, code: str, job_id: str, chapter: str = Form(""), volume: str = Form(""),
     ) -> RedirectResponse:
         manager = require_admin(request)
-        manager.assign_job_series(code, job_id, series_id, chapter)
+        manager.assign_job_chapter(code, job_id, chapter, volume)
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
     @app.post("/job/{code}/{job_id}/publish-series-notes")
@@ -4959,36 +4952,23 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         manager.publish_series_notes(code, job_id, explicit=True, use_current=parse_checkbox(use_current))
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
-    @app.post("/category/{code}/series/{series_id}/upload")
+    @app.post("/category/{code}/series/upload")
     async def upload_series_chapters(
-        request: Request, code: str, series_id: str,
-        chapters: list[UploadFile] = File(...), first_chapter: str = Form("1"),
+        request: Request, code: str,
+        chapters: list[UploadFile] = File(...), first_chapter: str = Form("1"), volume: str = Form(""),
     ) -> RedirectResponse:
         manager = require_admin(request)
-        manager.get_series(code, series_id)
-        form = await request.form()
-        options = {
-            "translation_notes": str(form.get("translation_notes", "")),
-            "thinking_budget_tokens": parse_thinking_budget_form(str(form.get("thinking_budget_tokens", "")), manager.config.default_thinking_budget_tokens),
-            "vlm_base_url": parse_vlm_base_url_form(str(form.get("vlm_base_url", "")), manager.config),
-            "vlm_model": parse_vlm_model_form(str(form.get("vlm_model", ""))),
-            "vlm_auth_token": parse_auth_token_form(str(form.get("vlm_auth_token", ""))),
-            "paddleocr_vl_auth_token": parse_auth_token_form(str(form.get("paddleocr_vl_auth_token", ""))),
-            "source_language": parse_source_language_form(str(form.get("source_language", "")), manager.config.default_source_language),
-            "ocr_engine": parse_ocr_engine_form(str(form.get("ocr_engine", "")), manager.config.default_ocr_engine),
-            "paddleocr_vl_server_url": parse_paddleocr_vl_server_url_form(str(form.get("paddleocr_vl_server_url", "")), manager.config),
-            "paddleocr_vl_model": parse_optional_text_form(str(form.get("paddleocr_vl_model", "")), manager.config.default_paddleocr_vl_model),
-            "ocr_page_workers": parse_page_workers_form(str(form.get("ocr_page_workers", "1")), "OCR workers"),
-            "lama_workers": parse_page_workers_form(str(form.get("lama_workers", "1")), "LaMa workers"),
-            "imagemagick_workers": parse_page_workers_form(str(form.get("imagemagick_workers", "1")), "ImageMagick workers"),
-            "pause_after_ocr": parse_checkbox(form.get("pause_after_ocr")),
-            "proofread_translations": parse_checkbox(form.get("enable_proofreading")),
-            "write_translation_notes": True,
-            "alt_placement_enabled": parse_checkbox(form.get("enable_alt_placement")),
-            "auto_translate_comicinfo_title": parse_checkbox(form.get("auto_translate_comicinfo_title")),
-        }
-        await submit_uploaded_series(manager, code, series_id, chapters, first_chapter, options)
-        return RedirectResponse(f"/category/{code}/series/{series_id}", status_code=303)
+        manager.get_series(code)
+        options = resolve_control_settings(manager, code, {}, require_model=True)
+        options["translation_notes"] = manager.load_category_advanced_options(code)["translationNotes"]
+        await submit_uploaded_series(manager, code, chapters, first_chapter, options, volume)
+        return RedirectResponse(f"/category/{code}", status_code=303)
+
+    @app.post("/category/{code}/exports")
+    async def export_category(request: Request, code: str, variant: str = Form("png"), grouping: str = Form("chapters")):
+        manager = require_admin(request)
+        manager.generate_category_export(code, variant, grouping)
+        return RedirectResponse(f"/category/{code}#series-settings", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
     async def category_jobs(request: Request, code: str) -> HTMLResponse:

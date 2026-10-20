@@ -16,7 +16,7 @@ from PIL import Image
 import translate_cbz
 import web_app
 from tests import test_regressions
-from web_series import chapter_order
+from web_series import chapter_number
 
 
 class SeriesTests(unittest.TestCase):
@@ -26,13 +26,14 @@ class SeriesTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.helper = test_regressions.WebAuthenticationTests()
         self.manager = self.helper.initialized_manager(self.root, ["default"])
-        self.series_id = self.manager.create_series("default", "Test series")
+        self.manager.initialize_series("default")
+        self.manager.update_series("default", "Test series", "", "")
 
-    def chapter(self, order: str, *, enqueue: bool = False, series_id: str | None = None) -> str:
+    def chapter(self, order: str, *, enqueue: bool = False, code: str = "default", volume: str = "") -> str:
         manager = self.manager
-        job_id = manager.create_job_id("default")
-        manager.job_dir("default", job_id).mkdir(parents=True)
-        manager.submit_job("default", job_id, f"chapter-{order}.cbz", series_id=series_id or self.series_id,
+        job_id = manager.create_job_id(code)
+        manager.job_dir(code, job_id).mkdir(parents=True)
+        manager.submit_job(code, job_id, f"chapter-{order}.cbz", volume=volume,
                            chapter=order, enqueue_job=enqueue, translation_notes="Keep honorifics.")
         return job_id
 
@@ -49,26 +50,26 @@ class SeriesTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
 
     def test_series_and_order_validation(self) -> None:
-        self.assertEqual(chapter_order("01.50"), "1.5")
-        for value in ("", "0", "-1", "NaN", "Infinity", "1000001", "chapter 1"):
+        self.assertEqual(chapter_number("01.50"), "1.5")
+        for value in ("", "-1", "NaN", "Infinity", "1000001", "chapter 1"):
             with self.subTest(value=value), self.assertRaises(HTTPException):
-                chapter_order(value)
+                chapter_number(value)
         self.chapter("1.5")
         with self.assertRaises(HTTPException) as caught:
             self.chapter("1.50")
         self.assertEqual(caught.exception.status_code, 409)
         with self.assertRaises(HTTPException):
-            self.manager.validate_series_chapter("default", "missing", "1")
-        with self.assertRaises(HTTPException):
-            self.manager.create_series("default", "test SERIES")
+            self.manager.validate_series_chapter("default", "invalid")
+        self.assertEqual(chapter_number("0"), "0")
+        self.chapter("1.5", volume="2")
         restarted = web_app.JobManager(self.manager.config)
         restarted.initialize_web_state()
-        self.assertEqual(restarted.get_series("default", self.series_id)["name"], "Test series")
+        self.assertEqual(restarted.get_series("default")["name"], "Test series")
 
     def test_context_is_captured_when_started_and_kept_on_retry(self) -> None:
         job_id = self.chapter("1")
         self.assertFalse(self.manager.series_context_path("default", job_id).exists())
-        self.manager.update_series("default", self.series_id, "Test series", "Use Aki.", "Aki is the captain.")
+        self.manager.update_series("default", "Test series", "Use Aki.", "Aki is the captain.")
         status = self.manager.load_status("default", job_id)
         self.manager.prepare_series_context("default", job_id, status)
         snapshot = self.manager.series_context_path("default", job_id).read_text()
@@ -77,21 +78,21 @@ class SeriesTests(unittest.TestCase):
         self.assertIn("Use Aki.", notes["job"])
         self.assertIn("Aki is the captain.", notes["job"])
         self.assertIn("Keep honorifics.", notes["job"])
-        self.manager.update_series("default", self.series_id, "Test series", "Changed", "New notes")
+        self.manager.update_series("default", "Test series", "Changed", "New notes")
         self.manager.prepare_series_context("default", job_id, self.manager.load_status("default", job_id))
         self.assertEqual(translate_cbz.load_translation_notes(notes_path), notes)
         self.assertEqual(self.manager.series_context_path("default", job_id).read_text(), snapshot)
         self.status(job_id, "failed")
         with self.assertRaises(HTTPException):
-            self.manager.assign_job_series("default", job_id, "", "")
+            self.manager.assign_job_chapter("default", job_id, "", "")
 
     def test_failed_or_review_chapter_blocks_only_its_series(self) -> None:
         first = self.chapter("1")
         second = self.chapter("2", enqueue=True)
-        other_series = self.manager.create_series("default", "Other")
-        unrelated = self.chapter("1", enqueue=True, series_id=other_series)
+        self.manager.create_category("other", is_series=True)
+        unrelated = self.chapter("1", enqueue=True, code="other")
         self.assertNotIn(("default", second), self.manager._queued_jobs)
-        self.assertIn(("default", unrelated), self.manager._queued_jobs)
+        self.assertIn(("other", unrelated), self.manager._queued_jobs)
         for state in ("failed", "paused", "cancelled", "running"):
             self.status(first, state)
             self.manager.enqueue_ready_series_jobs()
@@ -114,21 +115,21 @@ class SeriesTests(unittest.TestCase):
         self.manager.publish_series_notes("default", second)
         self.generated_notes(first, "Earlier rerun notes")
         self.assertFalse(self.manager.publish_series_notes("default", first))
-        series = self.manager.get_series("default", self.series_id)
+        series = self.manager.get_series("default")
         self.assertEqual(series["notes"], "Aki is the captain. Ren is the healer.")
-        self.assertEqual(series["notesThroughOrder"], "2")
+        self.assertEqual(series["notesThrough"]["chapter"], "2")
         self.assertTrue(self.manager.publish_series_notes("default", first, explicit=True))
-        self.assertEqual(self.manager.get_series("default", self.series_id)["notes"], "Earlier rerun notes")
+        self.assertEqual(self.manager.get_series("default")["notes"], "Earlier rerun notes")
 
     def test_chapter_without_translated_text_keeps_existing_series_notes(self) -> None:
-        self.manager.update_series("default", self.series_id, "Test series", "", "Captain Aki")
+        self.manager.update_series("default", "Test series", "", "Captain Aki")
         job_id = self.chapter("1")
         self.status(job_id, "complete")
         self.generated_notes(job_id, "No translated records were available.")
         self.assertTrue(self.manager.publish_series_notes("default", job_id))
-        series = self.manager.get_series("default", self.series_id)
+        series = self.manager.get_series("default")
         self.assertEqual(series["notes"], "Captain Aki")
-        self.assertEqual(series["notesThroughOrder"], "1")
+        self.assertEqual(series["notesThrough"]["chapter"], "1")
 
     def test_restart_reconstructs_waiting_dependencies(self) -> None:
         first, second = self.chapter("1"), self.chapter("2")
@@ -137,7 +138,7 @@ class SeriesTests(unittest.TestCase):
         restarted.initialize_web_state()
         restarted.requeue_interrupted_jobs()
         self.assertFalse(restarted._queued_jobs)
-        self.assertIn("chapter 1", restarted.load_status("default", second)["message"])
+        self.assertIn("Ch. 1", restarted.load_status("default", second)["message"])
         restarted.save_status("default", first, {**restarted.load_status("default", first), "status": "complete"})
         self.generated_notes(first, "Saved notes")
         restarted.publish_series_notes("default", first)
@@ -150,28 +151,28 @@ class SeriesTests(unittest.TestCase):
         restarted = web_app.JobManager(self.manager.config)
         restarted.initialize_web_state()
         restarted.requeue_interrupted_jobs()
-        self.assertEqual(restarted.get_series("default", self.series_id)["notes"], "Chapter one notes")
+        self.assertEqual(restarted.get_series("default")["notes"], "Chapter one notes")
         self.assertIn(("default", second), restarted._queued_jobs)
         self.status(second, "complete")
         self.generated_notes(second, "Chapter two notes")
         self.manager.publish_series_notes("default", second)
         self.manager.publish_series_notes("default", first, explicit=True)
         self.manager.recover_series_notes()
-        self.assertEqual(self.manager.get_series("default", self.series_id)["notes"], "Chapter one notes")
+        self.assertEqual(self.manager.get_series("default")["notes"], "Chapter one notes")
 
     def test_manual_notes_changed_during_run_are_not_overwritten(self) -> None:
         first, second = self.chapter("1"), self.chapter("2")
         status = self.manager.load_status("default", first)
         self.manager.prepare_series_context("default", first, status)
-        self.manager.update_series("default", self.series_id, "Test series", "", "Manual correction")
+        self.manager.update_series("default", "Test series", "", "Manual correction")
         self.status(first, "complete")
         self.generated_notes(first, "Older generated notes")
         self.assertFalse(self.manager.publish_series_notes("default", first))
-        self.assertEqual(self.manager.get_series("default", self.series_id)["notes"], "Manual correction")
+        self.assertEqual(self.manager.get_series("default")["notes"], "Manual correction")
         self.assertIn("changed during", self.manager.load_status("default", first)["seriesNotesWarning"])
         self.assertNotIn(("default", second), self.manager._queued_jobs)
         self.manager.publish_series_notes("default", first, explicit=True, use_current=True)
-        self.assertEqual(self.manager.get_series("default", self.series_id)["notes"], "Manual correction")
+        self.assertEqual(self.manager.get_series("default")["notes"], "Manual correction")
         self.assertIn(("default", second), self.manager._queued_jobs)
 
     def test_worker_runs_chapters_in_order_and_publishes_before_next_context(self) -> None:
@@ -212,7 +213,7 @@ class SeriesTests(unittest.TestCase):
         self.assertEqual([item[0] for item in seen], [first, second])
         self.assertNotIn("Captain Aki", seen[0][1])
         self.assertIn("Captain Aki", seen[1][1])
-        self.assertEqual(self.manager.get_series("default", self.series_id)["notes"], "Captain Aki and healer Ren")
+        self.assertEqual(self.manager.get_series("default")["notes"], "Captain Aki and healer Ren")
 
     @staticmethod
     def archive() -> bytes:
@@ -227,14 +228,14 @@ class SeriesTests(unittest.TestCase):
         app = web_app.create_app(self.root / "web_config.json")
         app.state.manager = self.manager
         session = self.manager.authenticate_admin(self.helper.ADMIN_PASSWORD)
-        url = f"/category/default/series/{self.series_id}"
+        url = "/category/default/series"
 
         async def exercise():
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
                 # Series management has the same login requirement as jobs.
-                self.assertNotEqual((await client.get(url)).status_code, 200)
+                self.assertNotEqual((await client.get("/category/default")).status_code, 200)
                 client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
-                response = await client.get(url)
+                response = await client.get("/category/default")
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("Series notes", response.text)
                 response = await client.post(url, data={
@@ -248,9 +249,9 @@ class SeriesTests(unittest.TestCase):
                     ("chapters", ("chapter2.cbz", self.archive(), "application/zip")),
                 ])
                 self.assertEqual(response.status_code, 303, response.text)
-                chapters = self.manager.series_chapters("default", self.series_id)
+                chapters = self.manager.series_chapters("default")
                 self.assertEqual([item["inputFilename"] for item in chapters], ["chapter2.cbz", "chapter10.cbz"])
-                self.assertEqual([item["chapterOrder"] for item in chapters], ["1", "2"])
+                self.assertEqual([item["chapter"] for item in chapters], ["1", "2"])
                 self.assertEqual(self.manager._queued_jobs, {("default", chapters[0]["jobId"])})
                 # A bad batch must leave no partially registered chapters.
                 response = await client.post(url + "/upload", data={
@@ -260,13 +261,13 @@ class SeriesTests(unittest.TestCase):
                     ("chapters", ("chapter4.cbz", b"invalid", "application/zip")),
                 ])
                 self.assertEqual(response.status_code, 400)
-                self.assertEqual(len(self.manager.series_chapters("default", self.series_id)), 2)
+                self.assertEqual(len(self.manager.series_chapters("default")), 2)
                 self.assertEqual(len(self.manager.iter_job_ids("default")), 2)
 
         async def direct_run_in_threadpool(function, *args):
             return function(*args)
 
-        with mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool):
+        with mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool), mock.patch("anyio.to_thread.run_sync", new=direct_run_in_threadpool):
             asyncio.run(asyncio.wait_for(exercise(), timeout=15))
 
 

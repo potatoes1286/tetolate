@@ -298,11 +298,27 @@ class CLITests(unittest.TestCase):
             self.execute(["jobs", "submit"])
         with self.assertRaises(cli.ClientError):
             self.execute(["jobs", "submit", str(first), "--images", str(second)])
-        client, _ = self.execute(["series", "upload", "abc123", str(first), str(second), "--category", "default", "--first-chapter", "2.5"])
-        self.assertEqual(client.request.call_args.args, ("POST", "/categories/default/series/abc123/upload"))
+        client, _ = self.execute(["series", "upload", "default", str(first), str(second), "--first-chapter", "2.5"])
+        self.assertEqual(client.request.call_args.args, ("POST", "/categories/default/series/upload"))
         body = client.request.call_args.kwargs["multipart"]
         self.assertIn(b"2.5", b"".join(body))
         self.assertEqual([path for _, path in body.parts], [first, second])
+
+    def test_category_series_commands_use_category_identity(self):
+        client, _ = self.execute(["categories", "create", "books", "--series"])
+        client.request.assert_called_once_with("POST", "/categories", {"name": "books", "is_series": True})
+        client, _ = self.execute(["series", "show", "books"])
+        client.request.assert_called_once_with("GET", "/categories/books/series")
+        client, _ = self.execute(["jobs", "chapter", "12345678", "--chapter", "1.5", "--volume", "2"])
+        client.request.assert_called_once_with("PATCH", "/jobs/12345678/chapter", {"volume": "2", "chapter": "1.5"})
+
+    def test_series_collection_export_waits_and_downloads(self):
+        client = mock.Mock(timeout=30)
+        client.request.side_effect = [{"status": "generating"}, {"status": "generating"}, {"status": "complete"}]
+        with mock.patch.object(cli.time, "sleep"):
+            self.execute(["series", "export", "books", "--format", "webp", "--grouping", "volumes", "--output", str(self.root / "books.zip")], client)
+        self.assertEqual(client.request.call_args_list[0], mock.call("POST", "/categories/books/exports", {"format": "webp", "grouping": "volumes"}))
+        client.download.assert_called_once_with("/categories/books/exports/download", self.root / "books.zip")
 
     def test_vlm_test_reads_credentials_from_file(self):
         path = self.root / "settings.json"

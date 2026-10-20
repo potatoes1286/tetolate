@@ -37,6 +37,9 @@ class TokenName(Input):
 class Name(Input):
     name: str
 
+class CategoryCreate(Name):
+    is_series: StrictBool = False
+
 
 class Delete(Input):
     confirmation: str
@@ -95,11 +98,16 @@ class SeriesUpdate(Input):
     name: str | None = None
     instructions: str | None = None
     notes: str | None = None
+    comic_info_xml: str | None = None
 
 
-class Membership(Input):
-    series_id: str = ""
+class Chapter(Input):
     chapter: str = ""
+    volume: str = ""
+
+class CategoryExport(Input):
+    format: Literal["png", "webp", "jxl"] = "png"
+    grouping: Literal["chapters", "volumes"] = "chapters"
 
 
 class Publish(Input):
@@ -267,8 +275,8 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         return {"categories": get_manager(request).admin_status()["categories"]}
 
     @router.post("/categories", status_code=201)
-    async def create_category(request: Request, data: Name):
-        return {"category": get_manager(request).create_category(data.name)}
+    async def create_category(request: Request, data: CategoryCreate):
+        return {"category": get_manager(request).create_category(data.name, data.is_series)}
 
     @router.patch("/categories/{code}")
     async def rename_category(request: Request, code: str, data: Name):
@@ -314,18 +322,18 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         values = [job for code in codes for job in manager.public_category_jobs(code)["jobs"]
                   if state is None or job["status"] == state]
         fields = {"category", "jobId", "jobName", "translatedJobName", "status", "phase", "page", "message",
-                  "createdAt", "age", "elapsed", "seriesId", "chapterOrder", "hasDownload", "ocrReviewCheckpoint", "exportsRunning"}
+                  "createdAt", "age", "elapsed", "isSeries", "volume", "chapter", "chapterLabel", "hasDownload", "ocrReviewCheckpoint", "exportsRunning"}
         return {"jobs": [{key: value for key, value in job.items() if key in fields} for job in values]}
 
     @router.post("/jobs", status_code=201)
     async def submit(request: Request, file: UploadFile | None = File(None),
                      page_images: list[UploadFile] | None = File(None), category: str = Form("default"),
                      settings: str = Form("{}"), translation_notes: str = Form(""),
-                     series_id: str = Form(""), chapter: str = Form("")):
+                     volume: str = Form(""), chapter: str = Form("")):
         manager = get_manager(request)
         code = manager.validate_category(category)
         options = upload_options(manager, code, settings)
-        manager.validate_series_chapter(code, series_id, chapter)
+        manager.validate_series_chapter(code, chapter, volume)
         images = [item for item in page_images or [] if item.filename]
         if bool(file and file.filename) == bool(images):
             raise HTTPException(400, "Upload one CBZ or ZIP archive, or separate page images, not both.")
@@ -342,7 +350,7 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
             else:
                 _, filename = await save_images(images, manager.input_path(code, job_id), manager.config.max_upload_bytes)
             manager.submit_job(code, job_id, filename, **options, translation_notes=translation_notes,
-                               series_id=series_id, chapter=chapter)
+                               volume=volume, chapter=chapter)
         except Exception:
             shutil.rmtree(path)
             raise
@@ -535,51 +543,63 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
                 "hasMore": offset < stat.st_size, "status": state}
 
     @router.get("/series")
-    async def series(request: Request, category: str | None = None):
+    async def series(request: Request):
         manager = get_manager(request)
-        codes = (manager.validate_category(category),) if category else manager.categories()
-        return {"series": [{"category": code, **{key: value for key, value in item.items()
-                            if key not in {"notes", "instructions"}}}
-                           for code in codes for item in manager.public_series(code)]}
+        return {"series": [{"category": code, "name": manager.get_series(code)["name"]}
+                           for code in manager.categories() if manager.is_series(code)]}
 
-    @router.post("/categories/{code}/series", status_code=201)
-    async def create_series(request: Request, code: str, data: Name):
+    @router.get("/categories/{code}/series")
+    async def get_series(request: Request, code: str):
         manager = get_manager(request)
-        series_id = manager.create_series(code, data.name)
-        return {"id": series_id, "category": code, **manager.get_series(code, series_id)}
-
-    @router.get("/categories/{code}/series/{series_id}")
-    async def get_series(request: Request, code: str, series_id: str):
-        manager = get_manager(request)
-        return {"id": series_id, "category": code, **manager.get_series(code, series_id),
+        return {"category": code, **manager.get_series(code),
                 "chapters": [manager.public_status(code, item["jobId"], include_log=False)
-                             for item in manager.series_chapters(code, series_id)]}
+                             for item in manager.series_chapters(code)]}
 
-    @router.post("/categories/{code}/series/{series_id}/upload", status_code=201)
-    async def upload_chapters(request: Request, code: str, series_id: str, chapters: list[UploadFile] = File(...),
-                              first_chapter: str = Form("1"), settings: str = Form("{}"), translation_notes: str = Form("")):
+    @router.post("/categories/{code}/series/upload", status_code=201)
+    async def upload_chapters(request: Request, code: str, chapters: list[UploadFile] = File(...),
+                              first_chapter: str = Form("1"), volume: str = Form(""),
+                              settings: str = Form("{}"), translation_notes: str = Form("")):
         manager = get_manager(request)
-        manager.validate_category(code)
-        options = upload_options(manager, code, settings)
+        options = upload_options(manager, manager.validate_category(code), settings)
         options.update(translation_notes=translation_notes, write_translation_notes=True)
-        ids = await submit_series(manager, code, series_id, chapters, first_chapter, options)
+        ids = await submit_series(manager, code, chapters, first_chapter, options, volume)
         return {"jobs": [manager.public_status(code, job_id, include_log=False) for job_id in ids]}
 
-    @router.patch("/categories/{code}/series/{series_id}")
-    async def update_series(request: Request, code: str, series_id: str, data: SeriesUpdate):
+    @router.patch("/categories/{code}/series")
+    async def update_series(request: Request, code: str, data: SeriesUpdate):
         manager = get_manager(request)
-        series = manager.get_series(code, series_id)
-        manager.update_series(code, series_id, data.name if data.name is not None else series["name"],
-            data.instructions if data.instructions is not None else series["instructions"],
-            data.notes if data.notes is not None else series["notes"])
-        return {"id": series_id, "category": code, **manager.get_series(code, series_id)}
+        with manager._lock:
+            series = manager.get_series(code)
+            values = {key: value for key, value in data.model_dump(exclude_unset=True).items()}
+            if any(value is None for value in values.values()):
+                raise HTTPException(422, "Series settings cannot be null.")
+            manager.update_series(code, values.get("name", series["name"]),
+                values.get("instructions", series["instructions"]), values.get("notes", series["notes"]),
+                values.get("comic_info_xml", series["comicInfoXml"]))
+        return {"category": code, **manager.get_series(code)}
 
-    @router.patch("/jobs/{job_id}/series")
-    async def assign_series(request: Request, job_id: str, data: Membership, category: str | None = None):
+    @router.patch("/jobs/{job_id}/chapter")
+    async def assign_chapter(request: Request, job_id: str, data: Chapter, category: str | None = None):
         manager = get_manager(request)
         code = find_job(manager, job_id, category)
-        manager.assign_job_series(code, job_id, data.series_id, data.chapter)
+        manager.assign_job_chapter(code, job_id, data.chapter, data.volume)
         return manager.public_status(code, job_id, include_log=False)
+
+    @router.post("/categories/{code}/exports")
+    async def export_category(request: Request, code: str, data: CategoryExport):
+        manager = get_manager(request)
+        manager.generate_category_export(code, data.format, data.grouping)
+        return manager.public_category_export_status(code)
+
+    @router.get("/categories/{code}/exports")
+    async def category_export(request: Request, code: str):
+        return get_manager(request).public_category_export_status(code)
+
+    @router.get("/categories/{code}/exports/download")
+    async def download_category_export(request: Request, code: str):
+        manager = get_manager(request)
+        path = manager.require_category_export(code)
+        return FileResponse(path, filename=f"{code}.zip", headers={"Cache-Control": "no-store"})
 
     @router.post("/jobs/{job_id}/series-notes")
     async def publish_notes(request: Request, job_id: str, data: Publish, category: str | None = None):
