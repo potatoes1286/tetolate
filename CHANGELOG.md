@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added Advanced Options editing for queued jobs and a category action to apply saved settings to all queued jobs.
+- Added Copy to Category Settings and Copy from Category Settings buttons to each job's Advanced Options.
 - Added direct page-number entry in the editor.
 - Added a Hide boxes toggle to Typesetting Preview.
 - Added line-spacing control to Typesetting.
@@ -15,6 +17,7 @@
 
 ### Changed
 
+- CBZ exports run independently of the translation queue, with separate progress and errors.
 - Manual line breaks follow automatic wrapping until edited, then keep the chosen breaks.
 - Editor actions now regenerate one stage, one changed page, all changed pages, or finish edits without VLM calls; regeneration and export generation remove old CBZ exports.
 - Preview reuses saved cleaned pages, shows text before LaMa finishes, and refreshes clean-box edits without blocking navigation.
@@ -24,6 +27,7 @@
 - Typesetting Preview batches uncached layers in one ImageMagick process, keeping per-box caches.
 - Simplified editor alignment labels and box-coordinate inputs.
 - Grouped password and remote CLI controls under Login settings.
+- Clarified category-setting copy buttons, removed their per-job confirmation, and simplified the login page.
 
 ### Fixed
 

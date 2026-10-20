@@ -140,7 +140,7 @@ class EditorActionTests(unittest.TestCase):
 
     def test_export_generation_removes_all_old_archives(self):
         paths = self.archives()
-        with mock.patch.object(self.manager, "enqueue"):
+        with mock.patch("web_exports.threading.Thread.start"):
             self.manager.generate_download(self.code, self.job_id, "png", regenerate=True)
         self.assertTrue(all(not path.exists() for path in paths))
 

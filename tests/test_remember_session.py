@@ -111,6 +111,8 @@ class RememberSessionTests(unittest.TestCase):
                 response = await client.get("/admin")
                 self.assertIn('name="remember_session"', response.text)
                 self.assertIn("Remember session (30 days)", response.text)
+                self.assertNotIn("Use only on a device you trust", response.text)
+                self.assertNotIn("Log out to remove the remembered session", response.text)
                 self.assertNotIn('value="1" checked', response.text)
                 response = await client.post("/admin/login", data={"password": self.password})
                 cookie = response.headers["set-cookie"].lower()

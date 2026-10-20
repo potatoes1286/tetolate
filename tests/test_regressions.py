@@ -1028,7 +1028,7 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertIn("Translate with VLM", titled_body)
         self.assertIn("<summary>Title settings</summary>", titled_body)
         self.assertIn('<legend>Translation VLM</legend>', titled_body)
-        self.assertIn("Save advanced options", titled_body)
+        self.assertIn("Copy to Category Settings", titled_body)
         self.assertIn('name="title_mode"', titled_body)
         self.assertNotIn("Regenerate an existing CBZ download", titled_body)
 
@@ -1091,7 +1091,7 @@ class WebAuthenticationTests(unittest.TestCase):
             with self.assertRaisesRegex(HTTPException, "VLM model is required"):
                 manager.build_command("default", job_id)
 
-    def test_package_only_command_without_vlm_model_is_allowed(self) -> None:
+    def test_package_generation_is_not_a_web_pipeline_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manager = self.initialized_manager(root, ["default"])
@@ -1100,11 +1100,8 @@ class WebAuthenticationTests(unittest.TestCase):
             manager.job_dir("default", job_id).mkdir(parents=True)
             manager.save_status("default", job_id, {"status": "complete"})
 
-            command = manager.build_command(
-                "default", job_id, "package", 0, package_variant="webp"
-            )
-
-        self.assertNotIn("--vlm-model", command)
+            with self.assertRaisesRegex(HTTPException, "independently"):
+                manager.build_command("default", job_id, "package", 0)
 
     def test_job_rename_preserves_translated_title_and_sets_download_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1684,7 +1681,7 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--lama-workers") + 1], "3")
         self.assertEqual(command[command.index("--imagemagick-workers") + 1], "4")
 
-    def test_web_pipeline_skips_archives_and_package_generation_selects_one_variant(self) -> None:
+    def test_web_pipeline_and_render_reruns_always_skip_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manager = self.initialized_manager(root, ["default"])
@@ -1693,17 +1690,12 @@ class WebAuthenticationTests(unittest.TestCase):
             manager.save_status("default", job_id, {"status": "failed"})
 
             normal_command = manager.build_command("default", job_id)
-            package_command = manager.build_command(
-                "default", job_id, "package", 0, package_variant="webp"
-            )
+            render_command = manager.build_command("default", job_id, "render", 0)
 
         self.assertIn("--skip-package", normal_command)
         self.assertNotIn("--package-variant", normal_command)
-        self.assertNotIn("--skip-package", package_command)
-        self.assertEqual(
-            package_command[package_command.index("--package-variant") + 1],
-            "webp",
-        )
+        self.assertIn("--skip-package", render_command)
+        self.assertNotIn("--package-variant", render_command)
 
     def test_case_colliding_saved_categories_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

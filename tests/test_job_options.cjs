@@ -10,18 +10,24 @@ const field = (name, value, type = "text", valid = true) => ({name, value: Strin
 
 function setup(fetch = async () => ({ok: true})) {
   const events = {}, timers = new Map(), requests = [], navigations = [], status = {textContent: ""};
+  let reloads = 0;
+  const categoryButton = {disabled: false, addEventListener: (_name, callback) => {events.useCategory = callback;}};
   let timer = 0;
   const form = {dataset: {jobOptions: "/api/v1/jobs/test/settings?category=default"}, elements: [], isConnected: true,
-    querySelector: (selector) => selector === "details" ? {addEventListener: (name, callback) => {events[name] = callback;}} : status,
+    querySelector: (selector) => selector === "details" ? {addEventListener: (name, callback) => {events[name] = callback;}}
+      : selector === "[data-use-category-options]" ? categoryButton : status,
     addEventListener: (name, callback) => {events[name] = callback;}};
   vm.runInNewContext(script, {
     document: {querySelector: () => form, addEventListener: (name, callback) => {events[name] = callback;}},
-    window: {addEventListener: (name, callback) => {events[name] = callback;}, location: {assign: (url) => navigations.push(url)}},
-    fetch: async (url, options) => {requests.push([url, {...options, body: JSON.parse(options.body)}]); return fetch(url, options);},
+    window: {confirm: () => {throw new Error("Use category settings must not ask for confirmation");},
+      addEventListener: (name, callback) => {events[name] = callback;},
+      location: {assign: (url) => navigations.push(url), reload: () => reloads++}},
+    fetch: async (url, options) => {requests.push([url, {...options, ...(options.body ? {body: JSON.parse(options.body)} : {})}]); return fetch(url, options);},
     setTimeout: (callback, delay) => {assert.equal(delay, 250); timers.set(++timer, callback); return timer;},
     clearTimeout: (id) => timers.delete(id),
   });
-  return {form, events, requests, status, timers, navigations,
+  return {form, events, requests, status, timers, navigations, categoryButton,
+    useCategory: () => events.useCategory(), reloads: () => reloads,
     change: (input) => events.change({target: input}), type: (input) => events.input({target: input}),
     flush: async () => {for (const [id, callback] of [...timers]) {timers.delete(id); callback();} await settle();},
     click: async () => {let prevented = false; const link = {href: "/job/default/test/edit", hasAttribute: () => false};
@@ -128,4 +134,57 @@ test("clearing an unsaved key keeps the saved key and dismisses its failed edit"
 test("detached forms do not block navigation or unload", async () => {
   const page = setup(); page.type(field("lama_workers", 4, "number")); page.form.isConnected = false;
   assert.equal(await page.click(), false); assert.equal(page.unload(), false);
+});
+
+test("Use category settings discards pending invalid input and reloads saved values", async () => {
+  const page = setup();
+  page.type(field("lama_workers", "", "number", false));
+  await page.useCategory();
+  assert.deepEqual(page.requests.map(([url, request]) => [url, request.method]), [
+    ["/api/v1/jobs/test/settings/use-category?category=default", "POST"],
+  ]);
+  assert.equal(page.requests[0][1].credentials, "same-origin");
+  assert.equal(page.timers.size, 0);
+  assert.equal(page.reloads(), 1);
+  await page.flush();
+  assert.equal(page.requests.length, 1);
+});
+
+test("Use category settings waits for in-flight saves and blocks edits or navigation", async () => {
+  let releaseSave, releaseReset;
+  const page = setup((_url, request) => new Promise(resolve => {
+    if (request.method === "PATCH") releaseSave = () => resolve({ok: true});
+    else releaseReset = () => resolve({ok: true});
+  }));
+  const control = field("lama_workers", 2, "number");
+  control.disabled = false;
+  page.form.elements = [control];
+  page.change(control); await settle();
+  const resetting = page.useCategory(); await settle();
+  assert.equal(page.requests.length, 1);
+  assert.equal(control.disabled, true);
+  assert.equal(page.categoryButton.disabled, true);
+  assert.equal(page.unload(), true);
+  assert.equal(await page.click(), true);
+  assert.equal(page.navigations.length, 0);
+  page.type(field("lama_workers", 9, "number"));
+  await page.useCategory();
+  releaseSave(); await settle();
+  assert.equal(page.requests.length, 2);
+  releaseReset(); await resetting;
+  assert.equal(page.reloads(), 1);
+  assert.equal(control.disabled, false);
+  assert.equal(page.categoryButton.disabled, false);
+});
+
+test("Use category settings reports errors without reloading and allows retry without confirmation", async () => {
+  let fail = true;
+  const page = setup(() => ({ok: !fail, text: async () => '{"error":{"message":"Job is running."}}'}));
+  await page.useCategory();
+  assert.equal(page.status.textContent, "Job is running.");
+  assert.equal(page.reloads(), 0);
+  assert.equal(page.categoryButton.disabled, false);
+  fail = false;
+  await page.useCategory();
+  assert.equal(page.reloads(), 1);
 });

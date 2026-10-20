@@ -285,6 +285,11 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         manager.validate_category(code)
         return manager.load_category_advanced_options(code)
 
+    @router.post("/categories/{code}/settings/apply-to-queued")
+    async def apply_category_settings(request: Request, code: str):
+        updated = get_manager(request).apply_category_options_to_queue(code)
+        return {"updated": updated, "count": len(updated)}
+
     @router.patch("/categories/{code}/settings")
     async def update_category_settings(request: Request, code: str, data: CategorySettings):
         manager = get_manager(request)
@@ -309,7 +314,7 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         values = [job for code in codes for job in manager.public_category_jobs(code)["jobs"]
                   if state is None or job["status"] == state]
         fields = {"category", "jobId", "jobName", "translatedJobName", "status", "phase", "page", "message",
-                  "createdAt", "age", "elapsed", "seriesId", "chapterOrder", "hasDownload", "ocrReviewCheckpoint"}
+                  "createdAt", "age", "elapsed", "seriesId", "chapterOrder", "hasDownload", "ocrReviewCheckpoint", "exportsRunning"}
         return {"jobs": [{key: value for key, value in job.items() if key in fields} for job in values]}
 
     @router.post("/jobs", status_code=201)
@@ -357,9 +362,17 @@ def install_control_api(app, get_manager, resolve_settings, save_upload, validat
         manager = get_manager(request)
         code = find_job(manager, job_id, category)
         changes = data.changes()
-        options = resolve_settings(manager, code, changes, job_id, require_model=False)
-        manager.update_job_advanced_options(code, job_id, **options,
-            clear_vlm_auth_token=data.clear_vlm_auth_token, clear_paddleocr_vl_auth_token=data.clear_paddleocr_vl_auth_token)
+        with manager._lock:
+            options = resolve_settings(manager, code, changes, job_id, require_model=False)
+            manager.update_job_advanced_options(code, job_id, **options,
+                clear_vlm_auth_token=data.clear_vlm_auth_token, clear_paddleocr_vl_auth_token=data.clear_paddleocr_vl_auth_token)
+        return manager.public_status(code, job_id, include_log=False)
+
+    @router.post("/jobs/{job_id}/settings/use-category")
+    async def use_category_settings(request: Request, job_id: str, category: str | None = None):
+        manager = get_manager(request)
+        code = find_job(manager, job_id, category)
+        manager.use_category_options_for_job(code, job_id)
         return manager.public_status(code, job_id, include_log=False)
 
     @router.post("/jobs/{job_id}/restart")

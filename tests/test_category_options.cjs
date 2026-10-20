@@ -10,21 +10,25 @@ const settle = () => new Promise((resolve) => setImmediate(resolve));
 const input = (name, value, type = "number", valid = true) => ({name, value: String(value), type,
   checked: value, checkValidity: () => valid});
 
-function setup(fetch = async () => ({ok: true})) {
+function setup(fetch = async () => ({ok: true, json: async () => ({count: 3})}), confirm = () => true) {
   const events = {}, requests = [], timers = new Map(), status = {textContent: ""};
+  const queueStatus = {textContent: ""};
+  const button = {disabled: false, addEventListener: (name, handler) => { events.apply = handler; }};
   let nextTimer = 0;
   const form = {dataset: {categoryOptions: "shorties"},
     querySelector: (selector) => selector === "details"
-      ? {addEventListener: (name, handler) => { events[name] = handler; }} : status,
+      ? {addEventListener: (name, handler) => { events[name] = handler; }}
+      : selector === "[data-apply-to-queued]" ? button
+      : selector === "[data-queue-options-status]" ? queueStatus : status,
     addEventListener: (name, handler) => { events[name] = handler; }};
   vm.runInNewContext(script, {
     document: {querySelector: () => form},
-    window: {addEventListener: (name, handler) => { events[name] = handler; }},
-    fetch: async (url, options) => { requests.push([url, {...options, body: JSON.parse(options.body)}]); return fetch(url, options); },
+    window: {confirm, addEventListener: (name, handler) => { events[name] = handler; }},
+    fetch: async (url, options) => { requests.push([url, {...options, ...(options.body ? {body: JSON.parse(options.body)} : {})}]); return fetch(url, options); },
     setTimeout: (callback, delay) => { assert.equal(delay, 250); timers.set(++nextTimer, callback); return nextTimer; },
     clearTimeout: (id) => timers.delete(id),
   });
-  return {status, requests, timers,
+  return {status, queueStatus, button, requests, timers, apply: () => events.apply(),
     change: (target) => events.change({target}),
     type: (target) => events.input({target}),
     flush: async () => { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } await settle(); },
@@ -46,6 +50,62 @@ test("all three worker counts save without an upload or model", async () => {
   }
   assert.equal(page.status.textContent, "Advanced options saved.");
   assert.equal(page.unload(), false);
+});
+
+test("bulk apply flushes pending edits before applying saved category settings", async () => {
+  const page = setup();
+  page.type(input("ocr_page_workers", 4));
+  await page.apply();
+  assert.deepEqual(page.requests.map(([url, request]) => [url, request.method]), [
+    ["/api/v1/categories/shorties/settings", "PATCH"],
+    ["/api/v1/categories/shorties/settings/apply-to-queued", "POST"],
+  ]);
+  assert.equal(page.requests[1][1].credentials, "same-origin");
+  assert.match(page.queueStatus.textContent, /Updated 3 queued/);
+  assert.equal(page.button.disabled, false);
+});
+
+test("bulk apply waits for in-flight saves and refuses invalid settings", async () => {
+  let release;
+  const page = setup((_url, request) => request.method === "PATCH"
+    ? new Promise(resolve => { release = () => resolve({ok: true}); })
+    : {ok: true, json: async () => ({count: 1})});
+  page.change(input("lama_workers", 4));
+  await settle();
+  const applying = page.apply();
+  await settle();
+  assert.equal(page.requests.length, 1);
+  assert.equal(page.button.disabled, true);
+  release(); await applying;
+  assert.equal(page.requests.length, 2);
+  page.change(input("lama_workers", 0, "number", false));
+  await page.apply();
+  assert.equal(page.requests.length, 2);
+  assert.match(page.queueStatus.textContent, /Save valid/);
+});
+
+test("bulk apply stops after save errors or cancelled confirmation", async () => {
+  const page = setup(() => ({ok: false, status: 500}));
+  page.type(input("lama_workers", 4));
+  await page.apply();
+  assert.equal(page.requests.length, 1);
+  assert.match(page.queueStatus.textContent, /Save valid/);
+  const cancelled = setup(undefined, () => false);
+  await cancelled.apply();
+  assert.equal(cancelled.requests.length, 0);
+  assert.equal(cancelled.button.disabled, false);
+});
+
+test("bulk apply displays server errors and permits a retry", async () => {
+  let fail = true;
+  const page = setup(() => ({ok: !fail, json: async () => fail
+    ? {error: {message: "Unknown category."}} : {count: 0}}));
+  await page.apply();
+  assert.equal(page.queueStatus.textContent, "Unknown category.");
+  assert.equal(page.button.disabled, false);
+  fail = false;
+  await page.apply();
+  assert.match(page.queueStatus.textContent, /Updated 0 queued/);
 });
 
 test("false flags, zero thinking tokens, empty notes and model are saved explicitly", async () => {

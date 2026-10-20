@@ -58,7 +58,8 @@ Login offers Remember session for 30 days, including server restarts. Leave it
 unchecked on shared devices. Logout revokes that session; a password change
 revokes all browser sessions. Only token hashes are saved in the private web state.
 
-Stopped jobs save Advanced Options automatically. Opening the editor waits for
+Queued and stopped jobs save Advanced Options automatically; running jobs cannot
+change them. Opening the editor waits for
 pending saves; a failed save keeps you on the job page. OCR checks the inference
 server's model list before local model setup. When Tetolate runs on the host,
 use the OCR container's published host port, not its container-network name.
@@ -91,6 +92,16 @@ parallel workers. Wait for “Advanced options saved” before leaving. Defaults
 can be saved before selecting a model; new jobs still need one. Auth tokens
 keep their separate test/upload save behavior.
 
+Jobs copy defaults when queued. To update an existing queue, use **Apply saved
+settings to queued jobs** in the category Advanced Options, or run
+`python tetolate_cli.py categories apply-to-queued CATEGORY`. This replaces
+queued-job options but keeps translation notes, chapter order, and queue position.
+Running jobs are not changed. You can also edit one queued job's Advanced Options.
+Use **Copy from Category Settings** in a job's Advanced Options to replace only that
+job's settings with its category defaults. Translation notes stay unchanged.
+Saved job keys stay with the same endpoint; changing an endpoint removes its old
+job key. Set a new OCR key on each job if required.
+
 Use `schema --json` for endpoint and settings schemas. Settings use snake_case
 names, such as `vlm_model`, `pause_after_ocr`, and `ocr_page_workers`. Partial updates
 keep other settings. For example:
@@ -108,6 +119,15 @@ and `export` accept `--timeout` and `--interval`; `--request-timeout` limits eac
 HTTP request. A paused job returns an error so an agent can request OCR review or
 resume. Export reuses an existing archive; use `--regenerate` to replace it and
 apply new title options.
+
+CBZ exports start independently of the translation queue and its pause setting.
+Different jobs and formats can export at the same time. Each export uses a copy
+of the current pages; reruns discard outdated exports. Duplicate requests for
+the same job and format are rejected while it is generating. Job details expose
+per-format `exports` state (`generating`, `complete`, `failed`, or `cancelled`)
+and `exportsRunning`. Export failures do not fail the translation job.
+CLI `export` waits for that format, then downloads it; its timeout does not cancel
+server work. Interrupted exports must be generated again after a server restart.
 
 Non-editor web actions are available through the CLI. `jobs submit --images`
 keeps file order and converts pages to PNG. `series upload` validates the whole

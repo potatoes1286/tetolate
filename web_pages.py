@@ -203,6 +203,8 @@ CATEGORY_OPTIONS_SCRIPT = """
   const form = document.querySelector("form[data-category-options]");
   if (!form) return;
   const status = form.querySelector("[data-category-options-status]");
+  const applyButton = form.querySelector("[data-apply-to-queued]");
+  const queueStatus = form.querySelector("[data-queue-options-status]");
   const names = {
     enable_alt_placement: "alt_placement_enabled", enable_proofreading: "proofread_translations",
     enable_translation_notes: "write_translation_notes", auto_translate_comicinfo_title: "auto_translate_comicinfo_title",
@@ -254,6 +256,27 @@ CATEGORY_OPTIONS_SCRIPT = """
     });
   }
   const options = form.querySelector("details");
+  if (applyButton) applyButton.addEventListener("click", async () => {
+    applyButton.disabled = true;
+    queueStatus.textContent = "";
+    try {
+      do {
+        for (const input of [...timers.keys()]) save(input);
+        await pending;
+      } while (active || timers.size);
+      if (failed.size) throw new Error("Save valid advanced options before applying them to queued jobs.");
+      if (!window.confirm("Replace advanced options for all queued jobs in this category with the saved category settings? Running jobs and translation notes will not change.")) return;
+      queueStatus.textContent = "Updating queued jobs...";
+      const response = await fetch(`/api/v1/categories/${encodeURIComponent(form.dataset.categoryOptions)}/settings/apply-to-queued`, {
+        method: "POST", credentials: "same-origin",
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error?.message || data.detail || `HTTP ${response.status}`);
+      queueStatus.textContent = `Updated ${data.count} queued job(s). Running jobs were not changed.`;
+    } catch (error) {
+      queueStatus.textContent = error instanceof Error ? error.message : String(error);
+    } finally { applyButton.disabled = false; }
+  });
   options.addEventListener("change", (event) => save(event.target));
   options.addEventListener("input", (event) => {
     const input = event.target;
@@ -290,13 +313,14 @@ function initJobOptions() {
     vlm_auth_token: "vlm_auth_token", paddleocr_vl_auth_token: "paddleocr_vl_auth_token",
     clear_vlm_auth_token: "clear_vlm_auth_token", clear_paddleocr_vl_auth_token: "clear_paddleocr_vl_auth_token",
   };
-  let pending = Promise.resolve(), active = 0;
+  let pending = Promise.resolve(), active = 0, replacing = false;
   const timers = new Map(), sent = new Map(), versions = new Map(), failed = new Map();
   function updateStatus() {
     if (!active && !timers.size) status.textContent = failed.size
       ? `Not saved: ${[...failed.values()].join(" ")}` : "Advanced options saved.";
   }
   function save(input) {
+    if (replacing) return;
     const name = names[input.name];
     if (!name) return;
     clearTimeout(timers.get(input)); timers.delete(input);
@@ -336,8 +360,42 @@ function initJobOptions() {
     return !failed.size;
   }
   const options = form.querySelector("details");
+  const categoryButton = form.querySelector("[data-use-category-options]");
+  if (categoryButton) categoryButton.addEventListener("click", async () => {
+    if (replacing) return;
+    replacing = true;
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+    const controls = [...form.elements].map(input => [input, input.disabled]);
+    for (const [input] of controls) input.disabled = true;
+    categoryButton.disabled = true;
+    try {
+      await pending;
+      status.textContent = "Using category settings...";
+      const [path, query] = form.dataset.jobOptions.split("?");
+      const response = await fetch(path + "/use-category" + (query ? "?" + query : ""), {
+        method: "POST", credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        let message = `HTTP ${response.status}`;
+        try { const data = JSON.parse(body); message = data.error?.message || data.detail || message; } catch {}
+        throw new Error(message);
+      }
+      failed.clear();
+      replacing = false;
+      window.location.reload();
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      replacing = false;
+      for (const [input, disabled] of controls) input.disabled = disabled;
+      categoryButton.disabled = false;
+    }
+  });
   options.addEventListener("change", (event) => save(event.target));
   options.addEventListener("input", (event) => {
+    if (replacing) return;
     const input = event.target;
     if (!names[input.name]) return;
     clearTimeout(timers.get(input));
@@ -351,15 +409,16 @@ function initJobOptions() {
   document.addEventListener("click", async (event) => {
     const link = event.target.closest("a[href]");
     if (!form.isConnected || !link || event.defaultPrevented || event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey
-        || link.target || link.hasAttribute("download") || !(active || timers.size || failed.size)) return;
+        || link.target || link.hasAttribute("download") || !(replacing || active || timers.size || failed.size)) return;
     event.preventDefault();
+    if (replacing) return;
     if (!await finishSaving()) { updateStatus(); return; }
     window.location.assign(link.href);
   });
   window.addEventListener("beforeunload", (event) => {
     if (!form.isConnected) return;
     flush();
-    if (active || failed.size) { event.preventDefault(); event.returnValue = ""; }
+    if (replacing || active || failed.size) { event.preventDefault(); event.returnValue = ""; }
   });
 }
 initJobOptions();
@@ -432,7 +491,6 @@ def admin_login_page(message: str = "") -> HTMLResponse:
 <form action="/admin/login" method="post">
   <label>Password<br><input name="password" type="password" required autocomplete="current-password"></label>
   <label><input name="remember_session" type="checkbox" value="1"> Remember session (30 days)</label>
-  <p class="muted">Use only on a device you trust. Log out to remove the remembered session.</p>
   <button type="submit">Log in</button>
 </form>
 """,
@@ -696,14 +754,24 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         mode = CBZ_TITLE_MODE_ORIGINAL
     selected = " checked" if status.get("cbzAltTitleInNotes") else ""
     export_buttons: list[str] = []
+    exports = status.get("exports", {})
     for variant, label in generate_labels.items():
         item = downloads.get(variant)
         available = bool(item.get("available")) if isinstance(item, dict) else bool(item)
         action = f"Regenerate {label.removeprefix('Generate ')}" if available else label
+        generating = exports.get(variant, {}).get("status") == "generating"
+        if generating:
+            action = f"Generating {variant.upper()} CBZ..."
+        disabled = " disabled" if generating else ""
         regenerate_attribute = ' name="regenerate" value="1"' if available else ""
         export_buttons.append(
-            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}>{escape(action)}</button>'
+            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}{disabled}>{escape(action)}</button>'
         )
+    export_messages = "".join(
+        f'<p class="muted">{escape(variant.upper())}: {escape(str(item.get("message", "")))}'
+        f'{(" Warning: " + escape(str(item["warning"]))) if item.get("warning") else ""}</p>'
+        for variant, item in exports.items()
+    )
     export_html = f"""
 <details>
   <summary>CBZ export</summary>
@@ -714,6 +782,7 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
     </select></label>
     <label><input name="alt_title_in_notes" type="checkbox" value="1"{selected}> Add the alternate title to ComicInfo notes</label>
     <p>{" ".join(export_buttons)}</p>
+    {export_messages}
   </form>
 </details>
 """
@@ -899,7 +968,10 @@ def advanced_options_fields(
         else ""
     )
     autosave_html = ('<p class="muted" data-category-options-status role="status">'
-                     'Options save automatically, except auth tokens.</p>' if autosave else "")
+                     'Options save automatically, except auth tokens.</p>'
+                     '<p class="muted">New jobs copy these settings when queued. Existing jobs keep their saved settings.</p>'
+                     '<button type="button" data-apply-to-queued>Apply saved settings to queued jobs</button>'
+                     '<p class="muted" data-queue-options-status role="status"></p>' if autosave else "")
     return f"""
 <details{open_attr}>
   <summary>{escape(summary)}</summary>
@@ -951,6 +1023,7 @@ def advanced_options_fields(
     <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
 </fieldset>
   {submit_button_html}
+  {'<button type="button" data-use-category-options>Copy from Category Settings</button>' if test_job_id else ''}
 </details>
 """
 
@@ -1207,7 +1280,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
       test_job_id=job_id,
-      submit_label="Save advanced options",
+      submit_label="Copy to Category Settings",
   )}
 </form>
 """
@@ -1328,9 +1401,7 @@ function htmlEscape(value) {{
 function restartMarkup(data) {{
   if (!data.canRestart) return "";
   let target = "from the beginning";
-  if (data.restartResumeFrom === "package") {{
-    target = "from package";
-  }} else if (data.restartResumeFrom) {{
+  if (data.restartResumeFrom) {{
     target = `from ${{data.restartResumeFrom}} page ${{data.restartResumePage ?? 0}}`;
   }}
   const label = data.ocrReviewCheckpoint ? "Continue processing" : "Restart run";
@@ -1388,11 +1459,13 @@ function downloadMarkup(data) {{
   const exportButtons = Object.keys(generateLabels).map((variant) => {{
     const item = downloads[variant];
     const available = item && (typeof item !== "object" || item.available);
-    const label = available ? regenerateLabels[variant] : generateLabels[variant];
+    const generating = data.exports?.[variant]?.status === "generating";
+    const label = generating ? `Generating ${{variant.toUpperCase()}} CBZ...` : (available ? regenerateLabels[variant] : generateLabels[variant]);
     const regenerateAttribute = available ? ' name="regenerate" value="1"' : "";
-    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}>${{label}}</button>`;
+    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}${{generating ? " disabled" : ""}}>${{label}}</button>`;
   }}).join(" ");
-  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p></form></details>`;
+  const exportMessages = Object.entries(data.exports || {{}}).map(([variant, item]) => `<p class="muted">${{htmlEscape(variant.toUpperCase())}}: ${{htmlEscape(item.message)}}${{item.warning ? " Warning: " + htmlEscape(item.warning) : ""}}</p>`).join("");
+  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p>${{exportMessages}}</form></details>`;
   return summaryHtml + linksHtml + exportHtml;
 }}
 function deleteMarkup(data) {{
@@ -1472,7 +1545,8 @@ function advancedOptionsMarkup(data) {{
         <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label>
         <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
       </fieldset>
-      <button type="submit">Save advanced options</button>
+      <button type="submit">Copy to Category Settings</button>
+      <button type="button" data-use-category-options>Copy from Category Settings</button>
     </details></form>`;
 }}
 function rerunJobMarkup(data) {{
@@ -1508,7 +1582,10 @@ async function refreshStatus() {{
   const keepAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
   log.textContent = (data.recentLog || []).join("\\n");
   if (keepAtBottom) log.scrollTop = log.scrollHeight;
-  document.getElementById("download").innerHTML = downloadMarkup(data);
+  const downloads = document.getElementById("download");
+  const exportOpen = downloads.querySelector("details")?.open;
+  downloads.innerHTML = downloadMarkup(data);
+  if (exportOpen && downloads.querySelector("details")) downloads.querySelector("details").open = true;
   document.getElementById("title-settings").innerHTML = titleSettingsMarkup(data);
   document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
   if (!(previousStatus === "complete" && data.status === "complete")) {{
@@ -1525,7 +1602,7 @@ async function refreshStatus() {{
     document.getElementById("rerun-job").innerHTML = rerunJobMarkup(data);
     document.getElementById("delete").innerHTML = deleteMarkup(data);
   }}
-  if (data.status === "complete" || data.status === "failed" || data.status === "cancelled" || (data.status === "paused" && data.canRestart)) {{
+  if (!data.exportsRunning && (data.status === "complete" || data.status === "failed" || data.status === "cancelled" || (data.status === "paused" && data.canRestart))) {{
     window.clearInterval(statusTimer);
   }}
 }}

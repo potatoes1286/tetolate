@@ -216,6 +216,74 @@ class ControlAPITests(unittest.TestCase):
 
         self.run_http(exercise)
 
+    def test_queued_job_settings_and_bulk_category_settings(self):
+        async def exercise(client):
+            for job_id, state in (("00000001", "queued"), ("00000002", "queued"), ("00000003", "running")):
+                self.manager.job_dir("default", job_id).mkdir(parents=True)
+                self.manager.save_status("default", job_id, {"status": state, "ocrPageWorkers": 1})
+            response = await client.patch("/api/v1/jobs/00000001/settings?category=default",
+                                          json={"ocr_page_workers": 2})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["ocrPageWorkers"], 2)
+            self.assertTrue(response.json()["canUpdateAdvancedOptions"])
+            response = await client.patch("/api/v1/categories/default/settings", json={
+                "paddleocr_vl_server_url": "http://127.0.0.1:8081/v1", "ocr_page_workers": 4,
+                "lama_workers": 3, "imagemagick_workers": 2})
+            self.assertEqual(response.status_code, 200, response.text)
+            response = await client.post("/api/v1/categories/default/settings/apply-to-queued")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(set(response.json()["updated"]), {"00000001", "00000002"})
+            self.assertEqual(response.json()["count"], 2)
+            self.assertEqual(self.manager.load_status("default", "00000003")["ocrPageWorkers"], 1)
+            command = self.manager.build_command("default", "00000002")
+            self.assertEqual(command[command.index("--ocr-workers") + 1], "4")
+            response = await client.patch("/api/v1/jobs/00000003/settings", json={"ocr_page_workers": 4})
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("running", response.json()["error"]["message"])
+            response = await client.post("/api/v1/categories/missing/settings/apply-to-queued")
+            self.assertEqual(response.status_code, 404)
+        self.run_http(exercise)
+
+    def test_job_can_replace_options_with_its_category_settings(self):
+        async def exercise(client):
+            self.manager.job_dir("default", "00000001").mkdir(parents=True)
+            self.manager.save_status("default", "00000001", {"status": "queued", "ocrPageWorkers": 4})
+            response = await client.post("/api/v1/jobs/00000001/settings/use-category?category=default")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["ocrPageWorkers"], 1)
+            self.assertEqual(response.json()["status"], "queued")
+            status = self.manager.load_status("default", "00000001")
+            status["status"] = "running"
+            self.manager.save_status("default", "00000001", status)
+            self.assertEqual((await client.post("/api/v1/jobs/00000001/settings/use-category")).status_code, 400)
+            self.assertEqual((await client.post("/api/v1/jobs/99999999/settings/use-category")).status_code, 404)
+        self.run_http(exercise)
+
+    def test_job_category_replacement_requires_write_authentication(self):
+        async def exercise(client):
+            url = "/api/v1/jobs/00000001/settings/use-category?category=default"
+            readonly = self.manager.create_control_token("reader", read_only=True)["token"]
+            self.assertEqual((await client.post(url, headers={"Authorization": "Bearer " + readonly})).status_code, 403)
+            client.headers.pop("Authorization")
+            self.assertEqual((await client.post(url)).status_code, 401)
+            client.cookies.set(web_app.ADMIN_COOKIE_NAME, self.manager.create_admin_session())
+            self.assertEqual((await client.post(url, headers={"Origin": "http://other.example"})).status_code, 403)
+        self.run_http(exercise)
+
+    def test_bulk_category_settings_requires_write_authentication(self):
+        async def exercise(client):
+            url = "/api/v1/categories/default/settings/apply-to-queued"
+            readonly = self.manager.create_control_token("reader", read_only=True)["token"]
+            response = await client.post(url, headers={"Authorization": "Bearer " + readonly})
+            self.assertEqual(response.status_code, 403)
+            client.headers.pop("Authorization")
+            self.assertEqual((await client.post(url)).status_code, 401)
+            session = self.manager.create_admin_session()
+            client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+            self.assertEqual((await client.post(url, headers={"Origin": "http://other.example"})).status_code, 403)
+            self.assertEqual((await client.post(url)).json(), {"updated": [], "count": 0})
+        self.run_http(exercise)
+
     def test_submit_settings_jobs_and_actions_share_manager_state(self):
         async def exercise(client):
             response = await client.patch("/api/v1/categories/default/settings", json={"vlm_model": "chosen", "vlm_auth_token": "private-vlm-key"})

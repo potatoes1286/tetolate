@@ -62,6 +62,7 @@ import web_security
 from web_series import SeriesManagerMixin, chapter_filename_key, chapter_order
 from web_storage import write_json_atomic
 from web_control_auth import ControlAuthMixin
+from web_exports import ExportManagerMixin
 
 
 LOGGER = logging.getLogger(__name__)
@@ -236,7 +237,6 @@ RESUME_PHASE_BY_PROGRESS = {
     "Placement style": "placements",
     "Clean": "render",
     "Render": "render",
-    "Package": "package",
 }
 RESUME_PHASES = frozenset(RESUME_PHASE_BY_PROGRESS.values())
 TERMINAL_JOB_STATUSES = frozenset(("complete", "failed", "cancelled"))
@@ -1310,7 +1310,6 @@ def parse_progress_line(line: str) -> tuple[str, int | None] | None:
         (re.compile(r"^VLM style placement page (\d+)"), "Placement style"),
         (re.compile(r"^Clean page (\d+)"), "Clean"),
         (re.compile(r"^Render page (\d+)"), "Render"),
-        (re.compile(r"^Wrote .+translated\.cbz"), "Package"),
     )
     for pattern, phase in patterns:
         match = pattern.search(line)
@@ -1323,7 +1322,7 @@ def parse_progress_line(line: str) -> tuple[str, int | None] | None:
 
 def progress_resume_target(phase: Any, page: Any) -> tuple[str, int] | None:
     resume_from = RESUME_PHASE_BY_PROGRESS.get(str(phase))
-    if resume_from in {"proofreading", "translation_notes", "package"}:
+    if resume_from in {"proofreading", "translation_notes"}:
         return stored_resume_target(resume_from, 0)
     return stored_resume_target(resume_from, page)
 
@@ -1331,7 +1330,7 @@ def progress_resume_target(phase: Any, page: Any) -> tuple[str, int] | None:
 def stored_resume_target(resume_from: Any, page: Any) -> tuple[str, int] | None:
     if resume_from not in RESUME_PHASES:
         return None
-    if resume_from in {"proofreading", "translation_notes", "package"}:
+    if resume_from in {"proofreading", "translation_notes"}:
         return resume_from, 0
     if page is None:
         return None
@@ -1412,17 +1411,19 @@ def optional_non_negative_int(value: Any, label: str) -> int | None:
     return parsed
 
 
-class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
+class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, ExportManagerMixin):
     def __init__(self, config: WebConfig) -> None:
         self.config = config
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._queued_jobs: set[tuple[str, str]] = set()
+        self._starting_jobs: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
         self._pause_condition = threading.Condition(self._lock)
         self._paused = False
         self._stopping = False
         self._active_processes: dict[tuple[str, str], subprocess.Popen[str]] = {}
         self._worker: threading.Thread | None = None
+        self._export_threads: set[threading.Thread] = set()
         self._password_hash = ""
         self._local_cli_token = ""
         self._categories: set[str] = set()
@@ -1441,6 +1442,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         self.acquire_instance_lock()
         try:
             self.initialize_web_state()
+            self.recover_interrupted_exports()
             self.requeue_interrupted_jobs()
             self._worker = threading.Thread(
                 target=self.worker_loop,
@@ -1474,6 +1476,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         self._queue.put(None)
         if self._worker is not None:
             self._worker.join(timeout=5)
+        export_deadline = time.monotonic() + 5
+        for thread in list(self._export_threads):
+            thread.join(timeout=max(0, export_deadline - time.monotonic()))
         with self._editor_lama_lock:
             if self._editor_lama_session is not None:
                 self._editor_lama_session.close()
@@ -2495,11 +2500,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             downloads[variant] = info
         return downloads
 
-    def invalidate_translated_cbz_archives(self, code: str, job_id: str) -> None:
-        """Remove archives whose rendered page inputs are no longer current."""
-        for variant in TRANSLATED_CBZ_FILENAMES:
-            self.translated_cbz_variant_path(code, job_id, variant).unlink(missing_ok=True)
-
     def iter_job_ids(self, code: str) -> list[str]:
         jobs_path = self.jobs_dir(code)
         if not jobs_path.is_dir():
@@ -2556,40 +2556,16 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
     def pending_resume_target_for_status(self, status: dict[str, Any]) -> tuple[str, int] | None:
         return stored_resume_target(status.get("pendingResumeFrom"), status.get("pendingResumePage"))
 
-    def apply_pending_resume_target(
-        self,
-        status: dict[str, Any],
-        target: tuple[str, int] | None,
-    ) -> None:
+    def apply_pending_resume_target(self, status: dict[str, Any], target: tuple[str, int] | None) -> None:
         if target is None:
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             return
-
         resume_from, resume_page = target
         status["pendingResumeFrom"] = resume_from
         status["pendingResumePage"] = resume_page
         status["lastResumeFrom"] = resume_from
         status["lastResumePage"] = resume_page
-        if resume_from == "package":
-            status["pendingPackageOnly"] = True
-            status["pendingWebpQuality"] = quality_for_display(
-                status.get("webpQuality"),
-                self.config.default_webp_quality,
-            )
-            status["pendingJxlQuality"] = quality_for_display(
-                status.get("jxlQuality"),
-                self.config.default_jxl_quality,
-            )
-        else:
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
 
     def load_status(self, code: str, job_id: str) -> dict[str, Any] | None:
         path = self.status_path(code, job_id)
@@ -2771,6 +2747,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         )
         input_info = file_info(self.input_path(code, job_id))
         downloads = self.download_info(code, job_id)
+        exports = self.load_export_state(code, job_id)["variants"]
         original_page_count = len(self.original_page_files(code, job_id))
         final_page_count = (
             len(self.final_page_files(code, job_id))
@@ -2851,6 +2828,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             "canTranslateTitle": status_value not in {"queued", "running"} and not is_active,
             "canRerunPages": status.get("status") == "complete",
             "canGenerateDownloads": status.get("status") == "complete",
+            "exports": exports,
+            "exportsRunning": any(item.get("status") == "generating" for item in exports.values()),
             "canEdit": status.get("status") == "complete" or ocr_review_checkpoint,
             "ocrReviewCheckpoint": ocr_review_checkpoint,
             "webpQuality": webp_quality,
@@ -2908,7 +2887,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             "hasGeneratedTranslationNotes": bool(generated_translation_notes),
             "canUpdateAdvancedOptions": (
                 not is_active
-                and status_value not in {"queued", "running", "terminating"}
+                and (code, job_id) not in self._starting_jobs
+                and status_value in {"queued", "failed", "cancelled", "paused", "complete"}
             ),
             "restartResumeFrom": restart_target[0] if restart_target is not None else None,
             "restartResumePage": restart_target[1] if restart_target is not None else None,
@@ -3182,6 +3162,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         clear_vlm_auth_token: bool,
         clear_paddleocr_vl_auth_token: bool,
         auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+        remember_defaults: bool = True,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -3202,7 +3183,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if (code, job_id) in self._active_processes or status.get("status") not in {
+            if (code, job_id) in self._active_processes or (code, job_id) in self._starting_jobs or status.get("status") not in {
+                "queued",
                 "failed",
                 "cancelled",
                 "paused",
@@ -3210,13 +3192,15 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             }:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only completed, failed, cancelled, or paused jobs can update advanced options.",
+                    detail="Cannot change advanced options while the job is starting or running.",
                 )
             if self.status_vlm_base_url(status).rstrip("/") != vlm_base_url.rstrip("/"):
                 # A job's saved key belongs to its previous endpoint.
                 job_secrets = self.load_job_secrets(code, job_id)
                 job_secrets.pop("vlmAuthToken", None)
                 write_json_atomic(self.job_secrets_path(code, job_id), job_secrets, mode=0o600)
+            if self.status_paddleocr_vl_server_url(status).rstrip("/") != paddleocr_vl_server_url.rstrip("/"):
+                clear_paddleocr_vl_auth_token = not paddleocr_vl_auth_token
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
             status["vlmModel"] = vlm_model
@@ -3232,7 +3216,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             status["ocrPageWorkers"] = ocr_page_workers
             status["lamaWorkers"] = lama_workers
             status["imagemagickWorkers"] = imagemagick_workers
-            status["message"] = "Advanced options updated."
+            if status.get("status") != "queued":
+                status["message"] = "Advanced options updated."
             self.save_status(code, job_id, status)
             self.update_job_auth_tokens(
                 code,
@@ -3242,24 +3227,53 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 clear_vlm_auth_token=clear_vlm_auth_token,
                 clear_paddleocr_vl_auth_token=clear_paddleocr_vl_auth_token,
             )
-            self.remember_category_advanced_options(
-                code,
-                thinking_budget_tokens=thinking_budget_tokens,
-                vlm_base_url=vlm_base_url,
-                vlm_model=vlm_model,
-                pause_after_ocr=pause_after_ocr,
-                proofread_translations=proofread_translations,
-                write_translation_notes=write_translation_notes,
-                alt_placement_enabled=alt_placement_enabled,
-                source_language=source_language,
-                ocr_engine=ocr_engine,
-                paddleocr_vl_server_url=paddleocr_vl_server_url,
-                paddleocr_vl_model=paddleocr_vl_model,
-                ocr_page_workers=ocr_page_workers,
-                lama_workers=lama_workers,
-                imagemagick_workers=imagemagick_workers,
-                auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+            if remember_defaults:
+                self.remember_category_advanced_options(
+                    code,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    vlm_base_url=vlm_base_url,
+                    vlm_model=vlm_model,
+                    pause_after_ocr=pause_after_ocr,
+                    proofread_translations=proofread_translations,
+                    write_translation_notes=write_translation_notes,
+                    alt_placement_enabled=alt_placement_enabled,
+                    source_language=source_language,
+                    ocr_engine=ocr_engine,
+                    paddleocr_vl_server_url=paddleocr_vl_server_url,
+                    paddleocr_vl_model=paddleocr_vl_model,
+                    ocr_page_workers=ocr_page_workers,
+                    lama_workers=lama_workers,
+                    imagemagick_workers=imagemagick_workers,
+                    auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+                )
+
+    def use_category_options_for_job(self, code: str, job_id: str) -> None:
+        code = self.validate_category(code)
+        with self._lock:
+            options = resolve_control_settings(self, code, {}, require_model=False)
+            self.update_job_advanced_options(
+                code, job_id, **options,
+                clear_vlm_auth_token=False, clear_paddleocr_vl_auth_token=False,
+                remember_defaults=False,
             )
+
+    def apply_category_options_to_queue(self, code: str) -> list[str]:
+        code = self.validate_category(code)
+        with self._lock:
+            options = resolve_control_settings(self, code, {}, require_model=False)
+            updated = []
+            for job_id in self.iter_job_ids(code):
+                status = self.load_status(code, job_id)
+                key = (code, job_id)
+                if not status or status.get("status") != "queued" or key in self._starting_jobs or key in self._active_processes:
+                    continue
+                self.update_job_advanced_options(
+                    code, job_id, **options,
+                    clear_vlm_auth_token=False, clear_paddleocr_vl_auth_token=False,
+                    remember_defaults=False,
+                )
+                updated.append(job_id)
+            return updated
 
     def restart_failed_job(self, code: str, job_id: str) -> None:
         code = self.validate_category(code)
@@ -3337,30 +3351,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             if restart_target is not None:
                 status["pendingResumeFrom"] = restart_target[0]
                 status["pendingResumePage"] = restart_target[1]
-                if restart_target[0] == "package":
-                    status["pendingPackageOnly"] = True
-                    if status.get("pendingPackageVariant") not in TRANSLATED_CBZ_FILENAMES:
-                        status["pendingPackageVariant"] = "png"
-                    status["pendingWebpQuality"] = quality_for_display(
-                        status.get("webpQuality"),
-                        self.config.default_webp_quality,
-                    )
-                    status["pendingJxlQuality"] = quality_for_display(
-                        status.get("jxlQuality"),
-                        self.config.default_jxl_quality,
-                    )
-                else:
-                    status.pop("pendingPackageOnly", None)
-                    status.pop("pendingPackageVariant", None)
-                    status.pop("pendingWebpQuality", None)
-                    status.pop("pendingJxlQuality", None)
             else:
                 status.pop("pendingResumeFrom", None)
                 status.pop("pendingResumePage", None)
-                status.pop("pendingPackageOnly", None)
-                status.pop("pendingPackageVariant", None)
-                status.pop("pendingWebpQuality", None)
-                status.pop("pendingJxlQuality", None)
             self.save_status(code, job_id, status)
             self.enqueue(code, job_id)
 
@@ -3486,11 +3479,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                     "lastResumePage": first_rerun["page"],
                 }
             )
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             status.pop("pid", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
             if translation_boxno is None:
                 status.pop("pendingTranslationBoxno", None)
             else:
@@ -3552,83 +3541,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             daemon=True,
         ).start()
 
-    def generate_download(
-        self,
-        code: str,
-        job_id: str,
-        variant: str,
-        *,
-        title_mode: str = CBZ_TITLE_MODE_ORIGINAL,
-        alt_title_in_notes: bool = False,
-        regenerate: bool = False,
-    ) -> None:
-        code = self.validate_category(code)
-        job_id = self.validate_job_id(job_id)
-        if variant not in TRANSLATED_CBZ_FILENAMES:
-            raise HTTPException(status_code=404, detail="Unknown translated CBZ variant.")
-        with self._lock:
-            status = self.load_status(code, job_id)
-            if status is None:
-                raise HTTPException(status_code=404, detail="Unknown job.")
-            if status.get("status") in {"queued", "running"}:
-                raise HTTPException(status_code=409, detail="Job is already queued or running.")
-            if status.get("status") != "complete":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Only complete jobs can generate downloads.",
-                )
-            if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
-            if not self.output_dir(code, job_id).is_dir():
-                raise HTTPException(status_code=400, detail="Existing output directory is missing.")
-            if title_mode not in CBZ_TITLE_MODES:
-                raise HTTPException(status_code=400, detail="Unknown CBZ title mode.")
-            if (
-                self.translated_cbz_variant_path(code, job_id, variant).is_file()
-                and not regenerate
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="That CBZ already exists. Use the regenerate action to replace it.",
-                )
-
-            try:
-                package_count = int(status.get("packageGenerationCount", 0)) + 1
-            except (TypeError, ValueError):
-                package_count = 1
-
-            self.invalidate_translated_cbz_archives(code, job_id)
-            status.update(
-                {
-                    "status": "queued",
-                    "phase": "Queued",
-                    "page": None,
-                    "message": (
-                        f"Queued to generate {variant.upper()} CBZ download."
-                    ),
-                    "finishedAt": None,
-                    "returnCode": None,
-                    "packageGenerationCount": package_count,
-                    "pendingPackageOnly": True,
-                    "pendingPackageVariant": variant,
-                    "pendingWebpQuality": quality_for_display(
-                        status.get("webpQuality"), self.config.default_webp_quality
-                    ),
-                    "pendingJxlQuality": quality_for_display(
-                        status.get("jxlQuality"), self.config.default_jxl_quality
-                    ),
-                    "pendingResumeFrom": "package",
-                    "pendingResumePage": 0,
-                    "lastResumeFrom": "package",
-                    "lastResumePage": 0,
-                    "cbzTitleMode": title_mode,
-                    "cbzAltTitleInNotes": bool(alt_title_in_notes),
-                }
-            )
-            status.pop("pid", None)
-            status.pop("pendingPageReruns", None)
-        self.save_status(code, job_id, status)
-        self.enqueue(code, job_id)
 
     def request_vlm_title(
         self,
@@ -3769,7 +3681,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                         translated = ""
                     else:
                         status["translatedJobName"] = safe_job_name(translated, source_title)
-                    self.save_status(code, job_id, status)
                 except Exception as exc:
                     warning = f"Could not generate the translated title; using the original title: {exc}"
 
@@ -4054,13 +3965,13 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         resume_from: str | None = None,
         resume_page: int | None = None,
         single_page: bool = False,
-        skip_package: bool = False,
-        package_variant: str | None = None,
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
         translation_boxno: int | None = None,
         editor_stage_only: str | None = None,
     ) -> list[str]:
+        if resume_from == "package":
+            raise HTTPException(400, "CBZ exports run independently, not as pipeline jobs.")
         command = [
             sys.executable,
             str(self.config.translate_script),
@@ -4100,7 +4011,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                 ),
             ]
         )
-        if resume_from in {"render", "package"} or editor_stage_only == "ocr":
+        if resume_from == "render" or editor_stage_only == "ocr":
             model = self.status_vlm_model(status)
             if model:
                 command.extend(["--vlm-model", model])
@@ -4137,15 +4048,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             command.extend(["--webp-quality", str(webp_quality)])
         if jxl_quality is not None:
             command.extend(["--jxl-quality", str(jxl_quality)])
-        if package_variant is not None:
-            if package_variant not in TRANSLATED_CBZ_FILENAMES:
-                raise HTTPException(status_code=400, detail="Unknown translated CBZ variant.")
-            command.extend(["--package-variant", package_variant])
-        if resume_from == "package" and status.get("pendingComicInfoTitle") is not None:
-            command.extend(["--comicinfo-title", str(status.get("pendingComicInfoTitle") or "")])
-            command.extend(
-                ["--comicinfo-alt-title", str(status.get("pendingComicInfoAltTitle") or "")]
-            )
         if resume_from is None:
             if self.status_pause_after_ocr(status):
                 command.extend(["--stop-after", "ocr_merged"])
@@ -4156,7 +4058,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             return command
 
         command.extend(["--resume-from", resume_from])
-        if resume_from not in {"extract", "package"}:
+        if resume_from != "extract":
             command.extend(["--resume-page", str(resume_page or 0)])
         if single_page and resume_from in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             command.append("--single-page")
@@ -4164,8 +4066,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             command.extend(["--editor-stage-only", editor_stage_only])
         if translation_boxno is not None:
             command.extend(["--translation-boxno", str(translation_boxno)])
-        if skip_package or resume_from != "package":
-            command.append("--skip-package")
+        command.append("--skip-package")
         return command
 
     def run_pipeline_process(
@@ -4248,132 +4149,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
 
         return return_code
 
-    def run_package_generation_job(
-        self,
-        code: str,
-        job_id: str,
-        status: dict[str, Any],
-    ) -> None:
-        variant = str(status.get("pendingPackageVariant") or "")
-        if variant not in TRANSLATED_CBZ_FILENAMES:
-            status.update(
-                {
-                    "status": "failed",
-                    "phase": "Failed",
-                    "message": "No valid CBZ variant was selected for generation.",
-                    "finishedAt": now_utc(),
-                }
-            )
-            self.save_status(code, job_id, status)
-            return
-        webp_quality = quality_for_display(
-            status.get("pendingWebpQuality"),
-            self.config.default_webp_quality,
-        )
-        jxl_quality = quality_for_display(
-            status.get("pendingJxlQuality"),
-            self.config.default_jxl_quality,
-        )
-        selected_title, alt_title, title_warning = self.resolve_cbz_export_titles(
-            code,
-            job_id,
-            status,
-        )
-        if selected_title is not None:
-            status["pendingComicInfoTitle"] = selected_title
-            status["pendingComicInfoAltTitle"] = alt_title or ""
-        if title_warning:
-            status["titleTranslationWarning"] = title_warning
-        else:
-            status.pop("titleTranslationWarning", None)
-        start_active_runtime(status)
-        status.update(
-            {
-                "status": "running",
-                "phase": "Starting",
-                "page": None,
-                "message": (
-                    f"Generating {variant.upper()} CBZ download. {title_warning}"
-                    if title_warning
-                    else f"Generating {variant.upper()} CBZ download."
-                ),
-                "finishedAt": None,
-                "pendingResumeFrom": "package",
-                "pendingResumePage": 0,
-                "lastResumeFrom": "package",
-                "lastResumePage": 0,
-            }
-        )
-        self.save_status(code, job_id, status)
-
-        return_code = self.run_pipeline_process(
-            code,
-            job_id,
-            self.build_command(
-                code,
-                job_id,
-                "package",
-                0,
-                webp_quality=webp_quality,
-                jxl_quality=jxl_quality,
-                package_variant=variant,
-            ),
-            f"generate {variant} download",
-        )
-
-        status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
-        finished_at = datetime.now(timezone.utc)
-        stop_active_runtime(status, finished_at)
-        status["returnCode"] = return_code
-        status["finishedAt"] = finished_at.isoformat()
-        status["webpQuality"] = webp_quality
-        status["jxlQuality"] = jxl_quality
-        status.pop("pid", None)
-        status.pop("pendingTranslationBoxno", None)
-        was_terminated = bool(status.pop("pendingTermination", None))
-        status.pop("terminatingAt", None)
-        status.pop("isPaused", None)
-        status.pop("pausedAt", None)
-
-        if was_terminated:
-            status.update(
-                {
-                    "status": "cancelled",
-                    "phase": "Cancelled",
-                    "page": None,
-                    "message": "Download generation terminated.",
-                }
-            )
-        elif return_code == 0 and self.translated_cbz_variant_path(code, job_id, variant).is_file():
-            status.update(
-                {
-                    "status": "complete",
-                    "phase": "Complete",
-                    "page": None,
-                    "message": f"{variant.upper()} CBZ download generation complete.",
-                }
-            )
-            if title_warning:
-                status["message"] += f" Warning: {title_warning}"
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
-            status.pop("pendingResumeFrom", None)
-            status.pop("pendingResumePage", None)
-        else:
-            status.update(
-                {
-                    "status": "failed",
-                    "phase": "Failed",
-                    "message": f"Download generation failed with exit code {return_code}.",
-                }
-            )
-            status["pendingPackageOnly"] = True
-            status["pendingPackageVariant"] = variant
-            status["pendingResumeFrom"] = "package"
-            status["pendingResumePage"] = 0
-        self.save_status(code, job_id, status)
 
     def run_page_rerun_batch_job(
         self,
@@ -4455,7 +4230,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                     "pendingPageReruns": page_reruns[index - 1 :],
                 }
             )
-            status.pop("pendingPackageOnly", None)
             self.save_status(code, job_id, status)
             final_return_code = self.run_pipeline_process(
                 code,
@@ -4466,7 +4240,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
                     resume_from,
                     page,
                     single_page=True,
-                    skip_package=True,
                     translation_boxno=translation_boxno,
                     **({"editor_stage_only": page_rerun["editorStageOnly"]} if "editorStageOnly" in page_rerun else {}),
                 ),
@@ -4544,13 +4317,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
             status.pop("pendingPageReruns", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             status.pop("pendingEditorChangedPages", None)
             status.pop("pendingTranslationBoxno", None)
-        elif not status.get("pendingPackageOnly"):
+        else:
             remaining_reruns = status.get("pendingPageReruns")
             if (
                 isinstance(remaining_reruns, list)
@@ -4566,6 +4335,18 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         self.save_status(code, job_id, status)
 
     def run_job(self, code: str, job_id: str) -> None:
+        # Claim the job before reading its settings or making title-model calls.
+        # Queue edits use the same lock, so they cannot be lost during startup.
+        key = (code, job_id)
+        with self._lock:
+            self._starting_jobs.add(key)
+        try:
+            self._run_job(code, job_id)
+        finally:
+            with self._lock:
+                self._starting_jobs.discard(key)
+
+    def _run_job(self, code: str, job_id: str) -> None:
         status = self.load_status(code, job_id) or {
             "category": code,
             "jobId": job_id,
@@ -4573,9 +4354,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin):
         }
         if status.get("pendingFinishEdits"):
             self.run_finish_editor_edits(code, job_id)
-            return
-        if status.get("pendingPackageOnly"):
-            self.run_package_generation_job(code, job_id, status)
             return
 
         pending_page_reruns = status.get("pendingPageReruns")

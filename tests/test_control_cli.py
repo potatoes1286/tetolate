@@ -161,6 +161,26 @@ class CLITests(unittest.TestCase):
         self.assertIn(b'name="file"; filename="book.cbz"', chunks[0])
         self.assertEqual(b"".join(chunks[1:-1]), path.read_bytes())
 
+    def test_export_wait_uses_variant_state_not_completed_job_state(self):
+        args = SimpleNamespace(job_id="12345678", category=None, format="png", timeout=1, interval=0.1)
+        client = mock.Mock(timeout=30)
+        client.request.side_effect = [
+            {"status": "complete", "exports": {"png": {"status": "generating"}}, "downloads": {}},
+            {"status": "complete", "exports": {"png": {"status": "complete"}}, "downloads": {"png": {"available": True}}},
+        ]
+        with mock.patch.object(cli.time, "sleep"):
+            result = cli.wait_export(client, args, deadline=cli.time.monotonic() + 1)
+        self.assertTrue(result["downloads"]["png"]["available"])
+        self.assertEqual(client.request.call_count, 2)
+        client.request.side_effect = None
+        for state in ("failed", "cancelled"):
+            client.request.return_value = {"status": "complete", "exports": {"png": {"status": state, "message": "Encoding failed"}}}
+            with self.assertRaisesRegex(cli.ClientError, "Encoding failed"):
+                cli.wait_export(client, args, deadline=cli.time.monotonic() + 1)
+        with self.assertRaises(cli.ClientError) as error:
+            cli.wait_export(client, args, deadline=cli.time.monotonic() - 1)
+        self.assertEqual(error.exception.exit_code, cli.EXIT_TIMEOUT)
+
     def test_wait_returns_terminal_failure_pause_and_timeout_codes(self):
         args = SimpleNamespace(job_id="12345678", category=None, timeout=1, interval=0.1)
         client = mock.Mock(timeout=30)
@@ -227,6 +247,10 @@ class CLITests(unittest.TestCase):
         client = client or mock.Mock(token="test-token", server="http://localhost:8088", timeout=30)
         result = cli.execute(client, args, self.root / "cli.json", {})
         return client, result
+
+    def test_apply_category_settings_to_queued_jobs(self):
+        client, _ = self.execute(["categories", "apply-to-queued", "akugyaku-seijo"])
+        client.request.assert_called_once_with("POST", "/categories/akugyaku-seijo/settings/apply-to-queued")
 
     def test_title_page_and_rerun_commands_send_correct_requests(self):
         for arguments, method, suffix, data in (

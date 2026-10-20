@@ -250,7 +250,7 @@ def parser() -> argparse.ArgumentParser:
         actions = parent.add_subparsers(dest="action", required=True)
         names = {
             "jobs": ("list", "show", "submit", "wait", "logs", "restart", "terminate", "rename", "delete", "rerun", "settings", "export", "download", "series", "publish-notes", "set-translated-title", "translate-title", "retry-title-translation", "pages", "page"),
-            "categories": ("list", "create", "rename", "delete", "settings"),
+            "categories": ("list", "create", "rename", "delete", "settings", "apply-to-queued"),
             "series": ("list", "create", "show", "rename", "notes", "instructions", "upload"),
             "tokens": ("list", "revoke", "create"),
         }[group]
@@ -391,6 +391,20 @@ def page_selection(value: str) -> list[int]:
     return sorted(pages)
 
 
+def wait_export(client: Client, args, *, deadline: float) -> dict:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ClientError("Timed out waiting for the CBZ export.", EXIT_TIMEOUT, "timeout")
+        status = client.request("GET", job_path(args), timeout=min(client.timeout, remaining))
+        export = status.get("exports", {}).get(args.format, {})
+        if export.get("status") in {"failed", "cancelled"}:
+            raise ClientError(export.get("message", "CBZ export failed."), 1, "export_failed")
+        if status.get("downloads", {}).get(args.format, {}).get("available") and export.get("status") != "generating":
+            return status
+        time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
+
+
 def wait_job(client: Client, args, *, deadline: float | None = None) -> dict:
     deadline = deadline if deadline is not None else time.monotonic() + args.timeout
     while True:
@@ -496,6 +510,8 @@ def execute(client: Client, args, config_path: Path, config: dict):
             return client.request("PATCH", path, {"name": args.new_name})
         if action == "delete":
             return client.request("DELETE", path, {"confirmation": args.confirmation})
+        if action == "apply-to-queued":
+            return client.request("POST", path + "/settings/apply-to-queued")
         changes = settings_changes(args)
         return client.request("PATCH" if changes else "GET", path + "/settings", changes if changes else None)
     if group == "series":
@@ -566,7 +582,7 @@ def execute(client: Client, args, config_path: Path, config: dict):
         client.request("POST", job_path(args, "/export"), {"format": args.format,
             "title_mode": args.title, "alt_title_in_notes": args.alt_title_in_notes, "regenerate": args.regenerate},
             timeout=min(client.timeout, args.timeout))
-        wait_job(client, args, deadline=deadline)
+        wait_export(client, args, deadline=deadline)
     return client.download(job_path(args, "/download/" + args.format), args.output, deadline=deadline)
 
 

@@ -128,7 +128,7 @@ class SeriesManagerMixin:
 
     def series_wait_reason(self, code: str, status: dict[str, Any]) -> str:
         series_id = status.get("seriesId")
-        if not series_id or status.get("pendingPackageOnly"):
+        if not series_id:
             return ""
         if status.get("pendingPageReruns"):
             return ""
