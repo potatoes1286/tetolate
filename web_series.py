@@ -19,12 +19,21 @@ SERIES_CONTEXT_FILENAME = "series_context.json"
 
 def chapter_number(value: str, label: str = "Chapter") -> str:
     try:
+        if len(value) > 20:
+            raise HTTPException(400, f"{label} must be at most 20 characters.")
         number = Decimal(value.strip())
-    except (InvalidOperation, AttributeError):
+    except (InvalidOperation, AttributeError, TypeError):
         raise HTTPException(400, f"{label} must be a non-negative number.") from None
-    if not number.is_finite() or not 0 <= number <= 1_000_000 or len(str(value)) > 20:
+    if not number.is_finite() or not 0 <= number <= 1_000_000:
         raise HTTPException(400, f"{label} must be between 0 and 1000000.")
-    return format(number.normalize(), "f")
+    # Smaller non-zero values need more than 20 fixed-point characters.
+    # Check before normalize(), which can round extreme exponents to zero.
+    if number and number.adjusted() < -18:
+        raise HTTPException(400, f"{label} must be at most 20 characters when written as a decimal.")
+    result = format(number.normalize(), "f")
+    if len(result) > 20:
+        raise HTTPException(400, f"{label} must be at most 20 characters when written as a decimal.")
+    return result
 
 
 def chapter_key(status: dict[str, Any]) -> tuple[Decimal, Decimal]:

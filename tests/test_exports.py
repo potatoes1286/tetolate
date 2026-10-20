@@ -79,6 +79,77 @@ class IndependentExportTests(unittest.TestCase):
     def state(self, variant="png", job=None):
         return self.manager.load_export_state(self.code, job or self.job_id)["variants"][variant]
 
+    def test_category_rename_waits_for_startup_and_queue_claim_is_atomic(self):
+        entered, release = threading.Event(), threading.Event()
+        self.releases.append(release)
+        key = (self.code, self.job_id)
+        state = self.manager.load_status(*key)
+        state["status"] = "queued"
+        self.manager.save_status(*key, state)
+        self.manager._queued_jobs.add(key)
+        self.manager._queue.put(key)
+        self.manager._queue.put(None)
+        queued_at_claim = []
+        claimed_at_failure_save = []
+        run_job = self.manager.run_job
+        save_status = self.manager.save_status
+
+        def claim(*args):
+            queued_at_claim.append(key in self.manager._queued_jobs)
+            run_job(*args)
+
+        def title(*args):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("Test did not release job startup")
+
+        def save(code, job_id, status):
+            if status.get("phase") == "Failed":
+                claimed_at_failure_save.append(key in self.manager._starting_jobs)
+            save_status(code, job_id, status)
+
+        with mock.patch.object(self.manager, "run_job", side_effect=claim), \
+             mock.patch.object(self.manager, "maybe_auto_translate_comicinfo_title", side_effect=title), \
+             mock.patch.object(self.manager, "build_command", return_value=[]), \
+             mock.patch.object(self.manager, "save_status", side_effect=save), \
+             mock.patch.object(self.manager, "run_pipeline_process", side_effect=RuntimeError("Synthetic startup failure")):
+            worker = threading.Thread(target=self.manager.worker_loop, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertIn(key, self.manager._starting_jobs)
+                self.assertNotIn(key, self.manager._queued_jobs)
+                with self.assertRaises(HTTPException) as caught:
+                    self.manager.rename_category(self.code, "renamed")
+                self.assertEqual(caught.exception.status_code, 409)
+                self.assertFalse(self.manager.category_dir("renamed").exists())
+            finally:
+                release.set()
+                worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(queued_at_claim, [True])
+        self.assertEqual(claimed_at_failure_save, [True])
+        self.assertNotIn(key, self.manager._starting_jobs)
+        self.assertEqual(self.manager.load_status(*key)["status"], "failed")
+        self.manager.rename_category(self.code, "renamed")
+        self.assertFalse(self.manager.category_dir(self.code).exists())
+        self.assertEqual(self.manager.load_status("renamed", self.job_id)["status"], "failed")
+
+    def test_category_rename_waits_for_independent_job_export(self):
+        package, entered, release, _ = self.blocked_packager()
+        with mock.patch.object(translate_cbz, "print_packaged_cbz", side_effect=package):
+            self.manager.generate_download(self.code, self.job_id, "png")
+            self.assertTrue(entered.wait(5))
+            with self.assertRaises(HTTPException) as caught:
+                self.manager.rename_category(self.code, "renamed")
+            self.assertEqual(caught.exception.status_code, 409)
+            release.set()
+            self.join()
+        self.assertEqual(self.state()["status"], "complete")
+        self.manager.rename_category(self.code, "renamed")
+        self.assertTrue(self.manager.translated_cbz_variant_path("renamed", self.job_id, "png").is_file())
+        self.assertEqual(self.manager.load_export_state("renamed", self.job_id)["variants"]["png"]["status"], "complete")
+
     def test_export_starts_while_queue_paused_and_another_pipeline_is_running(self):
         package, entered, release, _ = self.blocked_packager(real=True)
         self.manager._paused = True

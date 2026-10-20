@@ -1804,10 +1804,18 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                 for existing in self._categories
             ):
                 raise HTTPException(status_code=409, detail="That category already exists.")
-            if any(code == category for code, _job_id in self._active_processes):
+            if any(code == category for code, _job_id in self._active_processes) or any(
+                code == category for code, _job_id in self._starting_jobs
+            ):
                 raise HTTPException(status_code=409, detail="Stop active jobs before renaming this category.")
             if any(code == category for code, _job_id in self._queued_jobs):
                 raise HTTPException(status_code=409, detail="Wait for queued jobs before renaming this category.")
+            if self.category_export_status(category).get("status") == "generating" or any(
+                item.get("status") == "generating"
+                for job_id in self.iter_job_ids(category)
+                for item in self.load_export_state(category, job_id)["variants"].values()
+            ):
+                raise HTTPException(status_code=409, detail="Wait for CBZ exports before renaming this category.")
 
             source_path = self.category_dir(category)
             target_path = self.category_dir(new_category)
@@ -3901,8 +3909,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             if not self.wait_until_unpaused():
                 self._queue.task_done()
                 return
-            with self._lock:
-                self._queued_jobs.discard(key)
             try:
                 self.run_job(code, job_id)
             except Exception as exc:
@@ -3910,25 +3916,6 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                     f"error: unexpected web worker failure for {code}/{job_id}: {exc}",
                     file=sys.stderr,
                 )
-                try:
-                    status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
-                    finished_at = datetime.now(timezone.utc)
-                    stop_active_runtime(status, finished_at)
-                    status.update(
-                        {
-                            "status": "failed",
-                            "phase": "Failed",
-                            "message": f"Unexpected worker failure: {exc}",
-                            "finishedAt": finished_at.isoformat(),
-                        }
-                    )
-                    status.pop("pid", None)
-                    self.save_status(code, job_id, status)
-                except Exception as status_exc:
-                    print(
-                        f"error: could not persist worker failure for {code}/{job_id}: {status_exc}",
-                        file=sys.stderr,
-                    )
             finally:
                 self._queue.task_done()
                 try:
@@ -4345,8 +4332,26 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         key = (code, job_id)
         with self._lock:
             self._starting_jobs.add(key)
+            self._queued_jobs.discard(key)
         try:
             self._run_job(code, job_id)
+        except Exception as exc:
+            # Keep the claim until failure status is saved too. A rename must
+            # not move the job between an exception and its status write.
+            try:
+                status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+                finished_at = datetime.now(timezone.utc)
+                stop_active_runtime(status, finished_at)
+                status.update(status="failed", phase="Failed", message=f"Unexpected worker failure: {exc}",
+                              finishedAt=finished_at.isoformat())
+                status.pop("pid", None)
+                self.save_status(code, job_id, status)
+            except Exception as status_exc:
+                print(
+                    f"error: could not persist worker failure for {code}/{job_id}: {status_exc}",
+                    file=sys.stderr,
+                )
+            raise
         finally:
             with self._lock:
                 self._starting_jobs.discard(key)

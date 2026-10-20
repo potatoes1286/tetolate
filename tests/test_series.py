@@ -66,6 +66,25 @@ class SeriesTests(unittest.TestCase):
         restarted.initialize_web_state()
         self.assertEqual(restarted.get_series("default")["name"], "Test series")
 
+    def test_chapter_numbers_limit_normalized_length_before_expansion(self) -> None:
+        self.assertEqual(chapter_number("1e-18"), "0." + "0" * 17 + "1")
+        self.assertEqual(chapter_number("1.0e-18"), chapter_number("1e-18"))
+        self.assertEqual(chapter_number("1e6"), "1000000")
+        for value in ("1e-19", "1e-1000000", "1e-99999999999999999", "123456789012345e-19", "0." + "1" * 19):
+            for label in ("Chapter", "Volume"):
+                with self.subTest(value=value, label=label):
+                    with self.assertRaises(HTTPException) as caught:
+                        chapter_number(value, label)
+                    self.assertEqual(caught.exception.status_code, 400)
+
+    def test_extreme_exponents_are_rejected_before_formatting(self) -> None:
+        with mock.patch("web_series.format", side_effect=AssertionError("Must not expand this number"), create=True):
+            for value in ("1e-1000000", "1e-99999999999999999"):
+                with self.subTest(value=value):
+                    with self.assertRaises(HTTPException) as caught:
+                        chapter_number(value)
+                    self.assertEqual(caught.exception.status_code, 400)
+
     def test_context_is_captured_when_started_and_kept_on_retry(self) -> None:
         job_id = self.chapter("1")
         self.assertFalse(self.manager.series_context_path("default", job_id).exists())

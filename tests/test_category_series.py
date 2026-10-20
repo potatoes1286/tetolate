@@ -169,6 +169,32 @@ class CategorySeriesTests(unittest.TestCase):
         self.assertFalse(self.manager.category_export_path("books").exists())
         self.assertEqual(self.manager.category_export_status("books")["status"], "cancelled")
 
+    def test_category_rename_waits_for_collection_export(self):
+        self.chapter()
+        entered, release = threading.Event(), threading.Event()
+        self.events.append(release)
+        original = translate_cbz.print_packaged_cbz
+
+        def block(*args, **kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError("Test did not release export")
+            original(*args, **kwargs)
+
+        with mock.patch.object(translate_cbz, "print_packaged_cbz", side_effect=block):
+            self.manager.generate_category_export("books", "png", "chapters")
+            self.assertTrue(entered.wait(5))
+            with self.assertRaises(HTTPException) as caught:
+                self.manager.rename_category("books", "renamed")
+            self.assertEqual(caught.exception.status_code, 409)
+            self.manager.create_category("unrelated")
+            self.manager.rename_category("unrelated", "other")
+            release.set()
+            self.finish()
+        self.assertEqual(self.manager.category_export_status("books")["status"], "complete")
+        self.manager.rename_category("books", "renamed")
+        self.assertTrue(self.manager.require_category_export("renamed").is_file())
+
     def test_collection_download_checks_for_stale_pages(self):
         job = self.chapter()
         self.complete_export()

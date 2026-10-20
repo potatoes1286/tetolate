@@ -34,6 +34,9 @@
 
 ### Fixed
 
+- Category renames wait for starting jobs and CBZ exports, preventing orphaned jobs and stuck exports.
+- Chapter and volume numbers cannot expand beyond 20 decimal characters.
+- CLI collection exports apply one timeout to generation requests, polling, and downloads; timed-out downloads preserve existing files.
 - Job Advanced Options save automatically before opening the editor, including OCR endpoints and API keys.
 - OCR checks its inference endpoint before model setup and reports readable connection, authentication, and model errors.
 - Source launchers include required OCR dependencies by default.

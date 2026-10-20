@@ -182,11 +182,17 @@ class Client:
                 raise ClientError("Server did not return JSON. Check the server address and API version.", 1, "invalid_response") from None
 
     def download(self, path: str, output: Path, *, deadline: float | None = None) -> dict:
+        open_options = {}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout")
+            open_options["timeout"] = min(self.timeout, remaining)
         output.parent.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(dir=output.parent, prefix=".tetolate-download-", suffix=".tmp")
         temporary = Path(name)
         try:
-            with os.fdopen(descriptor, "wb") as target, self.open("GET", path) as response:
+            with os.fdopen(descriptor, "wb") as target, self.open("GET", path, **open_options) as response:
                 expected = response.headers.get("Content-Length")
                 while True:
                     if deadline is not None and time.monotonic() >= deadline:
@@ -195,6 +201,8 @@ class Client:
                         chunk = response.read(1024 * 1024)
                     except (OSError, HTTPTransportError):
                         raise ClientError("Download connection was interrupted.", EXIT_CONNECTION, "connection_error") from None
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout")
                     if not chunk:
                         break
                     target.write(chunk)
@@ -529,9 +537,11 @@ def execute(client: Client, args, config_path: Path, config: dict):
                       "translation_notes": args.notes_file.read_text(encoding="utf-8") if args.notes_file else ""}
             return client.request("POST", path + "/upload", multipart=Multipart([("chapters", file) for file in args.archives], fields))
         if action in {"export", "download"}:
+            deadline = None
             if action == "export":
                 deadline = time.monotonic() + args.timeout
-                client.request("POST", base + "/exports", {"format": args.format, "grouping": args.grouping})
+                client.request("POST", base + "/exports", {"format": args.format, "grouping": args.grouping},
+                               timeout=min(client.timeout, args.timeout))
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -542,7 +552,7 @@ def execute(client: Client, args, config_path: Path, config: dict):
                     if state.get("status") != "generating":
                         raise ClientError(state.get("message") or "Collection export failed.", 1, "export_failed")
                     time.sleep(min(args.interval, max(0, deadline - time.monotonic())))
-            return client.download(base + "/exports/download", args.output)
+            return client.download(base + "/exports/download", args.output, deadline=deadline)
         key = "comic_info_xml" if action == "comic-info-xml" else action
         field = "comicInfoXml" if action == "comic-info-xml" else action
         value = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read() if args.stdin else None

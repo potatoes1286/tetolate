@@ -315,10 +315,49 @@ class CLITests(unittest.TestCase):
     def test_series_collection_export_waits_and_downloads(self):
         client = mock.Mock(timeout=30)
         client.request.side_effect = [{"status": "generating"}, {"status": "generating"}, {"status": "complete"}]
-        with mock.patch.object(cli.time, "sleep"):
+        with mock.patch.object(cli.time, "sleep"), mock.patch.object(cli.time, "monotonic", return_value=100):
             self.execute(["series", "export", "books", "--format", "webp", "--grouping", "volumes", "--output", str(self.root / "books.zip")], client)
-        self.assertEqual(client.request.call_args_list[0], mock.call("POST", "/categories/books/exports", {"format": "webp", "grouping": "volumes"}))
-        client.download.assert_called_once_with("/categories/books/exports/download", self.root / "books.zip")
+        self.assertEqual(client.request.call_args_list[0], mock.call("POST", "/categories/books/exports", {"format": "webp", "grouping": "volumes"}, timeout=30))
+        client.download.assert_called_once_with("/categories/books/exports/download", self.root / "books.zip", deadline=3700)
+
+    def test_series_export_short_timeout_limits_start_request(self):
+        client = mock.Mock(timeout=30)
+        client.request.side_effect = [{}, {"status": "complete"}]
+        with mock.patch.object(cli.time, "monotonic", return_value=100):
+            self.execute(["series", "export", "books", "--timeout", "2", "--output", str(self.root / "books.zip")], client)
+        self.assertEqual(client.request.call_args_list[0].kwargs["timeout"], 2)
+        self.assertEqual(client.request.call_args_list[1].kwargs["timeout"], 2)
+        self.assertEqual(client.download.call_args.kwargs["deadline"], 102)
+
+    def test_series_export_stops_if_start_request_uses_deadline(self):
+        client = mock.Mock(timeout=30)
+        with mock.patch.object(cli.time, "monotonic", side_effect=[100, 103]):
+            with self.assertRaises(cli.ClientError) as caught:
+                self.execute(["series", "export", "books", "--timeout", "2", "--output", str(self.root / "books.zip")], client)
+        self.assertEqual(caught.exception.exit_code, cli.EXIT_TIMEOUT)
+        client.download.assert_not_called()
+
+    def test_download_deadline_preserves_old_output_and_bounds_open(self):
+        client = cli.Client("http://localhost:8088", "test-token")
+        output = self.root / "books.zip"
+        output.write_bytes(b"old archive")
+        for clock in ([103], [100, 100, 103], [100, 100, 100, 103], [100, 100, 100, 100, 103]):
+            with self.subTest(clock=clock):
+                response = mock.MagicMock()
+                response.__enter__.return_value = response
+                response.headers = {}
+                response.read.side_effect = [b"partial", b""]
+                with mock.patch.object(client, "open", return_value=response) as open_request, \
+                     mock.patch.object(cli.time, "monotonic", side_effect=clock):
+                    with self.assertRaises(cli.ClientError) as caught:
+                        client.download("/categories/books/exports/download", output, deadline=102)
+                self.assertEqual(caught.exception.exit_code, cli.EXIT_TIMEOUT)
+                self.assertEqual(output.read_bytes(), b"old archive")
+                self.assertEqual(list(self.root.glob(".tetolate-download-*")), [])
+                if clock[0] == 103:
+                    open_request.assert_not_called()
+                else:
+                    open_request.assert_called_once_with("GET", "/categories/books/exports/download", timeout=2)
 
     def test_vlm_test_reads_credentials_from_file(self):
         path = self.root / "settings.json"
