@@ -27,7 +27,7 @@ DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3
 DEFAULT_MIN_POINT_SIZE = 14
 DEFAULT_RENDER_BLEED = 8
-TEXT_LAYOUT_VERSION = 4
+TEXT_LAYOUT_VERSION = 5
 LINE_SPACING_LIMIT = 200
 TEXT_TRANSFORM_LIMITS = {"rotation": 180, "skewX": 60, "skewY": 60}
 PAGE_HEIGHT_MIN_POINT_RATIO = 0.008
@@ -248,6 +248,8 @@ def stroke_width(entry: dict[str, Any], image_height: int | None = None) -> floa
     value = entry.get("strokeWidth", DEFAULT_STROKE_WIDTH)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         configured = max(0, float(value))
+        if configured == 0:
+            return 0.0
     else:
         configured = float(DEFAULT_STROKE_WIDTH)
     return max(configured, scaled_page_stroke_width(image_height))
@@ -765,7 +767,7 @@ def text_layer_args(
     spacing_args = ["-interline-spacing", f"{entry.get('lineSpacing', 0):g}"]
     text_path.write_text(rendered_text, encoding="utf-8")
 
-    return [
+    outline_layer = [
         "(",
             "-size",
             f"{layer_inner_width}x{layer_inner_height}",
@@ -791,6 +793,9 @@ def text_layer_args(
             "-extent",
             f"{layer_width}x{layer_height}",
         ")",
+    ] if outline_width > 0 else []
+    return [
+        *outline_layer,
         "(",
             "-size",
             f"{layer_inner_width}x{layer_inner_height}",
@@ -814,7 +819,7 @@ def text_layer_args(
             "-extent",
             f"{layer_width}x{layer_height}",
         ")",
-        "-composite",
+        *(["-composite"] if outline_layer else []),
         *text_transform_args(entry, layer_width, layer_height),
     ]
 

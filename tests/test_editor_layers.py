@@ -418,6 +418,8 @@ class EditorLayerTests(unittest.TestCase):
                   {"manualLineBreaks": "One\nTWO\nThree"}, {"placementRegion": [10, 10, 130, 700]},
                   {"placementRegion": [10, 10, 700, 130]}]
         cases += [{"lineSpacing": spacing, "fontSizeWidthPercent": 3} for spacing in (-5, 0, 12)]
+        cases += [{"strokeWidth": 0, "fill": fill, "stroke": stroke}
+                  for fill, stroke in (("white", "black"), ("black", "white"))]
         cases += [{"rotation": angle} for angle in (-180, -35, 35, 90, 180)]
         cases += [{"manualLineBreaks": "Even if you say that...", "placementRegion": [40, 50, 755, 135]}]
         cases += [{"skewX": -30}, {"skewY": 30}, {"rotation": 23, "skewX": 30, "skewY": -20},

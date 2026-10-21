@@ -35,6 +35,7 @@
 
 ### Fixed
 
+- Outline width 0 disables the outline in editor previews and final renders.
 - Category renames wait for starting jobs and CBZ exports, preventing orphaned jobs and stuck exports.
 - Chapter and volume numbers cannot expand beyond 20 decimal characters.
 - CLI collection exports apply one timeout to generation requests, polling, and downloads; timed-out downloads preserve existing files.
