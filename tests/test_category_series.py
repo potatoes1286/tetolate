@@ -64,6 +64,72 @@ class CategorySeriesTests(unittest.TestCase):
         self.assertEqual(state["status"], "complete", state)
         return self.manager.require_category_export("books")
 
+    def test_job_numbers_stay_editable_without_series_note_controls(self):
+        job = self.chapter("1.5", "2")
+        self.manager.prepare_series_context("books", job, self.manager.load_status("books", job))
+        status = self.manager.public_status("books", job, include_log=False)
+        for state in ("complete", "failed", "cancelled", "paused"):
+            with self.subTest(state=state):
+                markup = web_pages.job_series_markup("books", job, {**status, "status": state})
+                self.assertIn('name="volume"', markup)
+                self.assertIn('value="2"', markup)
+                self.assertIn('name="chapter"', markup)
+                self.assertIn('value="1.5"', markup)
+                self.assertIn("Save volume/chapter", markup)
+                self.assertNotIn("Series settings", markup)
+                self.assertNotIn("publish-series-notes", markup)
+                self.assertNotIn("Use this chapter", markup)
+                self.assertNotIn("Keep current series notes", markup)
+                self.assertNotIn("fixed because", markup)
+        for state in ("queued", "running", "terminating"):
+            markup = web_pages.job_series_markup("books", job, {**status, "status": state})
+            self.assertIn('/category/books', markup)
+            self.assertNotIn('<form', markup)
+        category = web_pages.category_jobs_page("books", self.manager.public_category_jobs("books")).body.decode()
+        self.assertIn("Series settings", category)
+
+    def test_completed_chapter_renumbering_keeps_context_and_invalidates_exports(self):
+        job = self.chapter("1", "1")
+        self.manager.prepare_series_context("books", job, self.manager.load_status("books", job))
+        context_path = self.manager.series_context_path("books", job)
+        notes_path = self.manager.translation_notes_path("books", job)
+        context, notes = context_path.read_bytes(), notes_path.read_bytes()
+        generated = self.manager.generated_translation_notes_path("books", job)
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("Keep these shared notes", encoding="utf-8")
+        self.assertTrue(self.manager.publish_series_notes("books", job))
+        series_before = self.manager.get_series("books")
+        page = self.manager.final_page_files("books", job)[0]
+        original_page = page.read_bytes()
+        self.manager.generate_download("books", job, "png")
+        self.finish()
+        archive = self.manager.translated_cbz_variant_path("books", job, "png")
+        self.assertTrue(archive.is_file())
+        collection = self.complete_export()
+        with mock.patch.object(self.manager, "run_pipeline_process", side_effect=AssertionError("Must not rerun translation")):
+            self.manager.assign_job_chapter("books", job, "01.50", "2")
+        status = self.manager.load_status("books", job)
+        self.assertEqual((status["status"], status["volume"], status["chapter"]), ("complete", "2", "1.5"))
+        self.assertEqual(page.read_bytes(), original_page)
+        self.assertEqual(context_path.read_bytes(), context)
+        self.assertEqual(notes_path.read_bytes(), notes)
+        self.manager.prepare_series_context("books", job, status)
+        self.assertEqual(context_path.read_bytes(), context)
+        self.assertEqual(notes_path.read_bytes(), notes)
+        series = self.manager.get_series("books")
+        self.assertEqual(series["notesThrough"], {"volume": "2", "chapter": "1.5"})
+        for key in ("notes", "notesFromJobId", "revision"):
+            self.assertEqual(series[key], series_before[key])
+        self.assertFalse(archive.exists())
+        self.assertFalse(collection.exists())
+        self.assertEqual(self.manager.category_export_status("books")["status"], "cancelled")
+        # Saving unchanged numbers must not discard a newly generated export.
+        self.manager.generate_download("books", job, "png")
+        self.finish()
+        self.assertTrue(archive.is_file())
+        self.manager.assign_job_chapter("books", job, "1.50", "02")
+        self.assertTrue(archive.is_file())
+
     def test_category_flag_ui_and_decimal_volume_order(self):
         self.assertFalse(self.manager.is_series("default"))
         first = self.chapter("10", "1")

@@ -1622,19 +1622,12 @@ def job_series_markup(code: str, job_id: str, status: dict[str, Any]) -> str:
     warning = f'<p>{escape(status["seriesNotesWarning"])}</p>' if status.get("seriesNotesWarning") else ""
     if status.get("status") in {"queued", "running", "terminating"}:
         return link + warning
-    publish = (
-        f'<form action="/job/{escape(code)}/{escape(job_id)}/publish-series-notes" method="post">'
-        '<p>This replaces the current series notes, including notes from later chapters.</p>'
-        f'<button type="submit"{"" if status.get("hasGeneratedTranslationNotes") else " disabled"}>Use this chapter\'s notes for the series</button> '
-        '<button type="submit" name="use_current" value="1">Keep current series notes and continue</button></form>'
-        if status.get("status") == "complete" else ""
-    )
-    fields = '<p>Chapter and volume are fixed because this job has saved context.</p>' if status.get("seriesContextSaved") else f"""
+    fields = f"""
 <form action="/job/{escape(code)}/{escape(job_id)}/chapter" method="post">
 {chapter_fields(str(status.get("chapter") or ""), str(status.get("volume") or ""))}
-<button type="submit">Set chapter</button></form>
+<button type="submit">Save volume/chapter</button></form>
 """
-    return link + warning + '<details><summary>Series settings</summary>' + fields + publish + '</details>'
+    return link + warning + fields
 
 
 def series_settings_markup(code: str, data: dict[str, Any]) -> str:

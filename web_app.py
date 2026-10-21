@@ -4949,14 +4949,6 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         manager.assign_job_chapter(code, job_id, chapter, volume)
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
 
-    @app.post("/job/{code}/{job_id}/publish-series-notes")
-    async def publish_series_notes(
-        request: Request, code: str, job_id: str, use_current: str | None = Form(None),
-    ) -> RedirectResponse:
-        manager = require_admin(request)
-        manager.publish_series_notes(code, job_id, explicit=True, use_current=parse_checkbox(use_current))
-        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
-
     @app.post("/category/{code}/series/upload")
     async def upload_series_chapters(
         request: Request, code: str,

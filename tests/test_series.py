@@ -124,6 +124,40 @@ class SeriesTests(unittest.TestCase):
         self.assertIn(("default", second), self.manager._queued_jobs)
         self.assertTrue(self.manager.load_status("default", second)["writeTranslationNotes"])
 
+    def test_renumbering_preserves_other_chapters_notes_and_rejects_conflicts(self) -> None:
+        first, second = self.chapter("1"), self.chapter("2")
+        self.manager.prepare_series_context("default", first, self.manager.load_status("default", first))
+        self.status(first, "complete")
+        self.status(second, "complete")
+        self.generated_notes(second, "Notes from chapter 2")
+        self.manager.publish_series_notes("default", second)
+        series = self.manager.get_series("default")
+        self.manager.assign_job_chapter("default", first, "1.5")
+        self.assertEqual(self.manager.get_series("default"), series)
+        with self.assertRaises(HTTPException) as caught:
+            self.manager.assign_job_chapter("default", first, "2")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.manager.load_status("default", first)["chapter"], "1.5")
+        for state in ("queued", "running", "terminating"):
+            with self.subTest(state=state):
+                self.status(first, state)
+                with self.assertRaises(HTTPException) as caught:
+                    self.manager.assign_job_chapter("default", first, "3")
+                self.assertEqual(caught.exception.status_code, 409)
+        self.status(first, "complete")
+        for claimed in (self.manager._starting_jobs, self.manager._active_processes):
+            with self.subTest(claim=type(claimed).__name__):
+                if isinstance(claimed, set):
+                    claimed.add(("default", first))
+                else:
+                    claimed[("default", first)] = object()
+                try:
+                    with self.assertRaises(HTTPException) as caught:
+                        self.manager.assign_job_chapter("default", first, "3")
+                    self.assertEqual(caught.exception.status_code, 409)
+                finally:
+                    claimed.clear()
+
     def test_publication_replaces_notes_and_older_reruns_need_explicit_publish(self) -> None:
         first, second = self.chapter("1"), self.chapter("2")
         self.status(first, "complete")
@@ -242,6 +276,28 @@ class SeriesTests(unittest.TestCase):
         with zipfile.ZipFile(result, "w") as archive:
             archive.writestr("page.png", image.getvalue())
         return result.getvalue()
+
+    def test_http_can_renumber_a_completed_chapter_with_saved_context(self) -> None:
+        job = self.chapter("1")
+        self.manager.prepare_series_context("default", job, self.manager.load_status("default", job))
+        self.status(job, "complete")
+        snapshot = self.manager.series_context_path("default", job).read_bytes()
+        app = web_app.create_app(self.root / "web_config.json")
+        app.state.manager = self.manager
+        session = self.manager.authenticate_admin(self.helper.ADMIN_PASSWORD)
+
+        async def exercise():
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
+                client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                response = await client.post(f"/job/default/{job}/chapter", data={"chapter": "1.5", "volume": "2"})
+                self.assertEqual(response.status_code, 303, response.text)
+                status = self.manager.load_status("default", job)
+                self.assertEqual((status["status"], status["chapter"], status["volume"]), ("complete", "1.5", "2"))
+                self.assertEqual(self.manager.series_context_path("default", job).read_bytes(), snapshot)
+                response = await client.post(f"/job/default/{job}/publish-series-notes")
+                self.assertEqual(response.status_code, 404)
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=15))
 
     def test_http_batch_orders_files_and_registers_all_before_running(self) -> None:
         app = web_app.create_app(self.root / "web_config.json")

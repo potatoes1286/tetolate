@@ -110,7 +110,7 @@ class SeriesManagerMixin:
 
     def assign_job_chapter(self, code: str, job_id: str, chapter: str, volume: str = "") -> None:
         with self._lock:
-            self.get_series(code)
+            series = self.get_series(code)
             self.validate_job_id(job_id)
             status = self.load_status(code, job_id)
             if status is None:
@@ -119,11 +119,14 @@ class SeriesManagerMixin:
                 (code, job_id) in self._active_processes or (code, job_id) in self._starting_jobs
             ):
                 raise HTTPException(409, "Stop the job before changing chapter numbers.")
-            if self.series_context_path(code, job_id).exists():
-                raise HTTPException(409, "This chapter has saved context. Its chapter and volume are fixed.")
             chapter, volume = self.validate_series_chapter(code, chapter, volume, job_id)
+            if chapter == status.get("chapter") and volume == status.get("volume"):
+                return
             status.update(chapter=chapter, volume=volume, writeTranslationNotes=True)
             self.save_status(code, job_id, status)
+            if series["notesFromJobId"] == job_id:
+                series["notesThrough"] = {"chapter": chapter, "volume": volume}
+                self.save_series(code, series)
             self.invalidate_translated_cbz_archives(code, job_id)
             self.enqueue_ready_series_jobs()
 

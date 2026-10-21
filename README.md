@@ -118,9 +118,8 @@ in volume/chapter order and pass updated notes to the next chapter automatically
 Failed chapters, OCR review, or missing notes hold later chapters.
 
 Each chapter keeps the notes it started with for retries. Edit shared notes on the
-category page. To replace them with notes from an older chapter, use **Series settings**
-on that job and select **Use this chapter's notes for the series**.
-You can also keep your current edited notes and continue from that chapter.
+category page. You can change a completed job's volume and chapter without rerunning
+translation. Old CBZ exports are removed when the numbers change.
 
 **Export all CBZ** downloads a ZIP of PNG, WebP, or JXL CBZ files for completed
 chapters. Choose individual chapters or combine chapters by volume. Chapters

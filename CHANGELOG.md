@@ -18,6 +18,7 @@
 
 ### Changed
 
+- Removed job-level series-note buttons; volume and chapter can be edited after generation.
 - Series are now categories, with optional volume and decimal chapter numbers. Removed separate series records and selectors.
 - Series API and CLI actions now use category names instead of series IDs.
 - CBZ exports run independently of the translation queue, with separate progress and errors.
