@@ -635,12 +635,13 @@ function renderTools() {
     if (typesettingView === "preview") {
       const label = document.createElement("label"); label.className = "preview-box-toggle";
       const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = hidePreviewBoxes;
+      toggle.dataset.shortcut = "h";
       toggle.addEventListener("change", () => {
         hidePreviewBoxes = toggle.checked;
         canvas.hideBoxes = hidePreviewBoxes;
         canvas.draw();
       });
-      label.append(toggle, document.createTextNode(" Hide boxes")); target.append(label);
+      label.append(toggle, document.createTextNode(" Hide boxes [H]")); target.append(label);
     }
   }
   if (ocrAreaRunning) {
@@ -1033,7 +1034,8 @@ for (const id of ["job-notes", "page-notes"]) byId(id).addEventListener("input",
 });
 document.addEventListener("keydown", (event) => {
   if (resetting) return;
-  const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName);
+  const typing = event.target.isContentEditable ||
+    (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName) && event.target.type !== "checkbox");
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(); return; }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? store.redo() : store.undo(); return; }
   if (typing) return;

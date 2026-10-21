@@ -4,11 +4,13 @@
 
 ### Added
 
+- Added automatic chapter ordering and shared translation notes for series categories.
+- Added CLI and JSON API access to non-editor web actions, with revocable tokens.
 - Added category-series ComicInfo templates and ZIP collection exports by chapter or volume, in PNG, WebP, or JXL.
 - Added Advanced Options editing for queued jobs and a category action to apply saved settings to all queued jobs.
 - Added Copy to Category Settings and Copy from Category Settings buttons to each job's Advanced Options.
 - Added direct page-number entry in the editor.
-- Added a Hide boxes toggle to Typesetting Preview.
+- Added a Hide boxes toggle and H shortcut to Typesetting Preview.
 - Added line-spacing control to Typesetting.
 - Added a 30-day Remember session login option that survives server restarts.
 - Added a manual GitHub release check beside the web UI version.
@@ -35,6 +37,7 @@
 
 ### Fixed
 
+- Remember VLM API keys per endpoint across sessions and new jobs.
 - Outline width 0 disables the outline in editor previews and final renders.
 - Category renames wait for starting jobs and CBZ exports, preventing orphaned jobs and stuck exports.
 - Chapter and volume numbers cannot expand beyond 20 decimal characters.
@@ -66,8 +69,6 @@ TL;DR lots of housecleaning + no more image building needed anymore, now pushed 
 - Added ZIP uploads, lazy CBZ downloads, and ComicInfo title controls.
 - Added category and job naming controls.
 - Added translation of titles and editing titles.
-- Added series with ordered chapter uploads and automatic translation-note sharing.
-- Added CLI and JSON API access to non-editor web actions, with revocable tokens.
 
 ### Changed
 
@@ -77,7 +78,6 @@ TL;DR lots of housecleaning + no more image building needed anymore, now pushed 
 
 ### Fixed
 
-- Remember VLM API keys per endpoint across sessions and new jobs.
 - Improved VLM connection errors and missing-model handling.
 - Improved validation for image and archive inputs.
 - First startup now uses the documented default admin password 'changeme'.

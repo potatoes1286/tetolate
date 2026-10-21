@@ -181,7 +181,7 @@ test("view controls include Last Render, with no Re-render or clean delete butto
 
 test("Preview Hide boxes toggle is reversible and is not applied to other views or stages", () => {
   const page = setup();
-  const element = () => ({children: [], listeners: {}, append(...children) {this.children.push(...children);},
+  const element = () => ({children: [], listeners: {}, dataset: {}, append(...children) {this.children.push(...children);},
     replaceChildren() {this.children = [];}, addEventListener(name, callback) {this.listeners[name] = callback;}});
   const target = element();
   Object.assign(page.context, {typesettingView: "preview", hidePreviewBoxes: false, canvas: page.canvas,
@@ -207,6 +207,30 @@ test("Preview Hide boxes toggle is reversible and is not applied to other views 
   page.store.stage = "ocr"; page.context.renderTools();
   assert.equal(page.canvas.hideBoxes, false);
   assert.equal(JSON.stringify(page.store.records), before);
+});
+
+test("H activates only the Preview Hide boxes checkbox and never interrupts typing", () => {
+  const page = setup();
+  let keydown, visible = true, clicks = 0, prevented = 0;
+  const checkbox = {disabled: false, click() { clicks++; }};
+  const target = {querySelector: (selector) => visible && selector === '[data-shortcut="h"]' ? checkbox : null};
+  Object.assign(page.context, {resetting: false, ocrAreaRunning: false,
+    AVAILABLE_STAGES: ["ocr", "text", "placement"], byId: () => target,
+    document: {addEventListener: (_event, callback) => { keydown = callback; }}});
+  vm.runInContext(app.slice(app.indexOf('document.addEventListener("keydown",'), app.indexOf('window.addEventListener("beforeunload",')), page.context);
+  const press = (target = {tagName: "DIV"}, changes = {}) => keydown({key: "h", target,
+    preventDefault() {prevented++;}, ...changes});
+  press(); press({tagName: "DIV"}, {key: "H"});
+  assert.equal(clicks, 2); assert.equal(prevented, 2);
+  for (const tagName of ["INPUT", "TEXTAREA", "SELECT"]) press({tagName});
+  press({tagName: "DIV", isContentEditable: true});
+  for (const modifier of ["ctrlKey", "altKey", "metaKey"]) press(undefined, {[modifier]: true});
+  assert.equal(clicks, 2); assert.equal(prevented, 2);
+  press({tagName: "INPUT", type: "checkbox"});
+  assert.equal(clicks, 3);
+  visible = false; press(); assert.equal(clicks, 3);
+  assert.match(app, /toggle\.dataset\.shortcut = "h"/);
+  assert.match(app, /Hide boxes \[H\]/);
 });
 
 test("Delete key still removes clean boxes, but not while typing", () => {
