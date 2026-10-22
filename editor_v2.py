@@ -137,6 +137,7 @@ def visible_artifacts(
     """Hide descendants of deleted sources without changing saved stage data."""
     visible = copy.deepcopy(artifacts)
     raw_boxnos = {record.get("boxno") for record in visible.get("ocr_raw", [])}
+    raw_by_boxno = {record.get("boxno"): record for record in visible.get("ocr_raw", [])}
     deleted_raw = {record.get("boxno") for record in deleted_records(manifest, page, "ocr", "ocr_raw")} - raw_boxnos
     groups = []
     for group in visible.get("ocr_merged", []):
@@ -145,6 +146,14 @@ def visible_artifacts(
         if sources and not remaining:
             continue
         group["sourceBoxnos"] = remaining
+        if remaining != sources:
+            records = [raw_by_boxno[source] for source in remaining if source in raw_by_boxno]
+            group["sourceTexts"] = [str(record.get("text", "")) for record in records]
+            group["text"] = "".join(group["sourceTexts"])
+            if records:
+                regions = [record["region"] for record in records]
+                group["region"] = [min(r[0] for r in regions), min(r[1] for r in regions),
+                                   max(r[2] for r in regions), max(r[3] for r in regions)]
         groups.append(group)
     visible["ocr_merged"] = groups
     active_sources = {source for group in groups for source in group.get("sourceBoxnos", [])}

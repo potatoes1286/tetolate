@@ -38,13 +38,15 @@ export function fieldsFor(stage, record, fonts = [], artifact = null) {
     ["englishText", "English text", "textarea", record.englishText || ""],
   ];
   if (stage === "placement") return [
+    ["text", "Source text", "textarea", record.text || ""],
+    ["englishText", "Translated text", "textarea", record.englishText || ""],
     ...regionFields,
     ["font", "Font", "select", record.font || "", ["", ...fonts]],
     ["fill", "Text colour", "select", record.fill || "black", ["black", "white"]],
     ["stroke", "Outline colour", "select", record.stroke || (record.fill === "white" ? "black" : "white"), ["black", "white"]],
     ["strokeWidth", "Outline width", "number", record.strokeWidth ?? 2],
     ["gravity", "Alignment", "select", record.gravity || "center", ["north", "center", "south", "west", "east", "northwest", "northeast", "southwest", "southeast"]],
-    ["fontSizeWidthPercent", `Font size (wv; blank = auto; auto: ${Number(record._autoFontSizeWidthPercent || 0).toFixed(2)} wv)`, "number", record.fontSizeWidthPercent ?? ""],
+    ["fontSizeWidthPercent", `Font size (wv; auto: ${Number(record._autoFontSizeWidthPercent || 0).toFixed(2)})`, "number", record.fontSizeWidthPercent ?? ""],
     ["lineSpacing", "Extra line spacing (px; 0 = default)", "number", record.lineSpacing ?? 0],
     ["rotation", "Rotation (degrees; positive = clockwise)", "number", record.rotation ?? 0],
     ["skewX", "Horizontal skew (degrees)", "number", record.skewX ?? 0],

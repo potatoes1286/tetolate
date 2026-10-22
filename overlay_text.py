@@ -27,7 +27,7 @@ DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3
 DEFAULT_MIN_POINT_SIZE = 14
 DEFAULT_RENDER_BLEED = 8
-TEXT_LAYOUT_VERSION = 5
+TEXT_LAYOUT_VERSION = 6
 LINE_SPACING_LIMIT = 200
 TEXT_TRANSFORM_LIMITS = {"rotation": 180, "skewX": 60, "skewY": 60}
 PAGE_HEIGHT_MIN_POINT_RATIO = 0.008
@@ -432,10 +432,25 @@ def wrap_line_for_capacity(line: str, capacity: int) -> list[str]:
     return wrapped or [line]
 
 
-@functools.lru_cache(maxsize=512)
-def loaded_layout_font(font: str, point_size: int) -> ImageFont.FreeTypeFont | None:
+def font_file_signature(font: str) -> tuple[int, ...] | None:
+    """Identify a font revision, including same-size and atomic replacements."""
     try:
-        return ImageFont.truetype(font, max(1, point_size))
+        stat = Path(font).stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def loaded_layout_font(font: str, point_size: int) -> ImageFont.FreeTypeFont | None:
+    return _cached_layout_font(font, max(1, point_size), font_file_signature(font))
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_layout_font(
+    font: str, point_size: int, _signature: tuple[int, ...] | None,
+) -> ImageFont.FreeTypeFont | None:
+    try:
+        return ImageFont.truetype(font, point_size)
     except (OSError, ValueError):
         return None
 

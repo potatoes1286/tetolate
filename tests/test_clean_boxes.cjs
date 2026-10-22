@@ -136,7 +136,7 @@ test("save and preview API serialize clean boxes separately from text", async ()
     assert.equal(body.recordsByArtifact.clean_boxes.length, 1);
     assert.equal(body.recordsByArtifact.placements.length, 1);
     return page.document;
-  }}, resetting: false, byId: () => ({}), loadTypesettingView: async () => {}});
+  }}, resetting: false, savePromise: null, byId: () => ({}), loadTypesettingView: async () => {}});
   vm.runInContext(fn("save"), page.context);
   await page.context.save();
   assert.equal(page.store.dirty, false);
@@ -167,7 +167,7 @@ test("Last Render and current saved output never start cleaning", async () => {
 
 test("view controls include Last Render, with no Re-render or clean delete buttons", () => {
   const page = setup(), buttons = [];
-  Object.assign(page.context, {typesettingView: "current", hidePreviewBoxes: false, canvas: page.canvas, ocrAreaRunning: false, queuedAction: "",
+  Object.assign(page.context, {typesettingView: "current", hideEditorBoxes: false, canvas: page.canvas, ocrAreaRunning: false, queuedAction: "",
     byId: () => ({replaceChildren() {}}), selectTypesettingView() {},
     addButton: (_target, text, _handler, _title, _tooltip, shortcut) => {
       buttons.push({text, shortcut}); return {classList: {toggle() {}}};
@@ -179,13 +179,13 @@ test("view controls include Last Render, with no Re-render or clean delete butto
   assert.doesNotMatch(app, /addButton\([^\n]*"Delete clean box"/);
 });
 
-test("Preview Hide boxes toggle is reversible and is not applied to other views or stages", () => {
+test("Hide boxes is reversible in all three stages and limited to Preview in Typesetting", () => {
   const page = setup();
   const element = () => ({children: [], listeners: {}, dataset: {}, append(...children) {this.children.push(...children);},
     replaceChildren() {this.children = [];}, addEventListener(name, callback) {this.listeners[name] = callback;}});
   const target = element();
-  Object.assign(page.context, {typesettingView: "preview", hidePreviewBoxes: false, canvas: page.canvas,
-    groupChecked() {}, splitGroup() {},
+  Object.assign(page.context, {typesettingView: "preview", hideEditorBoxes: false, canvas: page.canvas,
+    groupChecked() {}, splitGroup() {}, moveSelected() {}, retranslate() {},
     ocrAreaRunning: false, queuedAction: "", byId: () => target,
     document: {createElement: element, createTextNode: (text) => ({text})},
     addButton: () => ({classList: {toggle() {}}})});
@@ -204,12 +204,20 @@ test("Preview Hide boxes toggle is reversible and is not applied to other views 
   assert.equal(page.canvas.hideBoxes, false);
   page.context.typesettingView = "preview"; page.context.renderTools();
   assert.equal(page.canvas.hideBoxes, true);
-  page.store.stage = "ocr"; page.context.renderTools();
-  assert.equal(page.canvas.hideBoxes, false);
+  for (const stage of ["ocr", "text"]) {
+    page.store.stage = stage; page.context.renderTools();
+    assert.equal(page.canvas.hideBoxes, true);
+    const toggle = target.children[0].children[0];
+    assert.equal(toggle.checked, true);
+    toggle.checked = false; toggle.listeners.change();
+    assert.equal(page.canvas.hideBoxes, false);
+    toggle.checked = true; toggle.listeners.change();
+    assert.equal(page.canvas.hideBoxes, true);
+  }
   assert.equal(JSON.stringify(page.store.records), before);
 });
 
-test("H activates only the Preview Hide boxes checkbox and never interrupts typing", () => {
+test("H activates the visible Hide boxes checkbox and never interrupts typing", () => {
   const page = setup();
   let keydown, visible = true, clicks = 0, prevented = 0;
   const checkbox = {disabled: false, click() { clicks++; }};
@@ -249,7 +257,7 @@ test("Delete key still removes clean boxes, but not while typing", () => {
   page.store.undo(); assert.equal(page.store.records.clean_boxes.length, 1);
 });
 
-test("background API sends only cleaning records and an abort signal", async () => {
+test("background API sends only cleaning records and does not abort accepted server work", async () => {
   let body, url, signal;
   const Api = vm.runInNewContext(read("api.js").replace("export class", "class") + "\nEditorApi", {
     fetch: async (target, options) => { url = target; signal = options.signal; body = JSON.parse(options.body); return {ok: true, json: async () => ({ok: true})}; },
@@ -258,5 +266,5 @@ test("background API sends only cleaning records and an abort signal", async () 
   await new Api("default", "test").cleanPreview(0, [], [], controller.signal);
   assert.match(url, /pages\/0\/clean-preview$/);
   assert.deepEqual(Object.keys(body).sort(), ["cleanBoxes", "cleanRecords"]);
-  assert.equal(signal, controller.signal);
+  assert.equal(signal, undefined);
 });

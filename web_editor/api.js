@@ -25,6 +25,8 @@ async function request(url, options = {}) {
 export class EditorApi {
   constructor(category, jobId) {
     this.root = `/api/job/${encodeURIComponent(category)}/${encodeURIComponent(jobId)}/editor/v2`;
+    this.cleaning = false;
+    this.pendingCleaning = null;
   }
 
   load(stage, page, signal) {
@@ -78,17 +80,48 @@ export class EditorApi {
   }
 
   preview(stage, page, records, cleanRecords, cleanBoxes = [], signal) {
-    return request(`${this.root}/pages/${page}/stages/${stage}/preview`, {
-      method: "POST", headers: jsonHeaders, signal,
-      body: JSON.stringify({ records, cleanRecords, cleanBoxes }),
-    });
+    return this.queueCleaning(`${this.root}/pages/${page}/stages/${stage}/preview`,
+      {records, cleanRecords, cleanBoxes}, signal);
   }
 
   cleanPreview(page, cleanRecords, cleanBoxes, signal) {
-    return request(`${this.root}/pages/${page}/clean-preview`, {
-      method: "POST", headers: jsonHeaders, signal,
-      body: JSON.stringify({cleanRecords, cleanBoxes}),
+    return this.queueCleaning(`${this.root}/pages/${page}/clean-preview`,
+      {cleanRecords, cleanBoxes}, signal);
+  }
+
+  queueCleaning(url, body, signal) {
+    return new Promise((resolve, reject) => {
+      const job = {url, body: JSON.stringify(body), signal, resolve, reject};
+      job.cancel = () => {
+        if (this.pendingCleaning === job) this.pendingCleaning = null;
+        signal?.removeEventListener("abort", job.cancel);
+        const error = new Error("Preview superseded.");
+        error.name = "AbortError";
+        reject(error);
+      };
+      if (signal?.aborted) { job.cancel(); return; }
+      this.pendingCleaning?.cancel();
+      this.pendingCleaning = job;
+      signal?.addEventListener("abort", job.cancel, {once: true});
+      void this.runCleaning();
     });
+  }
+
+  async runCleaning() {
+    if (this.cleaning || !this.pendingCleaning) return;
+    const job = this.pendingCleaning;
+    this.pendingCleaning = null;
+    this.cleaning = true;
+    try {
+      // Keep the network request alive after caller cancellation. Aborting
+      // fetch does not stop LaMa, and would let obsolete server work pile up.
+      job.resolve(await request(job.url, {method: "POST", headers: jsonHeaders, body: job.body}));
+    } catch (error) { job.reject(error); }
+    finally {
+      job.signal?.removeEventListener("abort", job.cancel);
+      this.cleaning = false;
+      void this.runCleaning();
+    }
   }
 
   async textLayout(page, record, signal) {

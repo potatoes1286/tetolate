@@ -134,7 +134,7 @@ function navigationSetup() {
   page.api.load = (stage, number, signal) => { const request = deferred(); pendingLoads.push({stage, number, signal, ...request}); return request.promise; };
   const elements = new Map();
   const context = vm.createContext({store: page.store, api: page.api, canvas: page.canvas, preview: page.preview,
-    loading: false, loadRequest: 0, loadController: null, currentPreviewRequest: null, navigationPage: null,
+    loading: false, loadRequest: 0, loadController: null, currentPreviewRequest: null, navigationPage: null, navigationRequest: 0, savePromise: null,
     typesettingView: "preview", AbortController, mergeSelection: new Set(), config: {pageCount: 10},
     AVAILABLE_STAGES: ["ocr", "text", "placement"], setStatus: page.status,
     imageUrl: () => "original", loadRevisions: async () => {},
@@ -142,6 +142,110 @@ function navigationSetup() {
   for (const name of ["load", "navigate", "selectPage", "loadTypesettingView", "exactPreview"]) vm.runInContext(fn(name), context);
   return {...page, context, pendingLoads};
 }
+
+function queuedCleaning(page) {
+  const network = [];
+  const Api = vm.runInNewContext(read("api.js").replace("export class", "class") + "\nEditorApi", {
+    fetch: (url, options) => new Promise((resolve) => {
+      network.push({url, body: JSON.parse(options.body),
+        finish: (url) => resolve({ok: true, json: async () => ({url})})});
+    }),
+  });
+  const api = new Api("default", "test");
+  page.api.cleanPreview = api.cleanPreview.bind(api);
+  return network;
+}
+
+test("rapid clean-box edits send the active mask and final mask, not intermediate masks", async () => {
+  const page = setup(), network = queuedCleaning(page);
+  page.preview.show(); await settle();
+  for (let left = 40; left <= 70; left += 10) {
+    page.store.mutate((records) => { records.clean_boxes = [{recordId: "clean", region: [left, 40, 90, 70]}]; });
+    await page.advance();
+    assert.equal(network.length, 1, "edits wait in the browser instead of the server queue");
+  }
+  network[0].finish("obsolete"); await settle();
+  assert.equal(network.length, 2);
+  assert.equal(network[1].body.cleanBoxes[0].region[0], 70);
+  assert.notEqual(page.loads.at(-1)[0], "obsolete");
+  network[1].finish("latest"); await settle();
+  assert.equal(page.loads.at(-1)[0], "latest");
+});
+
+test("rapid page navigation loads new pages immediately and skips obsolete waiting cleaning", async () => {
+  const page = navigationSetup(), network = queuedCleaning(page);
+  page.preview.show(); await settle();
+  for (const number of [4, 5]) {
+    const navigating = page.context.navigate("placement", number);
+    page.pendingLoads.at(-1).resolve(documentFor(number));
+    await navigating; await settle();
+    assert.equal(page.store.page, number);
+    assert.equal(page.loads.at(-1)[0], `original-${number}`);
+    assert.equal(network.length, 1);
+  }
+  network[0].finish("obsolete-page-3"); await settle();
+  assert.equal(network.length, 2);
+  assert.match(network[1].url, /pages\/5\/clean-preview$/);
+  assert.equal(page.loads.at(-1)[0], "original-5");
+  network[1].finish("clean-page-5"); await settle();
+  assert.equal(page.loads.at(-1)[0], "clean-page-5");
+});
+
+test("leaving Preview drops pending clean-box edits but lets the active request finish", async () => {
+  const page = setup(), network = queuedCleaning(page);
+  page.preview.show(); await settle();
+  page.store.mutate((records) => { records.clean_boxes = [{recordId: "clean", region: [40, 40, 70, 70]}]; });
+  await page.advance();
+  page.preview.hide(); await page.canvas.load("original");
+  network[0].finish("obsolete"); await settle();
+  assert.equal(network.length, 1);
+  assert.equal(page.loads.at(-1)[0], "original");
+  page.preview.show(); await settle();
+  assert.equal(network.length, 2);
+  assert.equal(network[1].body.cleanBoxes.length, 1);
+  network[1].finish("fresh"); await settle();
+  assert.equal(page.loads.at(-1)[0], "fresh");
+});
+
+test("dirty rapid navigation shares one save and the last page request wins", async () => {
+  for (const fail of [false, true]) {
+    const page = navigationSetup(), saves = [];
+    Object.assign(page.context, {resetting: false, SCREEN: {placement: {artifacts: ["placements", "clean_boxes"]}}});
+    page.api.save = () => { const pending = deferred(); saves.push(pending); return pending.promise; };
+    vm.runInContext(fn("save"), page.context);
+    page.store.mutate((records) => { records.clean_boxes.push({recordId: "new", region: [10, 10, 40, 40]}); });
+    const fourth = page.context.navigate("placement", 4);
+    const fifth = page.context.navigate("placement", 5);
+    assert.equal(saves.length, 1);
+    assert.equal(page.context.navigationPage, 5);
+    if (fail) saves[0].reject(new Error("Save failed"));
+    else saves[0].resolve(documentFor(3));
+    await settle();
+    if (fail) {
+      assert.equal(page.pendingLoads.length, 0); assert.equal(page.store.dirty, true);
+      assert.equal(page.context.navigationPage, null);
+    } else {
+      assert.deepEqual(page.pendingLoads.map((item) => item.number), [5]);
+      page.pendingLoads[0].resolve(documentFor(5));
+    }
+    await Promise.all([fourth, fifth]);
+    assert.equal(page.store.page, fail ? 3 : 5);
+  }
+});
+
+test("edits made during save stay dirty with the new revision", async () => {
+  const page = navigationSetup(), pending = deferred();
+  Object.assign(page.context, {resetting: false, SCREEN: {placement: {artifacts: ["placements"]}}});
+  page.api.save = () => pending.promise;
+  vm.runInContext(fn("save"), page.context);
+  page.store.mutate((records) => { records.placements[0].fontSizeWidthPercent = 2; });
+  const save = page.context.save();
+  page.store.mutate((records) => { records.placements[0].fontSizeWidthPercent = 3; });
+  pending.resolve({...documentFor(3), revision: 2}); await save;
+  assert.equal(page.store.dirty, true);
+  assert.equal(page.store.document.revision, 2);
+  assert.equal(page.store.records.placements[0].fontSizeWidthPercent, 3);
+});
 
 test("page-number entry navigates to the first and last pages", async () => {
   const page = navigationSetup(), input = page.context.byId("page-select");

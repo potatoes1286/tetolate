@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added a draggable bottom edge to make the editor taller and scroll the top bars out of view, with keyboard resizing and reset.
+- Show the last page number beside editor page entry and provide Hide boxes (H) in OCR & Merge and Text & Translation.
+- Added editable source and translated text above the box coordinates in Typesetting, shared with Text & Translation.
 - Added automatic chapter ordering and shared translation notes for series categories.
 - Added CLI and JSON API access to non-editor web actions, with revocable tokens.
 - Added category-series ComicInfo templates and ZIP collection exports by chapter or volume, in PNG, WebP, or JXL.
@@ -20,6 +23,7 @@
 
 ### Changed
 
+- Compacted editor headers and fields, moved stage tools across the full width, paired typesetting settings, and replaced field protection/reset labels with P/R controls.
 - Removed job-level series-note buttons; volume and chapter can be edited after generation.
 - Series are now categories, with optional volume and decimal chapter numbers. Removed separate series records and selectors.
 - Series API and CLI actions now use category names instead of series IDs.
@@ -37,6 +41,17 @@
 
 ### Fixed
 
+- Keep pending OCR additions linked to their saved translations and Typesetting boxes, so moving a box and switching tabs does not create duplicates.
+- Keep Typesetting field protection controls when source, translation, and placement records share an ID.
+- Keep editor panes within the window so selecting a box does not expand the page and shift the view.
+- Replacing a font reloads its cached measurements and invalidates text previews, preventing mixed font sizes from stale measurements.
+- Editor cleaning keeps one active request and only the newest waiting draft per tab, shared by Preview and Current, so rapid edits do not queue obsolete LaMa passes.
+- Finish Edits restores prior page images, cleaning masks, and editor data if publication fails; an unchanged finish keeps existing exports.
+- Title changes discard old and in-progress CBZ exports, including collection exports.
+- OCR endpoint checks reject redirects without forwarding API keys.
+- Rapid editor navigation shares pending saves and keeps the last requested page; edits made during a save stay unsaved.
+- Deleting part of an OCR group updates its source text and bounds; reset restores the group.
+- Category paths with extra spaces are rejected instead of creating orphan settings folders.
 - Remember VLM API keys per endpoint across sessions and new jobs.
 - Outline width 0 disables the outline in editor previews and final renders.
 - Category renames wait for starting jobs and CBZ exports, preventing orphaned jobs and stuck exports.

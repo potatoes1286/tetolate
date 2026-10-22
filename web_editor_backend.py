@@ -20,7 +20,7 @@ import lama_inpaint
 import overlay_text
 import paddle_ocr_image
 import translate_cbz
-from web_storage import write_json_atomic
+from web_storage import rollback_files, write_json_atomic
 
 
 def parse_region(value: Any, label: str) -> list[int]:
@@ -233,6 +233,15 @@ class EditorManagerMixin:
     ) -> None:
         structured = artifacts.setdefault("ocr_structured", [])
         represented_sources = {source for record in structured for source in record.get("sourceBoxnos", [])}
+        structured_boxnos = {record["boxno"] for record in structured}
+        # Pending sources are display-only until Structure runs. Reuse a saved
+        # descendant's number by OCR lineage, never by its edited coordinates.
+        saved_by_sources = {}
+        for artifact in ("placements", "translations", "alt_placement"):
+            for record in artifacts.get(artifact, []):
+                lineage = frozenset(record.get("sourceBoxnos", []))
+                if lineage and isinstance(record.get("boxno"), int):
+                    saved_by_sources.setdefault(lineage, record["boxno"])
         raw_by_boxno = {record["boxno"]: record for record in artifacts.get("ocr_raw", [])}
         for merged in artifacts.get("ocr_merged", []):
             sources = [source for source in merged.get("sourceBoxnos", [])
@@ -251,9 +260,13 @@ class EditorManagerMixin:
                     pending["region"] = [min(region[0] for region in regions), min(region[1] for region in regions),
                                          max(region[2] for region in regions), max(region[3] for region in regions)]
             boxno = merged.get("boxno")
-            if boxno in reserved_boxnos:
+            saved_boxno = saved_by_sources.get(frozenset(sources))
+            if saved_boxno is not None and saved_boxno not in structured_boxnos:
+                boxno = saved_boxno
+            elif boxno in reserved_boxnos:
                 boxno = max(reserved_boxnos, default=-1) + 1
             reserved_boxnos.add(boxno)
+            structured_boxnos.add(boxno)
             structured.append(
                 {
                     "page": page,
@@ -296,6 +309,7 @@ class EditorManagerMixin:
                     {
                         "page": page,
                         "boxno": boxno,
+                        "sourceBoxnos": copy.deepcopy(record.get("sourceBoxnos", [])),
                         "text": record.get("text", ""),
                         "englishText": "",
                     }
@@ -305,6 +319,7 @@ class EditorManagerMixin:
                     {
                         "page": page,
                         "boxno": boxno,
+                        "sourceBoxnos": copy.deepcopy(record.get("sourceBoxnos", [])),
                         "placementRegion": copy.deepcopy(record.get("region")),
                     }
                 )
@@ -313,6 +328,7 @@ class EditorManagerMixin:
                     {
                         "page": page,
                         "boxno": boxno,
+                        "sourceBoxnos": copy.deepcopy(record.get("sourceBoxnos", [])),
                         "safeToEraseOriginal": True,
                         "openLettering": False,
                         "altPlacementReason": "unclear",
@@ -458,6 +474,12 @@ class EditorManagerMixin:
             )[0]
 
     def editor_v2_protection_payload(self, manifest: dict[str, Any], page: int, stage: str) -> dict[str, Any]:
+        if stage == "placement":
+            state = editor_v2.protection_payload(manifest, page, stage)
+            text_state = self.editor_v2_protection_payload(manifest, page, "text")
+            for rid, fields in text_state["records"].items():
+                state["records"].setdefault(rid, {}).update(fields)
+            return state
         if stage != "text":
             return editor_v2.protection_payload(manifest, page, stage)
         records: dict[str, dict[str, bool]] = {}
@@ -595,6 +617,55 @@ class EditorManagerMixin:
         result.extend(pending)
         return result
 
+    def apply_typesetting_text_edits(
+        self, code: str, job_id: str, manifest: dict[str, Any], page: int,
+        edits: Any, display: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        if not isinstance(edits, list):
+            raise HTTPException(400, "textEdits must be an array.")
+        seen = set()
+        for edit in edits:
+            if not isinstance(edit, dict) or edit.get("artifact") not in {"ocr_structured", "translations"}:
+                raise HTTPException(400, "Text edits must refer to source text or translations.")
+            artifact, boxno = edit["artifact"], edit.get("boxno")
+            rid, value = edit.get("recordId"), edit.get("value")
+            if (isinstance(boxno, bool) or not isinstance(boxno, int) or boxno < 0
+                    or not isinstance(rid, str) or not rid or not isinstance(value, str) or len(value) > 100_000):
+                raise HTTPException(400, "Text edits require a record ID, box number, and text of at most 100000 characters.")
+            if (artifact, boxno) in seen:
+                raise HTTPException(400, "Each text record can be edited only once per save.")
+            seen.add((artifact, boxno))
+            if not any(record.get("boxno") == boxno for record in display["placements"]):
+                raise HTTPException(400, "Text edit has no visible typesetting box.")
+            original = next((record for record in display[artifact] if record.get("boxno") == boxno), None)
+            if original is not None and original["recordId"] != rid:
+                raise HTTPException(400, "Text edit does not match the saved record.")
+            if original is None:
+                if artifact != "translations" or not any(record.get("boxno") == boxno for record in display["ocr_structured"]):
+                    raise HTTPException(400, "Source text record not found.")
+                original = {"page": page, "boxno": boxno, "recordId": rid, "englishText": ""}
+            field = "text" if artifact == "ocr_structured" else "englishText"
+            if value == original.get(field, ""):
+                continue
+            member = "structure" if artifact == "ocr_structured" else "translation"
+            records = self.editor_v2_effective_records(code, job_id, manifest, artifact, page)
+            record = next((record for record in records if record["recordId"] == rid), None)
+            if record is None:
+                if any(record["recordId"] == rid or record.get("boxno") == boxno for record in records):
+                    raise HTTPException(400, "Text record identity is already in use.")
+                record = copy.deepcopy(original)
+                records.append(record)
+            record[field] = value
+            editor_v2.update_artifact_override(manifest, page, member, artifact,
+                self.load_editor_v2_baseline(code, job_id, artifact, page), records)
+            # Structure and erase share these records. A later frozen erase
+            # snapshot must keep the corrected source text as well.
+            for frozen_member in (("structure", "erase") if artifact == "ocr_structured" else (member,)):
+                if editor_v2.stage_override(manifest, page, frozen_member).get("frozen"):
+                    editor_v2.artifact_override(manifest, page, frozen_member, artifact)["freeze"] = {
+                        "records": editor_v2.hydrate_ids(artifact, page, records), "protected": True,
+                    }
+
     def save_editor_v2_update(
         self,
         code: str,
@@ -622,10 +693,13 @@ class EditorManagerMixin:
                     detail="The editor changed after this page was loaded. Reload before saving.",
                 )
             before = self.editor_v2_snapshot(code, job_id, manifest, page, (stage,))[stage]
+            text_before = self.editor_v2_snapshot(code, job_id, manifest, page, ("structure", "translation")) if stage == "placement" else {}
             supplied = data.get("recordsByArtifact")
             if not isinstance(supplied, dict):
                 raise HTTPException(status_code=400, detail="recordsByArtifact must be an object.")
             display = self.editor_v2_payload(code, job_id, stage, page)["recordsByArtifact"]
+            if stage == "placement":
+                self.apply_typesetting_text_edits(code, job_id, manifest, page, data.get("textEdits", []), display)
             if stage == "ocr":
                 deleted_groups = data.get("deletedOcrGroupIds", [])
                 if not isinstance(deleted_groups, list) or any(not isinstance(value, str) for value in deleted_groups):
@@ -769,7 +843,10 @@ class EditorManagerMixin:
                     else:
                         pages.pop(str(page), None)
             if stage == "placement":
-                editor_v2.mark_stages_saved(manifest, page, (stage,), before={stage: before})
+                snapshots = {**text_before, stage: before}
+                after = self.editor_v2_snapshot(code, job_id, manifest, page, tuple(snapshots))
+                changed = {member for member in snapshots if snapshots[member] != after[member]}
+                editor_v2.mark_stages_saved(manifest, page, changed, before=snapshots)
             else:
                 editor_v2.mark_saved(manifest, page, stage, before=before)
             self.save_editor_v2_manifest(code, job_id, manifest)
@@ -891,6 +968,13 @@ class EditorManagerMixin:
     ) -> dict[str, Any]:
         if stage == "text":
             return self.set_editor_v2_text_protection(code, job_id, page, data)
+        if stage == "placement" and data.get("pipelineStage") in {"structure", "translation"}:
+            allowed = {("structure", "ocr_structured", "text"), ("translation", "translations", "englishText")}
+            if data.get("action") not in {"field", "revert-field"} or (data["pipelineStage"], data.get("artifact"), data.get("field")) not in allowed:
+                raise HTTPException(400, "Only source and translated text fields can be changed here.")
+            with self._lock:
+                self.set_editor_v2_text_protection(code, job_id, page, data)
+                return self.editor_v2_payload(code, job_id, stage, page)
         try:
             stage = editor_v2.validate_stage(stage)
         except ValueError as exc:
@@ -1057,9 +1141,9 @@ class EditorManagerMixin:
                 text = {item["boxno"]: item.get("englishText", "") for item in records["translations"]}
                 snapshots.append({"page": page, "records": records,
                     "entries": self.editor_v2_render_entries(code, job_id, page, records["placements"], text)})
-            self.invalidate_translated_cbz_archives(code, job_id)
             if not pages:
                 return []
+            self.invalidate_translated_cbz_archives(code, job_id)
             write_json_atomic(self.editor_meta_dir(code, job_id) / "finish_edits.json", snapshots)
             status.update(status="queued", phase="Queued", page=None, finishedAt=None,
                           pendingFinishEdits=True, message="Queued to apply editor results without VLM calls.")
@@ -1086,38 +1170,51 @@ class EditorManagerMixin:
                     rendered = Path(directory) / f"{original.stem}.png"
                     overlay_text.overlay_text(snapshot["entries"], source, rendered)
                     prepared.append((rendered, final_dir / rendered.name, source))
-                for rendered, destination, source in prepared:
-                    rendered.replace(destination)
-                    cleaned = self.output_dir(code, job_id) / "pages/cleaned" / destination.name
-                    cleaned.parent.mkdir(parents=True, exist_ok=True)
-                    if source != cleaned:
-                        shutil.copyfile(source, cleaned)
-                        mask = source.with_suffix(".mask.png")
-                        if mask.is_file():
-                            saved_mask = self.output_dir(code, job_id) / "debug/masks" / destination.name
-                            saved_mask.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copyfile(mask, saved_mask)
-            with self._lock:
-                manifest = self.load_editor_v2_manifest(code, job_id)
-                for snapshot in snapshots:
-                    page = snapshot["page"]
-                    for artifact, values in snapshot["records"].items():
-                        write_json_atomic(self.output_dir(code, job_id) / "data" / artifact / f"page_{page:04d}.json", values)
-                    write_json_atomic(self.output_dir(code, job_id) / "data/render_entries" / f"page_{page:04d}.json", snapshot["entries"])
-                    manifest["pages"].setdefault(str(page), {}).update(pendingStages=[], pendingBases={}, stale=[])
-                manifest["revision"] += 1
-                manifest["updatedAt"] = editor_v2.utc_now()
-                self.save_editor_v2_manifest(code, job_id, manifest)
-            status.update(status="complete", phase="Complete", page=None, returnCode=0,
-                          message="Editor results applied. No OCR or VLM calls were made.")
-            status.pop("pendingFinishEdits", None)
+                with self._lock:
+                    manifest = self.load_editor_v2_manifest(code, job_id)
+                    targets = [self.editor_v2_manifest_path(code, job_id),
+                        self.editor_v2_history_dir(code, job_id) / f"revision_{manifest['revision'] + 1:08d}.json"]
+                    for rendered, destination, source in prepared:
+                        targets.extend([destination, self.output_dir(code, job_id) / "pages/cleaned" / destination.name,
+                            self.output_dir(code, job_id) / "debug/masks" / destination.name])
+                    for snapshot in snapshots:
+                        targets.extend(self.output_dir(code, job_id) / "data" / artifact / f"page_{snapshot['page']:04d}.json"
+                            for artifact in [*snapshot["records"], "render_entries"])
+                    backups = Path(directory) / "backups"
+                    backups.mkdir()
+                    with rollback_files(targets, backups):
+                        for rendered, destination, source in prepared:
+                            rendered.replace(destination)
+                            cleaned = self.output_dir(code, job_id) / "pages/cleaned" / destination.name
+                            cleaned.parent.mkdir(parents=True, exist_ok=True)
+                            if source != cleaned:
+                                shutil.copyfile(source, cleaned)
+                                mask = source.with_suffix(".mask.png")
+                                if mask.is_file():
+                                    saved_mask = self.output_dir(code, job_id) / "debug/masks" / destination.name
+                                    saved_mask.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copyfile(mask, saved_mask)
+                        for snapshot in snapshots:
+                            page = snapshot["page"]
+                            for artifact, values in snapshot["records"].items():
+                                write_json_atomic(self.output_dir(code, job_id) / "data" / artifact / f"page_{page:04d}.json", values)
+                            write_json_atomic(self.output_dir(code, job_id) / "data/render_entries" / f"page_{page:04d}.json", snapshot["entries"])
+                            manifest["pages"].setdefault(str(page), {}).update(pendingStages=[], pendingBases={}, stale=[])
+                        manifest["revision"] += 1
+                        manifest["updatedAt"] = editor_v2.utc_now()
+                        self.save_editor_v2_manifest(code, job_id, manifest)
+                        status.update(status="complete", phase="Complete", page=None, returnCode=0,
+                                      finishedAt=editor_v2.utc_now(),
+                                      message="Editor results applied. No OCR or VLM calls were made.")
+                        status.pop("pendingFinishEdits", None)
+                        self.save_status(code, job_id, status)
         except Exception:
             status.update(status="failed", phase="Failed", returnCode=1,
+                          pendingFinishEdits=True,
                           message="Could not apply editor results. Check the server log and retry.")
-            raise
-        finally:
             status["finishedAt"] = editor_v2.utc_now()
             self.save_status(code, job_id, status)
+            raise
 
     def rerun_editor_v2_page(self, code: str, job_id: str, stage: str, page: int) -> str:
         try:
@@ -1434,10 +1531,8 @@ class EditorManagerMixin:
             entry["region"] = [0, 0, width, height]
             entry.pop("boxno", None)
             entry.pop("page", None)
-            font = Path(entry["font"])
-            font_stat = font.stat() if font.is_file() else None
             signature = [overlay_text.TEXT_LAYOUT_VERSION, entry, image_width, image_height,
-                         [font_stat.st_size, font_stat.st_mtime_ns] if font_stat else None]
+                         overlay_text.font_file_signature(entry["font"])]
             key = hashlib.sha256(json.dumps(signature, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             output = directory / f"{key}.png"
             outputs.append(output)
@@ -1476,12 +1571,10 @@ class EditorManagerMixin:
             font_path = Path(str(entry["font"]))
             if not font_path.is_file():
                 continue
-            font_stat = font_path.stat()
             font_signatures.append(
                 {
                     "path": str(font_path.resolve()),
-                    "size": font_stat.st_size,
-                    "mtimeNs": font_stat.st_mtime_ns,
+                    "revision": overlay_text.font_file_signature(str(font_path)),
                 }
             )
         cache_payload = {
@@ -1655,7 +1748,7 @@ class EditorManagerMixin:
             source_regions = [raw_by_boxno[boxno]["region"] for boxno in source_boxnos]
             source_texts = [str(raw_by_boxno[boxno].get("text", "")) for boxno in source_boxnos]
             region = record.get("region")
-            if isinstance(region, list) and len(region) == 4:
+            if source_boxnos == record.get("sourceBoxnos", []) and isinstance(region, list) and len(region) == 4:
                 region = self.clamp_editor_region(region, width, height, f"mergedRecords[{index}].region")
             else:
                 region = [

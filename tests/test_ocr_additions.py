@@ -39,6 +39,119 @@ class OcrAdditionTests(unittest.TestCase):
         self.manager.save_editor_v2_manifest(self.code, self.job_id, manifest)
         write_json_atomic(self.data_dir / "ocr_raw/page_0000.json", raw)
 
+    def save_placements(self, payload):
+        # The shared fixture uses a made-up generated font. Use the configured
+        # backup font so this test exercises normal placement validation.
+        for record in payload["recordsByArtifact"]["placements"]:
+            record.pop("font", None)
+        return self.save(payload)
+
+    def test_moving_pending_typesetting_boxes_does_not_create_more_boxes_on_tab_changes(self):
+        self.old_orphans()
+        original = self.payload("placement")
+        expected_sources = {tuple(record["sourceBoxnos"]): (record["boxno"], record["recordId"])
+                            for record in self.missed(original["recordsByArtifact"]["ocr_structured"])}
+        expected_placements = {record["boxno"]: record["recordId"]
+                               for record in original["recordsByArtifact"]["placements"]}
+        for iteration in range(4):
+            payload = self.payload("placement")
+            for source in self.missed(payload["recordsByArtifact"]["ocr_structured"]):
+                placement = next(record for record in payload["recordsByArtifact"]["placements"]
+                                 if record["boxno"] == source["boxno"])
+                placement["placementRegion"] = [5 + iteration, 10, 25 + iteration, 35]
+            saved = self.save_placements(payload)
+            for stage in ("ocr", "text", "placement"):
+                records = self.payload(stage)["recordsByArtifact"]
+                self.assertEqual(len(records["placements"]), 4)
+                self.assertEqual(len(records["ocr_structured"]), 4)
+                self.assertEqual({tuple(record["sourceBoxnos"]): (record["boxno"], record["recordId"])
+                                  for record in self.missed(records["ocr_structured"])}, expected_sources)
+                self.assertEqual({record["boxno"]: record["recordId"] for record in records["placements"]}, expected_placements)
+                for record in records["placements"]:
+                    if record["boxno"] in {value[0] for value in expected_sources.values()}:
+                        self.assertEqual(record["placementRegion"], [5 + iteration, 10, 25 + iteration, 35])
+            self.assertEqual(saved["rerunFrom"], "ocr_structured")
+        manifest = self.manager.load_editor_v2_manifest(self.code, self.job_id)
+        self.assertEqual(len(self.manager.editor_v2_effective_records(self.code, self.job_id, manifest, "ocr_structured", 0)), 2)
+        self.assertEqual(editor_v2.pending_changes(manifest)[0], {"ocr", "placement"})
+
+    def test_editing_only_a_pending_translation_keeps_its_source_identity(self):
+        self.old_orphans()
+        payload = self.payload("text")
+        source = self.missed(payload["recordsByArtifact"]["ocr_structured"])[0]
+        translation = next(record for record in payload["recordsByArtifact"]["translations"] if record["boxno"] == source["boxno"])
+        translation["englishText"] = "Manual translation"
+        self.save(payload)
+        for stage in ("text", "placement", "ocr", "placement"):
+            records = self.payload(stage)["recordsByArtifact"]
+            repeated = next(record for record in self.missed(records["ocr_structured"])
+                            if record["sourceBoxnos"] == source["sourceBoxnos"])
+            self.assertEqual((repeated["boxno"], repeated["recordId"]), (source["boxno"], source["recordId"]))
+            self.assertEqual(next(record for record in records["translations"] if record["boxno"] == source["boxno"])["englishText"], "Manual translation")
+            self.assertEqual(len(records["placements"]), 4)
+
+    def test_newly_drawn_box_keeps_moved_placement_after_reload_and_reset(self):
+        payload = self.payload()
+        payload["recordsByArtifact"]["ocr_raw"].append({"page": 0, "boxno": 2, "recordId": "raw-drawn",
+            "ocrSource": "manual", "region": [50, 60, 80, 90], "text": ""})
+        payload["recordsByArtifact"]["ocr_merged"].append({"page": 0, "boxno": 2, "recordId": "group-drawn",
+            "ocrSource": "manual", "region": [50, 60, 80, 90], "sourceBoxnos": [2], "sourceTexts": [""], "text": ""})
+        self.save(payload)
+        payload = self.payload("placement")
+        source = next(record for record in payload["recordsByArtifact"]["ocr_structured"] if record["sourceBoxnos"] == [2])
+        placement = next(record for record in payload["recordsByArtifact"]["placements"] if record["boxno"] == source["boxno"])
+        rid = placement["recordId"]
+        placement["placementRegion"] = [5, 5, 20, 25]
+        saved = self.save_placements(payload)
+        restarted = web_app.JobManager(self.manager.config)
+        restarted.initialize_web_state()
+        for stage in ("ocr", "text", "placement"):
+            records = restarted.editor_v2_payload(self.code, self.job_id, stage, 0)["recordsByArtifact"]
+            self.assertEqual(len(records["placements"]), 3)
+            moved = next(record for record in records["placements"] if record["recordId"] == rid)
+            self.assertEqual(moved["placementRegion"], [5, 5, 20, 25])
+        reset = self.manager.reset_editor_v2_stage(self.code, self.job_id, 0, "placement", {"baseRevision": saved["revision"]})
+        self.assertEqual(len(reset["recordsByArtifact"]["placements"]), 3)
+        restored = next(record for record in reset["recordsByArtifact"]["placements"] if record["recordId"] == rid)
+        self.assertEqual(restored["placementRegion"], [50, 60, 80, 90])
+
+    def test_pending_box_identity_survives_frozen_typesetting_and_collision_with_generated_box(self):
+        baseline = self.manager.load_editor_v2_baseline(self.code, self.job_id, "placements", 0)
+        extra = {"page": 0, "boxno": 2, "placementRegion": [30, 30, 45, 50], "recordId": "generated-extra"}
+        write_json_atomic(self.manager.editor_v2_generated_path(self.code, self.job_id, "placements", 0), [*baseline, extra])
+        self.old_orphans()
+        payload = self.payload("placement")
+        source = self.missed(payload["recordsByArtifact"]["ocr_structured"])[0]
+        self.assertNotEqual(source["boxno"], 2)
+        moved = next(record for record in payload["recordsByArtifact"]["placements"] if record["boxno"] == source["boxno"])
+        moved["placementRegion"] = [5, 5, 20, 25]
+        saved = self.save_placements(payload)
+        frozen = self.manager.set_editor_v2_protection(self.code, self.job_id, 0, "placement", {
+            "baseRevision": saved["revision"], "action": "freeze-stage", "protected": True})
+        for stage in ("ocr", "text", "placement"):
+            records = self.payload(stage)["recordsByArtifact"]
+            self.assertEqual(len(records["placements"]), 5)
+            current = next(record for record in records["placements"] if record["recordId"] == moved["recordId"])
+            self.assertEqual(current["placementRegion"], [5, 5, 20, 25])
+            self.assertEqual(next(record for record in records["placements"] if record["recordId"] == "generated-extra")["placementRegion"], [30, 30, 45, 50])
+        self.assertTrue(frozen["stageStates"]["placement"]["frozen"])
+
+    def test_loading_moved_pending_boxes_is_read_only_and_keeps_clean_boxes(self):
+        self.old_orphans()
+        payload = self.payload("placement")
+        source = self.missed(payload["recordsByArtifact"]["ocr_structured"])[0]
+        next(record for record in payload["recordsByArtifact"]["placements"] if record["boxno"] == source["boxno"])["placementRegion"] = [5, 5, 20, 25]
+        payload["recordsByArtifact"]["clean_boxes"] = [{"page": 0, "boxno": 0, "recordId": "clean", "region": [70, 80, 90, 100]}]
+        saved = self.save_placements(payload)
+        paths = [self.manager.editor_v2_manifest_path(self.code, self.job_id),
+                 *(self.data_dir / artifact / "page_0000.json" for artifact in editor_v2.ARTIFACT_STAGES)]
+        before = {path: path.read_bytes() for path in paths}
+        for stage in ("ocr", "text", "placement", "placement"):
+            records = self.payload(stage)["recordsByArtifact"]
+            self.assertEqual(len(records["placements"]), 4)
+            self.assertEqual(records["clean_boxes"], saved["recordsByArtifact"]["clean_boxes"])
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+
     @staticmethod
     def missed(records):
         return [record for record in records if any(source in (8, 9) for source in record.get("sourceBoxnos", []))]

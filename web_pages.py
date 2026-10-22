@@ -1721,23 +1721,20 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     return base_page(
         f"Edit {code} {job_id}",
         f"""
-<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=12">
+<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=15">
 <div class="editor-app" id="editor-app">
   <header class="editor-header">
-    <div>
-      <a href="/job/{escape(code)}/{escape(job_id)}">Back to job</a>
-      <h1>Edit {escape(job_id)}</h1>
-      <p class="muted editor-input">{input_display_html(status)}</p>
+    <div class="job-details">
+      <h1><a href="/job/{escape(code)}/{escape(job_id)}" title="Back to job">Edit {escape(job_id)}</a></h1>
+      <span class="muted editor-input" title="{escape(status.get('inputFilename') or '')}">{input_display_html(status)}</span>
     </div>
+    <nav class="stage-tabs" aria-label="Editor stages">{stage_buttons}</nav>
     <div class="page-nav">
       <button id="prev-page" type="button" title="Previous page (A)">Previous [A]</button>
-      <label>Page <input id="page-select" type="number" min="0" max="{max(0, page_count - 1)}" step="1" value="0" required></label>
+      <label>Page <input id="page-select" type="number" min="0" max="{max(0, page_count - 1)}" step="1" value="0" required> / {max(0, page_count - 1)}</label>
       <button id="next-page" type="button" title="Next page (D)">Next [D]</button>
     </div>
-  </header>
-  {review_notice}
-  <nav class="stage-tabs" aria-label="Editor stages">{stage_buttons}</nav>
-  <div class="action-bar">
+    <div class="action-bar">
     <button id="undo" type="button" title="Undo (Ctrl+Z)" disabled>Undo</button>
     <button id="redo" type="button" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
     <button id="save" type="button" title="Save changes (Ctrl+S)">Save</button>
@@ -1750,7 +1747,11 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     <button id="finish-edits" type="button" data-tooltip="Apply saved edits to final output using only LaMa and ImageMagick. No OCR or VLM calls. Deletes old CBZ exports."{complete_only}>Finish Edits</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>
-  </div>
+    </div>
+  </header>
+  {review_notice}
+  <div id="stage-tools" class="stage-tools"></div>
+  <p id="editor-status" class="status-line muted" role="status"></p>
   <div id="editor-tooltip" class="editor-tooltip" role="tooltip" tabindex="0" hidden></div>
   <main class="editor-workspace">
     <aside class="record-pane">
@@ -1763,8 +1764,6 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     </aside>
     <div id="record-resizer" class="pane-resizer" role="separator" aria-label="Resize records pane" aria-orientation="vertical" tabindex="0"></div>
     <section class="canvas-pane">
-      <div id="stage-tools" class="stage-tools"></div>
-      <p id="editor-status" class="status-line muted" role="status"></p>
       <div class="canvas-wrap" id="canvas-wrap"><canvas id="page-canvas"></canvas></div>
     </section>
     <div id="inspector-resizer" class="pane-resizer" role="separator" aria-label="Resize inspector pane" aria-orientation="vertical" tabindex="0"></div>
@@ -1782,6 +1781,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
       </details>
     </aside>
   </main>
+  <div id="height-resizer" role="separator" aria-label="Resize editor height" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="20000" aria-valuenow="0" tabindex="0" title="Drag down to make the editor taller. Hold near the bottom of the window to keep expanding. Arrow Up/Down resize; Home or double-click resets.">Drag to resize</div>
 </div>
 <script>
 window.TETOLATE_EDITOR_V2 = {{
@@ -1792,6 +1792,6 @@ window.TETOLATE_EDITOR_V2 = {{
   reviewCheckpoint: {json.dumps(status.get("reviewCheckpoint"))},
 }};
 </script>
-<script type="module" src="/assets/editor-v2/app.js?v=14"></script>
+<script type="module" src="/assets/editor-v2/app.js?v=16"></script>
 """,
     )

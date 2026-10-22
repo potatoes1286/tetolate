@@ -224,6 +224,33 @@ class EditorLayerTests(unittest.TestCase):
                 self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])[1])
             self.assertEqual(render.call_count, 2)
 
+    def test_same_size_font_replacement_with_preserved_mtime_invalidates_both_preview_caches(self):
+        font = self.fonts / "Custom.ttf"
+        font.write_bytes(b"old-font")
+        record = {**self.record, "font": font.name}
+        original = self.manager.original_page_path(self.code, self.job_id, 0)
+        def overlay(_entries, _source, output):
+            shutil.copyfile(original, output)
+        with self.renderer() as layers, mock.patch.object(overlay_text, "ensure_magick", return_value="magick"), \
+             mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, False)), \
+             mock.patch.object(overlay_text, "overlay_text", side_effect=overlay) as current:
+            first = self.layer(record)
+            self.assertEqual(first, self.layer(record))
+            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            before = font.stat()
+            replacement = self.fonts / "replacement.ttf"
+            replacement.write_bytes(b"new-font")
+            os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+            replacement.replace(font)
+            self.assertEqual(font.stat().st_size, before.st_size)
+            self.assertEqual(font.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertNotEqual(first, self.layer(record))
+            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            self.assertEqual(layers.call_count, 2)
+            self.assertEqual(current.call_count, 2)
+
     def test_invalid_geometry_styles_text_and_font_paths_are_rejected(self):
         outside = self.root / "secret"
         outside.write_text("secret")

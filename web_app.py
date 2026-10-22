@@ -2128,7 +2128,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             }
 
     def validate_category(self, code: str) -> str:
-        code = code.strip()
+        if code != code.strip():
+            raise HTTPException(status_code=404, detail="Unknown job category.")
         with self._lock:
             exists = code in self._categories
         if not exists:
@@ -3745,6 +3746,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                 raise HTTPException(status_code=404, detail="Unknown job.")
             if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
                 raise HTTPException(status_code=409, detail="Wait for the job to stop before renaming it.")
+            if status.get("jobName") != name:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["jobName"] = name
             self.save_status(code, job_id, status)
         return name
@@ -3763,6 +3766,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                     status_code=409,
                     detail="Wait for the job to stop before changing its title.",
                 )
+            if (status.get("translatedJobName") or "") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             if translated:
                 status["translatedJobName"] = translated
                 status["titleTranslationAttempted"] = True
@@ -3823,6 +3828,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("translatedJobName") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["translatedJobName"] = translated
             status.pop("titleTranslationSkipped", None)
             status.pop("titleTranslationWarning", None)
@@ -3856,6 +3863,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
 
             if manual_title:
                 translated = validate_job_name(manual_title)
+                if status.get("translatedJobName") != translated:
+                    self.invalidate_translated_cbz_archives(code, job_id)
                 status["titleTranslationAttempted"] = True
                 status.pop("titleTranslationSkipped", None)
                 status["translatedJobName"] = translated
@@ -3894,6 +3903,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                 self.save_status(code, job_id, status)
                 return None
             translated = safe_job_name(translated, source_title)
+            if status.get("translatedJobName") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["translatedJobName"] = translated
             status.pop("titleTranslationWarning", None)
             self.save_status(code, job_id, status)

@@ -4636,8 +4636,10 @@ class EditorV2Tests(unittest.TestCase):
             for removed in ("structure", "erase", "translation"):
                 self.assertNotIn(f'data-stage="{removed}"', body)
             self.assertNotIn('data-stage="preview"', body)
-            self.assertIn('/assets/editor-v2/app.js?v=14', body)
+            self.assertIn('/assets/editor-v2/app.js?v=16', body)
             self.assertIn('id="page-select" type="number" min="0"', body)
+            last_page = max(0, len(manager.original_page_files(code, job_id)) - 1)
+            self.assertIn(f'value="0" required> / {last_page}</label>', body)
             self.assertNotIn('id="page-list"', body)
             self.assertNotIn('<datalist', body)
             self.assertNotIn('<select id="page-select"', body)
@@ -4645,10 +4647,17 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('Next [D]', body)
             self.assertIn('id="record-list"', body)
             self.assertIn('id="record-form"', body)
+            header_end = body.index('</header>')
+            for control in ('class="job-details"', 'class="stage-tabs"', 'class="page-nav"', 'class="action-bar"'):
+                self.assertLess(body.index(control), header_end)
+            self.assertLess(header_end, body.index('id="stage-tools"'))
+            self.assertLess(body.index('id="editor-status"'), body.index('<main class="editor-workspace">'))
             self.assertLess(body.index('id="stage-tools"'), body.index('id="editor-status"'))
             self.assertLess(body.index('id="editor-status"'), body.index('id="canvas-wrap"'))
             self.assertIn('id="record-resizer"', body)
             self.assertIn('id="inspector-resizer"', body)
+            self.assertIn('id="height-resizer" role="separator"', body)
+            self.assertIn('aria-label="Resize editor height"', body)
             self.assertIn(
                 "rerun only the steps required by its saved edits",
                 body,

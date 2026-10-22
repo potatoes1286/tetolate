@@ -128,7 +128,7 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     const changes = [];
     vm.runInNewContext(render + "\nrenderInspector()", {
       byId, store: {stage, selection: {artifact: stage === "ocr" ? "ocr_raw" : "placements"},
-        selectedRecord: () => record, document: {fonts: []}},
+        selectedRecord: () => record, records: {translations: []}, document: {fonts: []}},
       document: {createElement: (tag) => new Element(tag), createTextNode: (text) => ({text})},
       fieldsFor: screens.fieldsFor, ALIGNMENT_LABELS: {}, sourceRecord: () => null,
       protectionFor: () => undefined, applyInspector: (_values, target, field) => changes.push([target.stage, field]),
@@ -145,8 +145,12 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
     assert.deepEqual(changes, ["left", "top", "right", "bottom"].map((name) => [stage, name]));
     assert.ok(form.children.some((child) => child.tag === "label"), "other fields stay outside coordinate row");
     if (stage === "placement") {
+      assert.deepEqual(form.children.slice(0, 3).map((child) => child.className === "field-grid"
+        ? "coordinates" : child.children.find((item) => item.tag === "textarea")?.name), ["text", "englishText", "coordinates"]);
+      for (const child of form.children.slice(0, 2))
+        assert.ok(!child.children.find((item) => item.tag === "textarea").readOnly);
       const children = (element) => [element, ...(element.children || []).flatMap(children)];
-      const help = children(form).find((child) => child.className === "field-help");
+      const help = children(form).find((child) => child.className === "field-help" && child.dataset.tooltip.includes("line breaks"));
       assert.equal(help.tabIndex, 0);
       assert.match(help.dataset.tooltip, /Editing this text fixes your chosen line breaks/);
       const manual = children(form).find((child) => child.name === "manualLineBreaks");
@@ -178,6 +182,84 @@ test("OCR and Typesetting coordinates share one row with independent number inpu
   }
   const css = fs.readFileSync(path.join(root, "editor.css"), "utf8");
   assert.match(css, /\.field-grid\s*\{[^}]*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
+});
+
+test("compact Typesetting pairs settings and keeps accessible P/R field actions", () => {
+  class Element {
+    constructor(tag) {this.tag = tag; this.children = []; this.dataset = {}; this.listeners = {};}
+    append(...items) {for (const item of items) {item.parentNode = this; this.children.push(item);}}
+    replaceChildren() {this.children = [];}
+    addEventListener(name, callback) {this.listeners[name] = callback;}
+    setAttribute(name, value) {this[name] = value;}
+  }
+  const elements = {}, changes = [], data = records();
+  const record = {recordId: "placement-0", boxno: 0, placementRegion: [0, 0, 100, 100]};
+  const protection = {"placement-0": {font: true, fill: false, placementRegion: true}};
+  vm.runInNewContext(app.match(/function renderInspector\([^]*?\n\}/)[0] + "\nrenderInspector()", {
+    byId: (id) => elements[id] ||= new Element("div"),
+    store: {stage: "placement", records: data, selection: {artifact: "placements", recordId: record.recordId},
+      selectedRecord: () => record, document: {fonts: [], protection: {records: protection}}},
+    document: {createElement: (tag) => new Element(tag), createTextNode: (text) => ({text})},
+    fieldsFor: screens.fieldsFor, textFieldTarget: screens.textFieldTarget, ALIGNMENT_LABELS: {},
+    sourceRecord: () => data.ocr_structured[0], protectionFor: (id, field) => protection[id]?.[field],
+    changeProtection: (...args) => changes.push(args), refreshLineBreaks() {},
+  });
+  const descendants = (element) => [element, ...(element.children || []).flatMap(descendants)];
+  const all = descendants(elements["record-form"]);
+  for (const field of ["text", "englishText"]) assert.equal(all.find((item) => item.name === field).rows, 2);
+  for (const [pair, expected] of [["font", ["font", "fill"]], ["outline", ["stroke", "strokeWidth"]], ["size", ["gravity", "fontSizeWidthPercent"]]]) {
+    const row = all.find((item) => item.className === `field-pair ${pair}-pair`);
+    assert.deepEqual(row.children.map((wrapper) => descendants(wrapper).find((item) => item.name)?.name), expected);
+  }
+  const fontRow = all.find((item) => item.className === "field-pair font-pair");
+  const fontActions = descendants(fontRow.children[0]).filter((item) => item.tag === "button");
+  assert.deepEqual(fontActions.map((button) => button.textContent), ["P", "R"]);
+  assert.equal(fontActions[0]["aria-pressed"], "true");
+  assert.equal(fontActions[0]["aria-label"], "Unprotect Font");
+  assert.match(fontActions[0].dataset.tooltip, /Allow a later model rerun/);
+  assert.match(fontActions[1].dataset.tooltip, /restore the latest generated value/);
+  fontActions[0].listeners.click(); fontActions[1].listeners.click();
+  assert.deepEqual(changes.map(([action, _record, field, protectedValue]) => [action, field, protectedValue]),
+    [["field", "font", false], ["revert-field", "font", false]]);
+  assert.equal(descendants(fontRow.children[1]).find((item) => item.tag === "button")["aria-pressed"], "false");
+});
+
+test("Typesetting text edits update upstream records without copying text into placements", () => {
+  const data = records();
+  data.placements[0].recordId = "placement-0";
+  const store = {page: 0, records: data, mutate: (callback) => callback(data)};
+  const context = vm.createContext({store, updateTextField: screens.updateTextField, applyFields: screens.applyFields,
+    sourceRecord: (record) => data.ocr_structured.find((source) => source.boxno === record.boxno), newRecordId: () => "new"});
+  vm.runInContext(app.match(/function applyInspector\([^]*?\n\}/)[0], context);
+  const target = {stage: "placement", artifact: "placements", recordId: "placement-0"};
+  const inputs = {text: {value: "Corrected"}, englishText: {value: "Translated"}, left: {type: "number", value: "10"}};
+  context.applyInspector(inputs, target, "text");
+  context.applyInspector(inputs, target, "englishText");
+  context.applyInspector(inputs, target, "left");
+  assert.equal(data.ocr_structured[0].text, "Corrected");
+  assert.equal(data.translations[0].englishText, "Translated");
+  assert.equal(data.placements[0].text, undefined);
+  assert.equal(data.placements[0].englishText, undefined);
+  assert.equal(data.placements[0].placementRegion[0], 10);
+});
+
+test("Typesetting saves only changed text fields alongside placement records", async () => {
+  const data = records(), previous = structuredClone(data);
+  data.ocr_structured[0].text = "Source corrected";
+  data.translations.push({recordId: "new-translation", boxno: 1, englishText: "New translation"});
+  let request;
+  const store = {stage: "placement", page: 0, dirty: true, records: data,
+    document: {revision: 4, recordsByArtifact: previous}, markSaved: () => {}};
+  const context = vm.createContext({store, SCREEN: screens.SCREEN, savePromise: null, resetting: false,
+    byId: () => ({}), setStatus: () => {}, api: {save: async (_stage, _page, body) => { request = body; return {}; }}});
+  vm.runInContext(app.match(/async function save\([^]*?\n\}/)[0], context);
+  await context.save();
+  assert.equal(request.baseRevision, 4);
+  assert.deepEqual(JSON.parse(JSON.stringify(request.textEdits)), [
+    {artifact: "ocr_structured", recordId: "source-0", boxno: 0, value: "Source corrected"},
+    {artifact: "translations", recordId: "new-translation", boxno: 1, value: "New translation"},
+  ]);
+  assert.deepEqual(Object.keys(request.recordsByArtifact), ["placements", "clean_boxes"]);
 });
 
 test("zero and blank angles replace old values in the store, drafts, undo and redo", () => {

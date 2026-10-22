@@ -588,6 +588,12 @@ def create_paddle_ocr(
         ) from exc
 
 
+class NoEndpointRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Do not forward OCR credentials to a redirect destination.
+        return None
+
+
 def check_paddleocr_vl_endpoint(server_url: str, model_name: str, *, api_key: str | None = None) -> None:
     """Check reachability, API shape, authentication and model before loading OCR."""
     endpoint = normalize_ocr_service_url(server_url)
@@ -601,11 +607,13 @@ def check_paddleocr_vl_endpoint(server_url: str, model_name: str, *, api_key: st
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(f"{endpoint}/models", headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=5) as response:
+        with urllib.request.build_opener(NoEndpointRedirect()).open(request, timeout=5) as response:
             body = response.read(1024 * 1024 + 1)
     except urllib.error.HTTPError as exc:
         reason = HTTPStatus(exc.code).phrase if exc.code in HTTPStatus._value2member_map_ else "HTTP error"
-        if exc.code in {401, 403}:
+        if 300 <= exc.code < 400:
+            detail = "The OCR endpoint redirected the request. Set its final API address in Advanced Options; redirects are not followed."
+        elif exc.code in {401, 403}:
             detail = "The PaddleOCR-VL endpoint rejected the request. Check the OCR API key."
         elif exc.code == 404:
             detail = "The PaddleOCR-VL model-list API was not found. Most endpoints require an address ending in /v1."

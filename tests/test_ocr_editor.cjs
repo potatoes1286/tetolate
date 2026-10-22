@@ -24,7 +24,7 @@ function setup() {
   let id = 0;
   const context = vm.createContext({store, mergeSelection, newRecordId: (prefix) => `${prefix}-manual-${++id}`,
     setStatus: (...args) => status.push(args), SCREEN: screens.SCREEN, recordLabel: screens.recordLabel});
-  for (const name of ["nextBoxno", "rawBoxesFor", "ocrBoxesChecked", "selectOcrBoxes", "addRawBox", "unionRegion", "groupChecked", "splitGroup", "recordsForList"])
+  for (const name of ["nextBoxno", "rawBoxesFor", "ocrBoxesChecked", "selectOcrBoxes", "addRawBox", "unionRegion", "groupChecked", "splitGroup", "deleteSelected", "recordsForList"])
     vm.runInContext(functionSource(name), context);
   const canvas = {width: 200, height: 200, style: {}, getContext: () => ({}),
     getBoundingClientRect: () => ({left: 0, top: 0, width: 200, height: 200}),
@@ -43,6 +43,24 @@ function setup() {
   };
   return {store, context, editor, mergeSelection, status, click, doubleClick, handlers};
 }
+
+test("deleting part of an OCR group rebuilds its text and region, and undo restores it", () => {
+  const page = setup();
+  page.mergeSelection.add("raw-0"); page.mergeSelection.add("raw-1");
+  page.context.groupChecked();
+  const group = page.store.records.ocr_merged.at(-1);
+  page.store.select("ocr_raw", "raw-0");
+  page.context.deleteSelected();
+  const remaining = page.store.records.ocr_merged.find((item) => item.recordId === group.recordId);
+  assert.deepEqual(Array.from(remaining.sourceBoxnos), [1]);
+  assert.deepEqual(Array.from(remaining.sourceTexts), ["1"]);
+  assert.equal(remaining.text, "1");
+  assert.deepEqual(Array.from(remaining.region), [60, 10, 90, 40]);
+  page.store.undo();
+  const restored = page.store.records.ocr_merged.find((item) => item.recordId === group.recordId);
+  assert.equal(restored.text, "01");
+  assert.deepEqual(Array.from(restored.region), [10, 10, 90, 40]);
+});
 
 test("new manual boxes get a singleton group in the same undoable edit", () => {
   const page = setup();

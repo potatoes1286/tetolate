@@ -9,6 +9,7 @@ import types
 import unittest
 from unittest import mock
 import urllib.error
+import urllib.request
 
 from httpx import ASGITransport, AsyncClient
 
@@ -30,8 +31,20 @@ class OcrEndpointTests(unittest.TestCase):
         )
         return response
 
+    def test_preflight_rejects_redirects_without_forwarding_auth(self):
+        handler = ocr.NoEndpointRedirect()
+        request = urllib.request.Request(self.endpoint + "/models", headers={"Authorization": "Bearer test-secret"})
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                self.assertIsNone(handler.redirect_request(request, None, code, "Redirect", {}, "http://other-host.invalid/models"))
+                error = urllib.error.HTTPError(request.full_url, code, "Redirect", {}, None)
+                with mock.patch.object(ocr.urllib.request.OpenerDirector, "open", side_effect=error):
+                    with self.assertRaisesRegex(ocr.InputError, "final API address") as caught:
+                        ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model, api_key="test-secret")
+                    self.assertNotIn("test-secret", str(caught.exception))
+
     def test_preflight_checks_models_with_saved_auth_and_short_timeout(self):
-        with mock.patch.object(ocr.urllib.request, "urlopen", return_value=self.response()) as request:
+        with mock.patch.object(ocr.urllib.request.OpenerDirector, "open", return_value=self.response()) as request:
             ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model, api_key="test-secret")
         self.assertEqual(request.call_args.args[0].full_url, self.endpoint + "/models")
         self.assertEqual(request.call_args.args[0].get_header("Authorization"), "Bearer test-secret")
@@ -43,19 +56,19 @@ class OcrEndpointTests(unittest.TestCase):
             (ConnectionRefusedError(), "port is reachable"),
             (TimeoutError(), "within 5 seconds"),
         ):
-            with self.subTest(reason=reason), mock.patch.object(ocr.urllib.request, "urlopen", side_effect=urllib.error.URLError(reason)):
+            with self.subTest(reason=reason), mock.patch.object(ocr.urllib.request.OpenerDirector, "open", side_effect=urllib.error.URLError(reason)):
                 with self.assertRaises(ocr.InputError) as error:
                     ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model)
                 self.assertIn(expected, str(error.exception))
                 self.assertIn(self.endpoint, str(error.exception))
-        with mock.patch.object(ocr.urllib.request, "urlopen", side_effect=ConnectionRefusedError()):
+        with mock.patch.object(ocr.urllib.request.OpenerDirector, "open", side_effect=ConnectionRefusedError()):
             with self.assertRaisesRegex(ocr.InputError, "Did you forget to set the port"):
                 ocr.check_paddleocr_vl_endpoint("http://host.docker.internal/v1", self.model)
 
     def test_http_errors_do_not_echo_keys_or_response_bodies(self):
         for status, expected in ((401, "OCR API key"), (403, "OCR API key"), (404, "ending in /v1"), (400, "another service"), (503, "returned an error")):
             error = urllib.error.HTTPError(self.endpoint, status, "test-secret", {}, io.BytesIO(b"test-secret"))
-            with self.subTest(status=status), mock.patch.object(ocr.urllib.request, "urlopen", side_effect=error):
+            with self.subTest(status=status), mock.patch.object(ocr.urllib.request.OpenerDirector, "open", side_effect=error):
                 with self.assertRaises(ocr.InputError) as caught:
                     ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model, api_key="test-secret")
                 self.assertIn(expected, str(caught.exception))
@@ -64,15 +77,15 @@ class OcrEndpointTests(unittest.TestCase):
 
     def test_wrong_service_malformed_json_and_wrong_model_fail(self):
         for body in (b"LanguageTool API", b"<html>Error</html>", b"{}", b"null", b'{"data":[null]}', b"x" * (1024 * 1024 + 1)):
-            with self.subTest(body=body[:20]), mock.patch.object(ocr.urllib.request, "urlopen", return_value=self.response(body)):
+            with self.subTest(body=body[:20]), mock.patch.object(ocr.urllib.request.OpenerDirector, "open", return_value=self.response(body)):
                 with self.assertRaisesRegex(ocr.InputError, "different service"):
                     ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model)
-        with mock.patch.object(ocr.urllib.request, "urlopen", return_value=self.response(b'{"data":[{"id":"other"}]}')):
+        with mock.patch.object(ocr.urllib.request.OpenerDirector, "open", return_value=self.response(b'{"data":[{"id":"other"}]}')):
             with self.assertRaisesRegex(ocr.InputError, "does not list model"):
                 ocr.check_paddleocr_vl_endpoint(self.endpoint, self.model)
 
     def test_embedded_credentials_are_rejected_without_a_request(self):
-        with mock.patch.object(ocr.urllib.request, "urlopen") as request:
+        with mock.patch.object(ocr.urllib.request.OpenerDirector, "open") as request:
             with self.assertRaisesRegex(ocr.InputError, "auth token field"):
                 ocr.check_paddleocr_vl_endpoint("http://user:secret@ocr/v1", self.model)
             request.assert_not_called()
