@@ -13,7 +13,6 @@ Usage:
 Defaults:
   OUTPUT_DIR      ./<input-name>_translated
   UV_CACHE_DIR    /tmp/uv-cache
-  TETOLATE_LOCAL_PADDLEOCR=1 installs the optional in-process PaddleOCR dependencies
   config          <repository>/data/config/vlm_config.json
 
 Examples:
@@ -52,10 +51,7 @@ fi
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
-uv_args=(--locked --extra inpaint --project "$repo_dir")
-if [[ "${TETOLATE_LOCAL_PADDLEOCR:-0}" == "1" ]]; then
-  uv_args+=(--extra ocr)
-fi
+uv_args=(--locked --extra inpaint --extra ocr --project "$repo_dir")
 
 uv run "${uv_args[@]}" python "$translate_script" \
   "$input_cbz" "$output_dir" --config "$config_path" "$@"

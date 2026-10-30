@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from PIL import ImageFont
+from PIL import Image, ImageFont
 
 
 DEFAULT_FONT = str(
@@ -27,6 +27,9 @@ DEFAULT_GRAVITY = "center"
 DEFAULT_STROKE_WIDTH = 3
 DEFAULT_MIN_POINT_SIZE = 14
 DEFAULT_RENDER_BLEED = 8
+TEXT_LAYOUT_VERSION = 6
+LINE_SPACING_LIMIT = 200
+TEXT_TRANSFORM_LIMITS = {"rotation": 180, "skewX": 60, "skewY": 60}
 PAGE_HEIGHT_MIN_POINT_RATIO = 0.008
 PAGE_HEIGHT_MAX_POINT_RATIO = 0.024
 PAGE_HEIGHT_STROKE_WIDTH_RATIO = 0.0012
@@ -41,6 +44,7 @@ TARGET_WIDTH_FILL_RATIO = 0.78
 MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.82
 MAX_COMFORTABLE_WIDTH_FILL_RATIO = 0.92
 TALL_CAPTION_ASPECT_RATIO = 1.75
+WIDE_CAPTION_ASPECT_RATIO = 4.0
 TALL_CAPTION_TARGET_HEIGHT_FILL_RATIO = 0.62
 TALL_CAPTION_TARGET_WIDTH_FILL_RATIO = 0.80
 TALL_CAPTION_MAX_COMFORTABLE_HEIGHT_FILL_RATIO = 0.86
@@ -118,7 +122,31 @@ def selected_entries(entries: list[dict[str, Any]], page: int | None) -> list[di
     return selected
 
 
+def validate_text_transform(index: int, item: dict[str, Any]) -> None:
+    for field, limit in TEXT_TRANSFORM_LIMITS.items():
+        if field not in item:
+            continue
+        value = item[field]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or not -limit <= value <= limit):
+            raise InputError(f"Entry {index} {field} must be between {-limit} and {limit} degrees.")
+
+
+def validate_line_spacing(index: int, item: dict[str, Any]) -> None:
+    if "lineSpacing" not in item:
+        return
+    value = item["lineSpacing"]
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not -LINE_SPACING_LIMIT <= value <= LINE_SPACING_LIMIT):
+        raise InputError(f"Entry {index} lineSpacing must be between {-LINE_SPACING_LIMIT} and {LINE_SPACING_LIMIT} pixels.")
+
+
 def validate_entry(index: int, item: dict[str, Any]) -> None:
+    validate_text_transform(index, item)
+    validate_line_spacing(index, item)
+    if "manualLineBreaks" in item and (not isinstance(item["manualLineBreaks"], str)
+                                       or len(item["manualLineBreaks"]) > 100_000):
+        raise InputError(f"Entry {index} manualLineBreaks must be a string of at most 100000 characters.")
     region = item.get("region")
     if not isinstance(region, list) or len(region) != 4:
         raise InputError(f"Entry {index} must have region as a list of four numbers.")
@@ -220,6 +248,8 @@ def stroke_width(entry: dict[str, Any], image_height: int | None = None) -> floa
     value = entry.get("strokeWidth", DEFAULT_STROKE_WIDTH)
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         configured = max(0, float(value))
+        if configured == 0:
+            return 0.0
     else:
         configured = float(DEFAULT_STROKE_WIDTH)
     return max(configured, scaled_page_stroke_width(image_height))
@@ -402,10 +432,25 @@ def wrap_line_for_capacity(line: str, capacity: int) -> list[str]:
     return wrapped or [line]
 
 
-@functools.lru_cache(maxsize=512)
-def loaded_layout_font(font: str, point_size: int) -> ImageFont.FreeTypeFont | None:
+def font_file_signature(font: str) -> tuple[int, ...] | None:
+    """Identify a font revision, including same-size and atomic replacements."""
     try:
-        return ImageFont.truetype(font, max(1, point_size))
+        stat = Path(font).stat()
+    except OSError:
+        return None
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def loaded_layout_font(font: str, point_size: int) -> ImageFont.FreeTypeFont | None:
+    return _cached_layout_font(font, max(1, point_size), font_file_signature(font))
+
+
+@functools.lru_cache(maxsize=512)
+def _cached_layout_font(
+    font: str, point_size: int, _signature: tuple[int, ...] | None,
+) -> ImageFont.FreeTypeFont | None:
+    try:
+        return ImageFont.truetype(font, point_size)
     except (OSError, ValueError):
         return None
 
@@ -416,8 +461,9 @@ def lines_fit(
     width: int,
     height: int,
     font: str | None = None,
+    line_spacing: float = 0,
 ) -> bool:
-    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font)
+    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font, line_spacing)
     return estimated_width <= width and estimated_height <= height
 
 
@@ -425,6 +471,7 @@ def estimated_text_extent(
     lines: list[str],
     point_size: float,
     font: str | None = None,
+    line_spacing: float = 0,
 ) -> tuple[float, float]:
     layout_font = loaded_layout_font(font, round(point_size)) if font else None
     if layout_font is not None:
@@ -435,7 +482,9 @@ def estimated_text_extent(
     else:
         longest_line = max((len(line) for line in lines), default=0)
         estimated_width = longest_line * point_size * APPROX_FONT_WIDTH_RATIO
-    estimated_height = len(lines) * point_size * APPROX_LINE_HEIGHT_RATIO
+    line_height = point_size * APPROX_LINE_HEIGHT_RATIO
+    estimated_height = max(line_height, len(lines) * point_size * APPROX_LINE_HEIGHT_RATIO
+                           + max(0, len(lines) - 1) * line_spacing) if lines else 0
     return estimated_width, estimated_height
 
 
@@ -466,8 +515,9 @@ def layout_quality_score(
     tall_caption: bool,
     wrap_width_ratio: float,
     font: str | None = None,
+    line_spacing: float = 0,
 ) -> float:
-    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font)
+    estimated_width, estimated_height = estimated_text_extent(lines, point_size, font, line_spacing)
     width_ratio = estimated_width / max(1, width)
     height_ratio = estimated_height / max(1, height)
 
@@ -522,6 +572,8 @@ def technical_fitting_point_size(
     image_height: int | None = None,
     font: str | None = None,
     maximum_point_size: float | None = None,
+    line_spacing: float = 0,
+    fixed_lines: bool = False,
 ) -> float:
     wrap_ratios = wrap_ratios_for_region(width, height)
     search_maximum = (
@@ -532,8 +584,8 @@ def technical_fitting_point_size(
     start_size = max(1, math.ceil(search_maximum))
     for point_size in range(start_size, 0, -1):
         for wrap_width_ratio in wrap_ratios:
-            lines = layout_lines_for_point_size(text, float(point_size), width, wrap_width_ratio)
-            if lines_fit(lines, float(point_size), width, height, font):
+            lines = text.split("\n") if fixed_lines else layout_lines_for_point_size(text, float(point_size), width, wrap_width_ratio)
+            if lines_fit(lines, float(point_size), width, height, font, line_spacing):
                 return float(point_size)
     return 1.0
 
@@ -547,6 +599,10 @@ def explicit_caption_layout(
     image_height: int | None = None,
 ) -> tuple[str, float, float]:
     font = entry.get("font") if isinstance(entry.get("font"), str) else None
+    line_spacing = entry.get("lineSpacing", 0)
+    fixed_lines = bool(entry.get("manualLineBreaks", "").strip())
+    def layout_lines(size: float, ratio: float = 1.0) -> list[str]:
+        return text.split("\n") if fixed_lines else layout_lines_for_point_size(text, size, width, ratio)
     fixed_percent = entry.get("fontSizeWidthPercent")
     if (
         isinstance(fixed_percent, (int, float))
@@ -562,22 +618,40 @@ def explicit_caption_layout(
             image_height,
             font,
             requested_size,
+            line_spacing,
+            fixed_lines,
         )
         point_size = min(requested_size, technical_size)
         candidates = [
-            layout_lines_for_point_size(text, point_size, width, ratio)
+            layout_lines(point_size, ratio)
             for ratio in wrap_ratios_for_region(width, height)
         ]
         fitting = [
-            lines for lines in candidates if lines_fit(lines, point_size, width, height, font)
+            lines for lines in candidates if lines_fit(lines, point_size, width, height, font, line_spacing)
         ]
         selected = min(fitting or candidates, key=lambda lines: len(lines))
         return "\n".join(selected), point_size, technical_size
 
     minimum = min_point_size(entry, image_height)
     point_size_cap = aesthetic_max_point_size(entry, width, height, image_height)
+    # Relax the short-box height cap only if a larger, single-line layout fits.
+    # Otherwise keep the original search and scoring unchanged.
+    if text.strip() and "\n" not in text and width >= height * WIDE_CAPTION_ASPECT_RATIO:
+        single_line_cap = min(
+            page_relative_max_point_size(image_height, width, height),
+            width * AESTHETIC_WIDTH_POINT_RATIO,
+            height / APPROX_LINE_HEIGHT_RATIO,
+        )
+        configured = configured_max_point_size(entry)
+        if configured is not None:
+            single_line_cap = min(single_line_cap, configured)
+        for size in range(math.floor(single_line_cap), math.floor(point_size_cap), -1):
+            lines = layout_lines(float(size))
+            if len(lines) == 1 and lines_fit(lines, float(size), width, height, font):
+                point_size_cap = float(size)
+                break
     technical_best_size = technical_fitting_point_size(
-        text, width, height, image_height, font
+        text, width, height, image_height, font, line_spacing=line_spacing, fixed_lines=fixed_lines
     )
     tall_caption = is_tall_caption_region(width, height)
     wrap_ratios = wrap_ratios_for_region(width, height)
@@ -590,8 +664,8 @@ def explicit_caption_layout(
 
     for point_size in candidate_sizes:
         for wrap_width_ratio in wrap_ratios:
-            lines = layout_lines_for_point_size(text, float(point_size), width, wrap_width_ratio)
-            if not lines_fit(lines, float(point_size), width, height, font):
+            lines = layout_lines(float(point_size), wrap_width_ratio)
+            if not lines_fit(lines, float(point_size), width, height, font, line_spacing):
                 continue
             score = layout_quality_score(
                 lines,
@@ -602,6 +676,7 @@ def explicit_caption_layout(
                 tall_caption,
                 wrap_width_ratio,
                 font,
+                line_spacing,
             )
             if best_candidate is None or score < best_candidate[0]:
                 best_candidate = (score, lines, float(point_size))
@@ -610,8 +685,21 @@ def explicit_caption_layout(
         _, best_lines, best_size = best_candidate
         return "\n".join(best_lines), best_size, technical_best_size
 
-    forced_lines = layout_lines_for_point_size(text, minimum, width, wrap_ratios[-1])
-    return "\n".join(forced_lines), minimum, technical_best_size
+    # Keep user-entered breaks even in a small box; shrink rather than rewrap.
+    forced_size = min(minimum, technical_best_size) if fixed_lines else minimum
+    forced_lines = layout_lines(forced_size, wrap_ratios[-1])
+    return "\n".join(forced_lines), forced_size, technical_best_size
+
+
+def layout_entry_text(entry: dict[str, Any], image_width: int, image_height: int) -> tuple[str, float, float]:
+    """Use the same layout for the inspector, preview layers, and final output."""
+    _, _, width, height = rounded_region(entry["region"])
+    padding = max(0, round(stroke_width(entry, image_height) * 2))
+    manual = entry.get("manualLineBreaks", "")
+    text = ("\n".join(" ".join(line.split()) for line in manual.strip().splitlines())
+            if manual.strip() else normalize_caption_text(entry["englishText"]))
+    return explicit_caption_layout(entry, text, max(1, width - padding * 2), max(1, height - padding * 2),
+                                   image_width, image_height)
 
 
 def explicit_pointsize_args(
@@ -635,14 +723,44 @@ def explicit_pointsize_args(
     return ["-pointsize", f"{point_size:g}"]
 
 
-def render_text_layer(
-    magick: str,
+def text_transform_args(entry: dict[str, Any], width: int, height: int) -> list[str]:
+    """Shear X, shear Y, then rotate clockwise, with one resampling pass."""
+    validate_text_transform(0, entry)
+    rotation, skew_x, skew_y = (entry.get(field, 0) for field in TEXT_TRANSFORM_LIMITS)
+    if not (rotation or skew_x or skew_y):
+        return []
+    angle = math.radians(rotation)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    x, y = math.tan(math.radians(skew_x)), math.tan(math.radians(skew_y))
+    a, b = cosine - sine * y, sine + cosine * y
+    c, d = cosine * x - sine * (1 + x * y), sine * x + cosine * (1 + x * y)
+    # Two pixels of resampling border. Matching parity keeps the center and
+    # composite offset on whole pixels, including odd-sized layout boxes.
+    out_width = math.ceil(round(abs(a) * width + abs(c) * height, 10)) + 4
+    out_height = math.ceil(round(abs(b) * width + abs(d) * height, 10)) + 4
+    out_width += (width - out_width) % 2
+    out_height += (height - out_height) % 2
+    # ImageMagick distortion coordinates put the first pixel center at 0.5.
+    center_x, center_y = width / 2, height / 2
+    dx = out_width / 2 - a * center_x - c * center_y
+    dy = out_height / 2 - b * center_x - d * center_y
+    matrix = ",".join(f"{value:.12g}" for value in (a, b, c, d, dx, dy))
+    # Use exact pixels for right angles only when the centered grids line up.
+    exact_rotation = (not (skew_x or skew_y) and rotation % 90 == 0
+                      and (rotation % 180 == 0 or width % 2 == height % 2))
+    filter_args = ["-filter", "point"] if exact_rotation else []
+    return ["+repage", "-background", "none", "-virtual-pixel", "transparent",
+            *filter_args,
+            "-define", f"distort:viewport={out_width}x{out_height}+0+0",
+            "-distort", "AffineProjection", matrix, "+repage", "-depth", "8"]
+
+
+def text_layer_args(
     entry: dict[str, Any],
-    layer_path: Path,
     text_path: Path,
     image_width: int,
     image_height: int,
-) -> None:
+) -> list[str]:
     left, top, width, height = rounded_region(entry["region"])
     del left, top
 
@@ -658,20 +776,13 @@ def render_text_layer(
     layer_inner_width = inner_width + bleed * 2
     layer_inner_height = inner_height + bleed * 2
     gravity = entry.get("gravity", DEFAULT_GRAVITY)
-    layout_text = normalize_caption_text(entry["englishText"])
-    rendered_text, point_size, estimated_fit_size = explicit_caption_layout(
-        entry,
-        layout_text,
-        inner_width,
-        inner_height,
-        image_width,
-        image_height,
-    )
+    rendered_text, point_size, estimated_fit_size = layout_entry_text(entry, image_width, image_height)
+    text_kind = "label" if entry.get("manualLineBreaks", "").strip() else "caption"
     point_size_args = explicit_pointsize_args(entry, point_size, estimated_fit_size, image_height)
+    spacing_args = ["-interline-spacing", f"{entry.get('lineSpacing', 0):g}"]
     text_path.write_text(rendered_text, encoding="utf-8")
 
-    command = [
-        magick,
+    outline_layer = [
         "(",
             "-size",
             f"{layer_inner_width}x{layer_inner_height}",
@@ -680,6 +791,7 @@ def render_text_layer(
             "-font",
             entry.get("font", DEFAULT_FONT),
             *point_size_args,
+            *spacing_args,
             "-gravity",
             gravity,
             "-fill",
@@ -688,7 +800,7 @@ def render_text_layer(
             stroke,
             "-strokewidth",
             f"{outline_width:g}",
-            f"caption:@{text_path}",
+            f"{text_kind}:@{text_path}",
             "-background",
             "none",
             "-gravity",
@@ -696,6 +808,9 @@ def render_text_layer(
             "-extent",
             f"{layer_width}x{layer_height}",
         ")",
+    ] if outline_width > 0 else []
+    return [
+        *outline_layer,
         "(",
             "-size",
             f"{layer_inner_width}x{layer_inner_height}",
@@ -704,13 +819,14 @@ def render_text_layer(
             "-font",
             entry.get("font", DEFAULT_FONT),
             *point_size_args,
+            *spacing_args,
             "-gravity",
             gravity,
             "-fill",
             fill,
             "-stroke",
             "none",
-            f"caption:@{text_path}",
+            f"{text_kind}:@{text_path}",
             "-background",
             "none",
             "-gravity",
@@ -718,10 +834,32 @@ def render_text_layer(
             "-extent",
             f"{layer_width}x{layer_height}",
         ")",
-        "-composite",
-        str(layer_path),
+        *(["-composite"] if outline_layer else []),
+        *text_transform_args(entry, layer_width, layer_height),
     ]
+
+
+def render_text_layer(
+    magick: str, entry: dict[str, Any], layer_path: Path, text_path: Path,
+    image_width: int, image_height: int,
+) -> None:
+    command = [magick, *text_layer_args(entry, text_path, image_width, image_height), str(layer_path)]
     run_magick(command, f"rendering text layer for region {entry['region']}")
+
+
+def render_text_layers(
+    magick: str, layers: list[tuple[dict[str, Any], Path, Path]],
+    image_width: int, image_height: int,
+) -> None:
+    if not layers:
+        return
+    # Restore settings between boxes and discard each image after writing it.
+    command = [magick, "-respect-parentheses", "-size", "1x1", "xc:none"]
+    for entry, output, text_path in layers:
+        command.extend(["(", *text_layer_args(entry, text_path, image_width, image_height),
+                        "-write", str(output), "+delete", ")"])
+    command.append("null:")
+    run_magick(command, f"rendering {len(layers)} text layers")
 
 
 def composite_layer(
@@ -732,19 +870,20 @@ def composite_layer(
     entry: dict[str, Any],
 ) -> None:
     left, top, width, height = rounded_region(entry["region"])
-    del width, height
-    bleed = render_bleed(entry)
+    with Image.open(layer_path) as layer:
+        left += (width - layer.width) // 2
+        top += (height - layer.height) // 2
 
     command = [
         magick,
         str(base_path),
         str(layer_path),
         "-geometry",
-        f"+{left - bleed}+{top - bleed}",
+        f"{left:+d}{top:+d}",
         "-composite",
         str(output_path),
     ]
-    run_magick(command, f"compositing text layer at ({left - bleed}, {top - bleed})")
+    run_magick(command, f"compositing text layer at ({left}, {top})")
 
 
 def run_magick(command: list[str], action: str) -> None:

@@ -47,27 +47,19 @@ def replace_required(text: str, pattern: str, replacement: str, description: str
     return updated
 
 
-def replace_versions_in_section(
-    text: str,
-    heading: str,
-    next_heading: str | None,
-    version: str,
-    target_version: str,
-    *,
-    replace_any_version: bool = False,
-) -> str:
+def update_release_examples(text: str, target_version: str) -> str:
+    heading = "## Release container"
     start = text.find(heading)
     if start < 0:
         raise SystemExit(f"Could not find documentation section {heading!r}.")
-    end = text.find(next_heading, start + len(heading)) if next_heading else -1
-    if end < 0:
-        end = len(text)
-    section = text[start:end]
-    version_pattern = r"v\d+\.\d+\.\d+" if replace_any_version else r"v" + re.escape(version)
-    updated, count = re.subn(version_pattern + r"\b", "v" + target_version, section)
+    updated, count = re.subn(
+        r"(v|ghcr\.io/potatoes1286/tetolate:)\d+\.\d+\.\d+\b",
+        lambda match: match[1] + target_version,
+        text[start:],
+    )
     if count == 0:
         raise SystemExit(f"Could not update a version reference in {heading!r}.")
-    return text[:start] + updated + text[end:]
+    return text[:start] + updated
 
 
 def update_file(path: Path, old_text: str, new_text: str) -> None:
@@ -108,46 +100,9 @@ def synchronize(target_version: str, *, check_only: bool) -> list[Path]:
     )
     updates.append((lock_path, lock, lock_updated))
 
-    compose_path = ROOT / "compose.yaml"
-    compose = compose_path.read_text(encoding="utf-8")
-    compose_updated = replace_required(
-        compose,
-        r'^(\s*image:\s+\S*/' + re.escape(project_name) + r':)\d+\.\d+\.\d+(\s*)$',
-        r'\g<1>' + target_version + r'\g<2>',
-        "Compose image version",
-    )
-    updates.append((compose_path, compose, compose_updated))
-
-    readme_path = ROOT / "README.md"
-    readme = readme_path.read_text(encoding="utf-8")
-    readme_updated = replace_versions_in_section(
-        readme,
-        "## Install",
-        "## Upgrade",
-        old_version,
-        target_version,
-        replace_any_version=True,
-    )
-    readme_updated = replace_versions_in_section(
-        readme_updated,
-        "## Upgrade",
-        "## Rollback",
-        old_version,
-        target_version,
-        replace_any_version=True,
-    )
-    updates.append((readme_path, readme, readme_updated))
-
     building_path = ROOT / "BUILDING.md"
     building = building_path.read_text(encoding="utf-8")
-    building_updated = replace_versions_in_section(
-        building,
-        "## Release container",
-        None,
-        old_version,
-        target_version,
-        replace_any_version=True,
-    )
+    building_updated = update_release_examples(building, target_version)
     updates.append((building_path, building, building_updated))
 
     changed = [path for path, old_text, new_text in updates if old_text != new_text]

@@ -4,6 +4,11 @@ You are given the complete ${source_name} source text, final ${target_name} tran
 translation notes. Write concise plain-text notes that would help keep future related volumes
 consistent.
 
+Produce one updated, consolidated set of notes. Retain useful names, terms, and
+decisions from the supplied notes, including ones absent from this chapter.
+Merge repeated entries and add new facts; do not append a chapter log.
+Fixed series instructions take priority and must not be changed by inferred notes.
+
 Include useful items such as:
 - Character names and consistent romanization/spelling.
 - Places, organizations, magic/skill names, titles, honorific choices, and recurring terms.

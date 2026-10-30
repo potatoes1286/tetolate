@@ -122,6 +122,12 @@ def engine_cache_key(engine: str, options: dict[str, Any]) -> str:
 
 def create_local_engine(engine: str, options: dict[str, Any]) -> Any:
     device = str(options.get("device") or paddle_ocr_image.DEFAULT_DEVICE)
+    if engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
+        paddle_ocr_image.check_paddleocr_vl_endpoint(
+            options.get("vl_rec_server_url", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL),
+            options.get("vl_rec_api_model_name", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL),
+            api_key=options.get("vl_rec_api_key"),
+        )
     paddle_ocr_image.configure_paddlex_runtime(device)
     try:
         if engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:

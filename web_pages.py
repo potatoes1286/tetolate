@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+from decimal import Decimal
 from typing import Any
 
 from fastapi.responses import HTMLResponse
@@ -38,6 +39,66 @@ CATEGORY_DELETE_CONFIRM = (
     "Delete this category and every job, input, output, log, and download inside it?"
 )
 JOB_NAME_MAX_LENGTH = 256
+UPDATE_CHECK_SCRIPT = r"""
+<script>
+(() => {
+  const check = document.getElementById("check-updates");
+  const status = document.getElementById("update-status");
+  let checking = false;
+  function versionParts(value) {
+    if (typeof value !== "string" || !/^v?\d+\.\d+\.\d+$/.test(value)) {
+      throw new Error("Invalid release version.");
+    }
+    const parts = value.replace(/^v/, "").split(".").map(Number);
+    if (!parts.every(Number.isSafeInteger)) throw new Error("Invalid release version.");
+    return parts;
+  }
+  check.addEventListener("click", async (event) => {
+    event.preventDefault();
+    if (checking) return;
+    checking = true;
+    check.setAttribute("aria-disabled", "true");
+    status.textContent = "Checking...";
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const response = await fetch("https://api.github.com/repos/potatoes1286/tetolate/releases/latest", {
+        headers: {"Accept": "application/vnd.github+json"},
+        credentials: "omit",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (response.status === 404) {
+        status.textContent = "No published releases found.";
+        return;
+      }
+      if (!response.ok) throw new Error(`GitHub returned HTTP ${response.status}.`);
+      const release = await response.json();
+      const latest = versionParts(release.tag_name);
+      const current = versionParts(check.dataset.version);
+      if (release.draft || release.prerelease) throw new Error("Not a stable release.");
+      const difference = latest.findIndex((part, index) => part !== current[index]);
+      if (difference !== -1 && latest[difference] > current[difference]) {
+        const link = document.createElement("a");
+        link.href = `https://github.com/potatoes1286/tetolate/releases/tag/${encodeURIComponent(release.tag_name)}`;
+        link.textContent = release.tag_name;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        status.replaceChildren("Newer update: ", link);
+      } else {
+        status.textContent = "Up to date.";
+      }
+    } catch {
+      status.textContent = "Could not check for updates. Try again.";
+    } finally {
+      clearTimeout(timeout);
+      checking = false;
+      check.removeAttribute("aria-disabled");
+    }
+  });
+})();
+</script>
+"""
 CBZ_TITLE_MODE_ORIGINAL = "original"
 CBZ_TITLE_MODE_TRANSLATED = "translated"
 TERMINATE_JOB_CONFIRM = (
@@ -136,6 +197,235 @@ document.addEventListener("click", (event) => {
 """
 
 
+CATEGORY_OPTIONS_SCRIPT = """
+<script>
+(() => {
+  const form = document.querySelector("form[data-category-options]");
+  if (!form) return;
+  const status = form.querySelector("[data-category-options-status]");
+  const applyButton = form.querySelector("[data-apply-to-queued]");
+  const queueStatus = form.querySelector("[data-queue-options-status]");
+  const names = {
+    enable_alt_placement: "alt_placement_enabled", enable_proofreading: "proofread_translations",
+    enable_translation_notes: "write_translation_notes", auto_translate_comicinfo_title: "auto_translate_comicinfo_title",
+    pause_after_ocr: "pause_after_ocr", source_language: "source_language", ocr_engine: "ocr_engine",
+    paddleocr_vl_server_url: "paddleocr_vl_server_url", paddleocr_vl_model: "paddleocr_vl_model",
+    ocr_page_workers: "ocr_page_workers", lama_workers: "lama_workers", imagemagick_workers: "imagemagick_workers",
+    vlm_base_url: "vlm_base_url", vlm_model: "vlm_model", thinking_budget_tokens: "thinking_budget_tokens",
+    translation_notes: "translation_notes",
+  };
+  let pending = Promise.resolve(), active = 0, submitting = false;
+  const failed = new Set(), versions = new Map(), timers = new Map(), sent = new Map();
+  function updateStatus() {
+    if (!active && !timers.size) status.textContent = failed.size
+      ? "Some options were not saved. Change them again to retry."
+      : "Advanced options saved.";
+  }
+  function save(input) {
+    const name = names[input.name];
+    if (!name) return; // Passwords and upload controls are not category defaults.
+    clearTimeout(timers.get(input)); timers.delete(input);
+    if ((input.name !== "vlm_model" && !input.checkValidity()) || (input.type === "number" && input.value === "")) {
+      versions.set(name, (versions.get(name) || 0) + 1);
+      failed.add(name);
+      status.textContent = "Not saved: enter a valid value.";
+      return;
+    }
+    const value = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+    if (sent.get(name) === value && !failed.has(name)) { updateStatus(); return; }
+    const version = (versions.get(name) || 0) + 1;
+    versions.set(name, version);
+    sent.set(name, value);
+    active++;
+    status.textContent = "Saving advanced options...";
+    pending = pending.then(async () => {
+      try {
+        const body = JSON.stringify({[name]: value});
+        const response = await fetch(`/api/v1/categories/${encodeURIComponent(form.dataset.categoryOptions)}/settings`, {
+          method: "PATCH", headers: {"Content-Type": "application/json"},
+          credentials: "same-origin", keepalive: body.length < 16000, body,
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (versions.get(name) === version) failed.delete(name);
+      } catch {
+        if (versions.get(name) === version) failed.add(name);
+      } finally {
+        active--;
+        updateStatus();
+      }
+    });
+  }
+  const options = form.querySelector("details");
+  if (applyButton) applyButton.addEventListener("click", async () => {
+    applyButton.disabled = true;
+    queueStatus.textContent = "";
+    try {
+      do {
+        for (const input of [...timers.keys()]) save(input);
+        await pending;
+      } while (active || timers.size);
+      if (failed.size) throw new Error("Save valid advanced options before applying them to queued jobs.");
+      if (!window.confirm("Replace advanced options for all queued jobs in this category with the saved category settings? Running jobs and translation notes will not change.")) return;
+      queueStatus.textContent = "Updating queued jobs...";
+      const response = await fetch(`/api/v1/categories/${encodeURIComponent(form.dataset.categoryOptions)}/settings/apply-to-queued`, {
+        method: "POST", credentials: "same-origin",
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error?.message || data.detail || `HTTP ${response.status}`);
+      queueStatus.textContent = `Updated ${data.count} queued job(s). Running jobs were not changed.`;
+    } catch (error) {
+      queueStatus.textContent = error instanceof Error ? error.message : String(error);
+    } finally { applyButton.disabled = false; }
+  });
+  options.addEventListener("change", (event) => save(event.target));
+  options.addEventListener("input", (event) => {
+    const input = event.target;
+    if (!names[input.name]) return;
+    clearTimeout(timers.get(input));
+    timers.set(input, setTimeout(() => save(input), 250));
+    status.textContent = "Saving advanced options...";
+  });
+  form.addEventListener("submit", () => { submitting = true; });
+  window.addEventListener("beforeunload", (event) => {
+    for (const input of [...timers.keys()]) save(input);
+    if (!submitting && (active || failed.size)) { event.preventDefault(); event.returnValue = ""; }
+  });
+})();
+</script>
+"""
+
+
+JOB_OPTIONS_SCRIPT = """
+<script>
+function initJobOptions() {
+  const form = document.querySelector("form[data-job-options]");
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = "1";
+  form.noValidate = true;
+  const status = form.querySelector("[data-job-options-status]");
+  const names = {
+    enable_alt_placement: "alt_placement_enabled", enable_proofreading: "proofread_translations",
+    enable_translation_notes: "write_translation_notes", auto_translate_comicinfo_title: "auto_translate_comicinfo_title",
+    pause_after_ocr: "pause_after_ocr", source_language: "source_language", ocr_engine: "ocr_engine",
+    paddleocr_vl_server_url: "paddleocr_vl_server_url", paddleocr_vl_model: "paddleocr_vl_model",
+    ocr_page_workers: "ocr_page_workers", lama_workers: "lama_workers", imagemagick_workers: "imagemagick_workers",
+    vlm_base_url: "vlm_base_url", vlm_model: "vlm_model", thinking_budget_tokens: "thinking_budget_tokens",
+    vlm_auth_token: "vlm_auth_token", paddleocr_vl_auth_token: "paddleocr_vl_auth_token",
+    clear_vlm_auth_token: "clear_vlm_auth_token", clear_paddleocr_vl_auth_token: "clear_paddleocr_vl_auth_token",
+  };
+  let pending = Promise.resolve(), active = 0, replacing = false;
+  const timers = new Map(), sent = new Map(), versions = new Map(), failed = new Map();
+  function updateStatus() {
+    if (!active && !timers.size) status.textContent = failed.size
+      ? `Not saved: ${[...failed.values()].join(" ")}` : "Advanced options saved.";
+  }
+  function save(input) {
+    if (replacing) return;
+    const name = names[input.name];
+    if (!name) return;
+    clearTimeout(timers.get(input)); timers.delete(input);
+    const version = (versions.get(name) || 0) + 1;
+    if ((input.name !== "vlm_model" && !input.checkValidity()) || (input.type === "number" && input.value === "")) {
+      versions.set(name, version); failed.set(name, "Enter a valid value."); updateStatus(); return;
+    }
+    const value = input.type === "checkbox" ? input.checked : input.type === "number" ? Number(input.value) : input.value;
+    if (input.type === "password" && !value) {
+      versions.set(name, version); failed.delete(name); sent.delete(name);
+      updateStatus(); return; // Blank keeps the saved key.
+    }
+    if (sent.get(name) === value && !failed.has(name)) { updateStatus(); return; }
+    versions.set(name, version); sent.set(name, value); active++;
+    status.textContent = "Saving advanced options...";
+    pending = pending.then(async () => {
+      try {
+        const response = await fetch(form.dataset.jobOptions, {
+          method: "PATCH", headers: {"Content-Type": "application/json"},
+          credentials: "same-origin", body: JSON.stringify({[name]: value}),
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          let message = `HTTP ${response.status}`;
+          try { const data = JSON.parse(body); message = data.error?.message || data.detail || message; } catch {}
+          throw new Error(message);
+        }
+        if (versions.get(name) === version) failed.delete(name);
+      } catch (error) {
+        if (versions.get(name) === version) failed.set(name, error.message);
+      } finally { active--; updateStatus(); }
+    });
+  }
+  function flush() { for (const input of [...timers.keys()]) save(input); }
+  async function finishSaving() {
+    do { flush(); await pending; } while (active || timers.size);
+    return !failed.size;
+  }
+  const options = form.querySelector("details");
+  const categoryButton = form.querySelector("[data-use-category-options]");
+  if (categoryButton) categoryButton.addEventListener("click", async () => {
+    if (replacing) return;
+    replacing = true;
+    for (const timer of timers.values()) clearTimeout(timer);
+    timers.clear();
+    const controls = [...form.elements].map(input => [input, input.disabled]);
+    for (const [input] of controls) input.disabled = true;
+    categoryButton.disabled = true;
+    try {
+      await pending;
+      status.textContent = "Using category settings...";
+      const [path, query] = form.dataset.jobOptions.split("?");
+      const response = await fetch(path + "/use-category" + (query ? "?" + query : ""), {
+        method: "POST", credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        let message = `HTTP ${response.status}`;
+        try { const data = JSON.parse(body); message = data.error?.message || data.detail || message; } catch {}
+        throw new Error(message);
+      }
+      failed.clear();
+      replacing = false;
+      window.location.reload();
+    } catch (error) {
+      status.textContent = error instanceof Error ? error.message : String(error);
+    } finally {
+      replacing = false;
+      for (const [input, disabled] of controls) input.disabled = disabled;
+      categoryButton.disabled = false;
+    }
+  });
+  options.addEventListener("change", (event) => save(event.target));
+  options.addEventListener("input", (event) => {
+    if (replacing) return;
+    const input = event.target;
+    if (!names[input.name]) return;
+    clearTimeout(timers.get(input));
+    timers.set(input, setTimeout(() => save(input), 250));
+    status.textContent = "Saving advanced options...";
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    for (const input of form.elements) save(input);
+  });
+  document.addEventListener("click", async (event) => {
+    const link = event.target.closest("a[href]");
+    if (!form.isConnected || !link || event.defaultPrevented || event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey
+        || link.target || link.hasAttribute("download") || !(replacing || active || timers.size || failed.size)) return;
+    event.preventDefault();
+    if (replacing) return;
+    if (!await finishSaving()) { updateStatus(); return; }
+    window.location.assign(link.href);
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (!form.isConnected) return;
+    flush();
+    if (replacing || active || failed.size) { event.preventDefault(); event.returnValue = ""; }
+  });
+}
+initJobOptions();
+</script>
+"""
+
+
 def escape(value: Any) -> str:
     return html.escape("" if value is None else str(value), quote=True)
 
@@ -184,7 +474,8 @@ def base_page(title: str, body: str, *, wide: bool = False) -> HTMLResponse:
 </head>
 <body{body_class}>
 {body}
-<footer class="muted">tetolate {escape(VERSION)}</footer>
+<footer class="muted">tetolate {escape(VERSION)} · <a id="check-updates" href="https://github.com/potatoes1286/tetolate/releases" target="_blank" rel="noopener noreferrer" data-version="{escape(VERSION)}">Check for updates</a> <span id="update-status" role="status"></span></footer>
+{UPDATE_CHECK_SCRIPT}
 </body>
 </html>"""
     )
@@ -199,6 +490,7 @@ def admin_login_page(message: str = "") -> HTMLResponse:
 {message_html}
 <form action="/admin/login" method="post">
   <label>Password<br><input name="password" type="password" required autocomplete="current-password"></label>
+  <label><input name="remember_session" type="checkbox" value="1"> Remember session (30 days)</label>
   <button type="submit">Log in</button>
 </form>
 """,
@@ -258,7 +550,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
         url = str(item.get("url") or f"/category/{category}")
         category_rows.append(
             "<tr>"
-            f'<td><a href="{escape(url)}">{escape(category)}</a></td>'
+            f'<td><a href="{escape(url)}">{escape(category)}</a>{" <span class=muted>(series)</span>" if item.get("isSeries") else ""}</td>'
             f'<td>{escape(item.get("jobCount", 0))}</td>'
             f'<td><a class="button" href="/admin/categories/{escape(category)}/rename">Rename...</a> '
             f'<a class="button" href="/admin/categories/{escape(category)}/delete">Delete...</a></td>'
@@ -300,11 +592,22 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
 <h2>Job Categories</h2>
 <form action="/admin/categories" method="post">
   <label>New category<br><input name="category" type="text" required pattern="[A-Za-z0-9_-]{{1,64}}" maxlength="64" autocomplete="off"></label>
+  <label><input name="is_series" type="checkbox" value="1"> Is series <abbr title="A series category keeps chapters in volume/chapter order and shares translation notes and ComicInfo metadata between them." tabindex="0">[?]</abbr></label>
   <button type="submit">Create category</button>
 </form>
 {categories_html}
 <h2>Active Job</h2>
 {active_html}
+<details><summary>Login settings</summary>
+<h2>Remote CLI access</h2>
+<p>Local CLI access does not need a token or login. Create a control token only for remote CLI or agent access.</p>
+<p>Control tokens are separate from VLM API keys and stay valid until revoked.</p>
+<form action="/admin/control-tokens" method="post">
+  <label>Token name<br><input name="name" type="text" maxlength="100" required></label>
+  <label><input name="read_only" type="checkbox" value="1"> Read-only</label>
+  <button type="submit">Create control token</button>
+</form>
+<ul>{''.join(f'<li>{escape(item["name"])} ({"read-only" if item["readOnly"] else "read/write"}) <form action="/admin/control-tokens/{escape(item["id"])}/revoke" method="post"><button type="submit">Revoke</button></form></li>' for item in manager.list_control_tokens())}</ul>
 <h2>Change Admin Password</h2>
 <form action="/admin/password" method="post">
   <label>Current password<br><input name="current_password" type="password" required autocomplete="current-password"></label>
@@ -312,6 +615,7 @@ def admin_dashboard_page(manager: JobManager, message: str = "") -> HTMLResponse
   <label>Confirm new password<br><input name="confirm_password" type="password" required autocomplete="new-password"></label>
   <button type="submit">Change password</button>
 </form>
+</details>
 """,
     )
 
@@ -451,14 +755,24 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
         mode = CBZ_TITLE_MODE_ORIGINAL
     selected = " checked" if status.get("cbzAltTitleInNotes") else ""
     export_buttons: list[str] = []
+    exports = status.get("exports", {})
     for variant, label in generate_labels.items():
         item = downloads.get(variant)
         available = bool(item.get("available")) if isinstance(item, dict) else bool(item)
         action = f"Regenerate {label.removeprefix('Generate ')}" if available else label
+        generating = exports.get(variant, {}).get("status") == "generating"
+        if generating:
+            action = f"Generating {variant.upper()} CBZ..."
+        disabled = " disabled" if generating else ""
         regenerate_attribute = ' name="regenerate" value="1"' if available else ""
         export_buttons.append(
-            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}>{escape(action)}</button>'
+            f'<button name="variant" value="{escape(variant)}" type="submit"{regenerate_attribute}{disabled}>{escape(action)}</button>'
         )
+    export_messages = "".join(
+        f'<p class="muted">{escape(variant.upper())}: {escape(str(item.get("message", "")))}'
+        f'{(" Warning: " + escape(str(item["warning"]))) if item.get("warning") else ""}</p>'
+        for variant, item in exports.items()
+    )
     export_html = f"""
 <details>
   <summary>CBZ export</summary>
@@ -469,6 +783,7 @@ def download_links_html(code: str, job_id: str, status: dict[str, Any]) -> str:
     </select></label>
     <label><input name="alt_title_in_notes" type="checkbox" value="1"{selected}> Add the alternate title to ComicInfo notes</label>
     <p>{" ".join(export_buttons)}</p>
+    {export_messages}
   </form>
 </details>
 """
@@ -604,6 +919,7 @@ def advanced_options_fields(
     test_category: str = "",
     test_job_id: str = "",
     submit_label: str = "",
+    autosave: bool = False,
 ) -> str:
     try:
         budget = _thinking_budget(thinking_budget_tokens)
@@ -639,7 +955,7 @@ def advanced_options_fields(
     )
     clear_vlm_html = (
         '<label><input name="clear_vlm_auth_token" type="checkbox" value="1"> Remove saved translation VLM token</label>'
-        if has_vlm_auth_token
+        if has_vlm_auth_token and test_job_id
         else ""
     )
     clear_paddle_html = (
@@ -652,9 +968,15 @@ def advanced_options_fields(
         if submit_label
         else ""
     )
+    autosave_html = ('<p class="muted" data-category-options-status role="status">'
+                     'Options save automatically, except auth tokens.</p>'
+                     '<p class="muted">New jobs copy these settings when queued. Existing jobs keep their saved settings.</p>'
+                     '<button type="button" data-apply-to-queued>Apply saved settings to queued jobs</button>'
+                     '<p class="muted" data-queue-options-status role="status"></p>' if autosave else "")
     return f"""
 <details{open_attr}>
   <summary>{escape(summary)}</summary>
+  {autosave_html}
   <fieldset>
     <legend>Workflow</legend>
     {translation_notes_html}
@@ -702,6 +1024,7 @@ def advanced_options_fields(
     <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
 </fieldset>
   {submit_button_html}
+  {'<button type="button" data-use-category-options>Copy from Category Settings</button>' if test_job_id else ''}
 </details>
 """
 
@@ -765,7 +1088,7 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         actions_html = " ".join(item for item in (view_html, delete_html) if item)
         rows.append(
             "<tr>"
-            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape(job_name)}</a>{title_html}<br>'
+            f'<td><a href="/job/{escape(code)}/{escape(job_id)}">{escape((str(job.get("chapterLabel") or "") + " " + job_name).strip())}</a>{title_html}<br>'
             f'<span class="muted">{escape(job_id)}</span></td>'
             f'<td>{escape(job.get("status"))}</td>'
             f'<td>{escape(job.get("phase"))}</td>'
@@ -794,10 +1117,12 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
         f"""
 <h1>Category: {escape(code)}</h1>
 <p><a href="/admin">Admin</a></p>
-<form action="/upload" method="post" enctype="multipart/form-data">
+{series_settings_markup(code, data)}
+<form action="/upload" method="post" enctype="multipart/form-data" data-category-options="{escape(code)}">
   <input name="category" type="hidden" value="{escape(code)}">
   <label>CBZ or ZIP archive<br><input name="cbz" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}"></label>
   <label>Page image files<br><input name="page_images" type="file" accept="{UPLOAD_PAGE_IMAGE_ACCEPT}" multiple></label>
+  {chapter_fields() if data.get("series") else ""}
   <p class="muted">Upload one CBZ or ZIP archive, or upload multiple image pages. A ZIP archive must contain image pages and can contain metadata. Separate images use the picker order and are converted to PNG.</p>
   {advanced_options_fields(
       default_thinking_budget_tokens,
@@ -816,12 +1141,15 @@ def category_jobs_page(code: str, data: dict[str, Any]) -> HTMLResponse:
       lama_workers=default_lama_workers,
       imagemagick_workers=default_imagemagick_workers,
       vlm_model=default_vlm_model,
+      has_vlm_auth_token=bool(data.get("hasVlmAuthToken")),
       auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
+      autosave=True,
   )}
   <button type="submit">Queue new job</button>
 </form>
 {VLM_CONNECTION_TEST_SCRIPT}
+{CATEGORY_OPTIONS_SCRIPT}
 <h2>Jobs</h2>
 {jobs_html}
 """,
@@ -923,7 +1251,8 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
     imagemagick_workers = int(status.get("imagemagickWorkers") or 1)
     advanced_options_html = (
         f"""
-<form action="/job/{escape(code)}/{escape(job_id)}/advanced-options" method="post">
+<form action="/job/{escape(code)}/{escape(job_id)}/advanced-options" method="post" data-job-options="/api/v1/jobs/{escape(job_id)}/settings?category={escape(code)}">
+  <p class="muted" data-job-options-status role="status">Options save automatically.</p>
   {advanced_options_fields(
       thinking_budget,
       vlm_base_url,
@@ -944,7 +1273,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
       auto_translate_comicinfo_title=auto_translate_comicinfo_title,
       test_category=code,
       test_job_id=job_id,
-      submit_label="Save advanced options",
+      submit_label="Copy to Category Settings",
   )}
 </form>
 """
@@ -1017,6 +1346,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 <p class="muted">Job ID: {escape(job_id)}</p>
 <p><a href="/category/{escape(code)}">Back to category {escape(code)}</a></p>
 <div id="title-settings">{title_settings_html}</div>
+{job_series_markup(code, job_id, status)}
 <dl>
   <dt>Category</dt><dd>{escape(code)}</dd>
   <dt>Input</dt><dd>{input_display_html(status)}</dd>
@@ -1039,6 +1369,7 @@ def job_page(code: str, job_id: str, status: dict[str, Any]) -> HTMLResponse:
 <h2>Recent Log</h2>
 <pre id="log" class="job-log">{escape(log_text)}</pre>
 {VLM_CONNECTION_TEST_SCRIPT}
+{JOB_OPTIONS_SCRIPT}
 <script>
 const code = {json.dumps(code)};
 const jobId = {json.dumps(job_id)};
@@ -1063,9 +1394,7 @@ function htmlEscape(value) {{
 function restartMarkup(data) {{
   if (!data.canRestart) return "";
   let target = "from the beginning";
-  if (data.restartResumeFrom === "package") {{
-    target = "from package";
-  }} else if (data.restartResumeFrom) {{
+  if (data.restartResumeFrom) {{
     target = `from ${{data.restartResumeFrom}} page ${{data.restartResumePage ?? 0}}`;
   }}
   const label = data.ocrReviewCheckpoint ? "Continue processing" : "Restart run";
@@ -1123,11 +1452,13 @@ function downloadMarkup(data) {{
   const exportButtons = Object.keys(generateLabels).map((variant) => {{
     const item = downloads[variant];
     const available = item && (typeof item !== "object" || item.available);
-    const label = available ? regenerateLabels[variant] : generateLabels[variant];
+    const generating = data.exports?.[variant]?.status === "generating";
+    const label = generating ? `Generating ${{variant.toUpperCase()}} CBZ...` : (available ? regenerateLabels[variant] : generateLabels[variant]);
     const regenerateAttribute = available ? ' name="regenerate" value="1"' : "";
-    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}>${{label}}</button>`;
+    return `<button name="variant" value="${{variant}}" type="submit"${{regenerateAttribute}}${{generating ? " disabled" : ""}}>${{label}}</button>`;
   }}).join(" ");
-  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p></form></details>`;
+  const exportMessages = Object.entries(data.exports || {{}}).map(([variant, item]) => `<p class="muted">${{htmlEscape(variant.toUpperCase())}}: ${{htmlEscape(item.message)}}${{item.warning ? " Warning: " + htmlEscape(item.warning) : ""}}</p>`).join("");
+  const exportHtml = `<details><summary>CBZ export</summary><form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/generate-download" method="post"><label>Title in ComicInfo<br><select name="title_mode">${{modeOptions}}</select></label><label><input name="alt_title_in_notes" type="checkbox" value="1"${{altChecked}}> Add the alternate title to ComicInfo notes</label><p>${{exportButtons}}</p>${{exportMessages}}</form></details>`;
   return summaryHtml + linksHtml + exportHtml;
 }}
 function deleteMarkup(data) {{
@@ -1172,7 +1503,8 @@ function advancedOptionsMarkup(data) {{
   const clearVlm = data.hasVlmAuthToken
     ? `<label><input name="clear_vlm_auth_token" type="checkbox" value="1"> Remove saved translation VLM token</label>`
     : "";
-  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post">
+  return `<form action="/job/${{encodeURIComponent(code)}}/${{encodeURIComponent(jobId)}}/advanced-options" method="post" data-job-options="/api/v1/jobs/${{encodeURIComponent(jobId)}}/settings?category=${{encodeURIComponent(code)}}">
+    <p class="muted" data-job-options-status role="status">Options save automatically.</p>
     <details><summary>Advanced options</summary>
       <fieldset><legend>Workflow</legend>
         <label><input name="enable_alt_placement" type="checkbox" value="1"${{altPlacementChecked}}> Enable alt-placement</label>
@@ -1206,7 +1538,8 @@ function advancedOptionsMarkup(data) {{
         <label>No. of thinking tokens<br><input name="thinking_budget_tokens" type="number" step="1" value="${{thinkingBudget}}"></label>
         <p class="muted">Use 0 to disable thinking where supported. Use a negative value for unlimited/server-defined thinking.</p>
       </fieldset>
-      <button type="submit">Save advanced options</button>
+      <button type="submit">Copy to Category Settings</button>
+      <button type="button" data-use-category-options>Copy from Category Settings</button>
     </details></form>`;
 }}
 function rerunJobMarkup(data) {{
@@ -1242,7 +1575,10 @@ async function refreshStatus() {{
   const keepAtBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
   log.textContent = (data.recentLog || []).join("\\n");
   if (keepAtBottom) log.scrollTop = log.scrollHeight;
-  document.getElementById("download").innerHTML = downloadMarkup(data);
+  const downloads = document.getElementById("download");
+  const exportOpen = downloads.querySelector("details")?.open;
+  downloads.innerHTML = downloadMarkup(data);
+  if (exportOpen && downloads.querySelector("details")) downloads.querySelector("details").open = true;
   document.getElementById("title-settings").innerHTML = titleSettingsMarkup(data);
   document.getElementById("generated-translation-notes").innerHTML = generatedTranslationNotesMarkup(data);
   if (!(previousStatus === "complete" && data.status === "complete")) {{
@@ -1251,6 +1587,7 @@ async function refreshStatus() {{
       advancedOptions.innerHTML = "";
     }} else if (!advancedOptions.querySelector("form")) {{
       advancedOptions.innerHTML = advancedOptionsMarkup(data);
+      initJobOptions();
     }}
     document.getElementById("restart").innerHTML = restartMarkup(data);
     document.getElementById("terminate").innerHTML = terminateMarkup(data);
@@ -1258,7 +1595,7 @@ async function refreshStatus() {{
     document.getElementById("rerun-job").innerHTML = rerunJobMarkup(data);
     document.getElementById("delete").innerHTML = deleteMarkup(data);
   }}
-  if (data.status === "complete" || data.status === "failed" || data.status === "cancelled" || (data.status === "paused" && data.canRestart)) {{
+  if (!data.exportsRunning && (data.status === "complete" || data.status === "failed" || data.status === "cancelled" || (data.status === "paused" && data.canRestart))) {{
     window.clearInterval(statusTimer);
   }}
 }}
@@ -1269,20 +1606,103 @@ const statusTimer = window.setInterval(refreshStatus, 5000);
     )
 
 
+def chapter_fields(chapter: str = "", volume: str = "") -> str:
+    return f"""
+<div style="display:flex;gap:1em">
+  <label>Volume (optional)<br><input name="volume" type="number" min="0" max="1000000" step="any" style="width:9em" value="{escape(volume)}"></label>
+  <label>Chapter<br><input name="chapter" type="number" min="0" max="1000000" step="any" style="width:9em" value="{escape(chapter)}" required></label>
+</div>
+"""
+
+
+def job_series_markup(code: str, job_id: str, status: dict[str, Any]) -> str:
+    if not status.get("isSeries"):
+        return ""
+    link = f'<p>Series: <a href="/category/{escape(code)}">{escape(code)}</a> — {escape(status.get("chapterLabel"))}</p>'
+    warning = f'<p>{escape(status["seriesNotesWarning"])}</p>' if status.get("seriesNotesWarning") else ""
+    if status.get("status") in {"queued", "running", "terminating"}:
+        return link + warning
+    fields = f"""
+<form action="/job/{escape(code)}/{escape(job_id)}/chapter" method="post">
+{chapter_fields(str(status.get("chapter") or ""), str(status.get("volume") or ""))}
+<button type="submit">Save volume/chapter</button></form>
+"""
+    return link + warning + fields
+
+
+def series_settings_markup(code: str, data: dict[str, Any]) -> str:
+    series = data.get("series")
+    if not series:
+        return ""
+    state = data.get("seriesExport") or {}
+    download = "" if state.get("status") != "complete" else f'<a href="/api/v1/categories/{escape(code)}/exports/download">Download CBZ collection</a>'
+    return f"""
+<details id="series-settings"><summary>Series settings</summary>
+<form action="/category/{escape(code)}/series" method="post">
+  <label>Series name<br><input name="name" maxlength="256" required value="{escape(series['name'])}"></label>
+  <label>Fixed translation instructions<br><textarea name="instructions" rows="4" maxlength="100000">{escape(series['instructions'])}</textarea></label>
+  <label>Series notes<br><textarea name="notes" rows="8" maxlength="100000">{escape(series['notes'])}</textarea></label>
+  <label>Common ComicInfo XML<br><textarea name="comic_info_xml" rows="8" maxlength="100000" placeholder="&lt;ComicInfo&gt;...&lt;/ComicInfo&gt;">{escape(series['comicInfoXml'])}</textarea></label>
+  <p class="muted">Common XML replaces matching source fields. Each export sets its own title, volume, chapter, and page count. Leave XML blank to keep source metadata.</p>
+  <button type="submit">Save series settings</button>
+</form>
+<p class="muted">Chapters run in volume/chapter order and share translation notes. Retries keep their saved context.</p>
+<form action="/category/{escape(code)}/exports" method="post">
+  <label>Export all CBZ as <select name="variant">{''.join(f'<option value="{v}"' + (' selected' if state.get('format', 'png') == v else '') + f'>{label}</option>' for v, label in (('png', 'PNG'), ('webp', 'WebP'), ('jxl', 'JXL')))}</select></label>
+  <label>Group <select name="grouping"><option value="chapters"{' selected' if state.get('grouping', 'chapters') == 'chapters' else ''}>Individual chapters</option><option value="volumes"{' selected' if state.get('grouping') == 'volumes' else ''}>Volumes</option></select></label>
+  <button type="submit">Export all CBZ</button>
+</form>
+<p class="muted">Exports completed chapters only, as a ZIP of CBZ files. Volume mode combines chapters in each volume; chapters without a volume stay separate. Export does not use the VLM.</p>
+<p id="series-export-status" role="status">{escape(state.get('message') or '')}</p>
+<p id="series-export-download">{download}</p>
+<details><summary>Upload multiple chapters</summary>
+<form action="/category/{escape(code)}/series/upload" method="post" enctype="multipart/form-data">
+<label>CBZ or ZIP chapters<br><input name="chapters" type="file" accept="{UPLOAD_COMIC_ARCHIVE_ACCEPT}" multiple required></label>
+<label>Volume (optional)<br><input name="volume" type="number" min="0" max="1000000" step="any"></label>
+<label>First chapter<br><input name="first_chapter" type="number" min="0" max="1000000" step="any" value="1" required></label>
+<p class="muted">Uses saved category Advanced Options. Files use filename order (2 before 10); each next chapter adds 1.</p>
+<button type="submit">Queue chapters</button></form>
+</details></details>
+<script>
+(() => {{
+  let timer;
+  if (window.location.hash === "#series-settings") document.getElementById("series-settings").open = true;
+  async function refreshExport() {{
+    try {{
+      const response = await fetch("/api/v1/categories/{escape(code)}/exports", {{cache: "no-store"}});
+      if (!response.ok) throw new Error("Could not read export status.");
+      const data = await response.json();
+      document.getElementById("series-export-status").textContent = data.message || "";
+      const download = document.getElementById("series-export-download");
+      download.replaceChildren();
+      if (data.status === "complete") {{
+        const link = document.createElement("a");
+        link.href = "/api/v1/categories/{escape(code)}/exports/download";
+        link.textContent = "Download CBZ collection";
+        download.append(link);
+      }}
+      if (data.status === "generating") timer = setTimeout(refreshExport, 2000);
+    }} catch (error) {{
+      document.getElementById("series-export-status").textContent = error.message;
+      timer = setTimeout(refreshExport, 5000);
+    }}
+  }}
+  refreshExport();
+  window.addEventListener("beforeunload", () => clearTimeout(timer));
+}})();
+</script>
+"""
+
+
 def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     status = manager.require_editable_job(code, job_id)
     manager.load_editor_v2_manifest(code, job_id)
     available_stages = manager.editor_available_stages(status)
     ocr_review_checkpoint = status.get("reviewCheckpoint") == "ocr"
     page_count = len(manager.original_page_files(code, job_id))
-    page_options = "\n".join(
-        f'<option value="{index}">Page {index}</option>' for index in range(page_count)
-    )
     stage_labels = {
         "ocr": "OCR & Merge",
-        "structure": "Structure",
-        "erase": "Erase & Alternate Placement",
-        "translation": "Translation",
+        "text": "Text & Translation",
         "placement": "Typesetting",
     }
     stage_buttons = "\n".join(
@@ -1301,33 +1721,37 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     return base_page(
         f"Edit {code} {job_id}",
         f"""
-<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=7">
+<link rel="stylesheet" href="/assets/editor-v2/editor.css?v=15">
 <div class="editor-app" id="editor-app">
   <header class="editor-header">
-    <div>
-      <a href="/job/{escape(code)}/{escape(job_id)}">Back to job</a>
-      <h1>Edit {escape(job_id)}</h1>
-      <p class="muted editor-input">{input_display_html(status)}</p>
+    <div class="job-details">
+      <h1><a href="/job/{escape(code)}/{escape(job_id)}" title="Back to job">Edit {escape(job_id)}</a></h1>
+      <span class="muted editor-input" title="{escape(status.get('inputFilename') or '')}">{input_display_html(status)}</span>
     </div>
+    <nav class="stage-tabs" aria-label="Editor stages">{stage_buttons}</nav>
     <div class="page-nav">
       <button id="prev-page" type="button" title="Previous page (A)">Previous [A]</button>
-      <label>Page<select id="page-select">{page_options}</select></label>
+      <label>Page <input id="page-select" type="number" min="0" max="{max(0, page_count - 1)}" step="1" value="0" required> / {max(0, page_count - 1)}</label>
       <button id="next-page" type="button" title="Next page (D)">Next [D]</button>
     </div>
-  </header>
-  {review_notice}
-  <nav class="stage-tabs" aria-label="Editor stages">{stage_buttons}</nav>
-  <div class="action-bar">
+    <div class="action-bar">
     <button id="undo" type="button" title="Undo (Ctrl+Z)" disabled>Undo</button>
     <button id="redo" type="button" title="Redo (Ctrl+Shift+Z)" disabled>Redo</button>
     <button id="save" type="button" title="Save changes (Ctrl+S)">Save</button>
+    <button id="reset-stage" type="button" data-tooltip="Restore the generated records for this stage on this page. Remove saved and unsaved edits and protection flags. Other stages, pages, and saved translation notes are kept.">Reset stage</button>
     <button id="freeze-stage" type="button" data-tooltip="Protect all current values in this stage on this page. Later reruns keep them until you unprotect the stage.">Protect stage</button>
     <button id="freeze-page" type="button" data-tooltip="Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page."{complete_only}>Protect page</button>
-    <button id="regenerate" type="button" data-tooltip="Save this page, then rerun only the stages after the current stage for this page. The current stage is used as input and is not regenerated."{complete_only}>Regenerate downstream</button>
-    <button id="regenerate-all" type="button" data-tooltip="Rerun every page with saved editor changes from the earliest required downstream pass. Then update all later stages and rendered pages."{complete_only}>Regenerate all changes</button>
+    <button id="regenerate-stage" type="button" data-tooltip="Rebuild only this tab on this page. Protected edits are kept; later stages remain out of date."{complete_only}>Regenerate stage</button>
+    <button id="regenerate-page" type="button" data-tooltip="Save this page and rerun only the steps required by its saved edits, through final rendering."{complete_only}>Regenerate page</button>
+    <button id="regenerate-all-pages" type="button" data-tooltip="Rerun only the required steps on all pages with saved edits."{complete_only}>Regenerate all pages</button>
+    <button id="finish-edits" type="button" data-tooltip="Apply saved edits to final output using only LaMa and ImageMagick. No OCR or VLM calls. Deletes old CBZ exports."{complete_only}>Finish Edits</button>
     <button id="continue-processing" type="button" data-tooltip="Save this page and continue the pipeline from Structure. The pipeline uses the reviewed OCR and merge data."{continue_only}>Continue processing</button>
     <span id="save-state" class="muted" role="status">Loading...</span>
-  </div>
+    </div>
+  </header>
+  {review_notice}
+  <div id="stage-tools" class="stage-tools"></div>
+  <p id="editor-status" class="status-line muted" role="status"></p>
   <div id="editor-tooltip" class="editor-tooltip" role="tooltip" tabindex="0" hidden></div>
   <main class="editor-workspace">
     <aside class="record-pane">
@@ -1340,9 +1764,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
     </aside>
     <div id="record-resizer" class="pane-resizer" role="separator" aria-label="Resize records pane" aria-orientation="vertical" tabindex="0"></div>
     <section class="canvas-pane">
-      <div id="stage-tools" class="stage-tools"></div>
       <div class="canvas-wrap" id="canvas-wrap"><canvas id="page-canvas"></canvas></div>
-      <p id="editor-status" class="status-line muted" role="status"></p>
     </section>
     <div id="inspector-resizer" class="pane-resizer" role="separator" aria-label="Resize inspector pane" aria-orientation="vertical" tabindex="0"></div>
     <aside class="inspector-pane">
@@ -1359,6 +1781,7 @@ def editor_page(manager: JobManager, code: str, job_id: str) -> HTMLResponse:
       </details>
     </aside>
   </main>
+  <div id="height-resizer" role="separator" aria-label="Resize editor height" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax="20000" aria-valuenow="0" tabindex="0" title="Drag down to make the editor taller. Hold near the bottom of the window to keep expanding. Arrow Up/Down resize; Home or double-click resets.">Drag to resize</div>
 </div>
 <script>
 window.TETOLATE_EDITOR_V2 = {{
@@ -1369,6 +1792,6 @@ window.TETOLATE_EDITOR_V2 = {{
   reviewCheckpoint: {json.dumps(status.get("reviewCheckpoint"))},
 }};
 </script>
-<script type="module" src="/assets/editor-v2/app.js?v=8"></script>
+<script type="module" src="/assets/editor-v2/app.js?v=16"></script>
 """,
     )

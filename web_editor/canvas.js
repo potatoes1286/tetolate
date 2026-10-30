@@ -1,75 +1,77 @@
 import { SCREEN } from "./screens.js";
 
-const COLORS = { ocr_raw: "#e11d48", ocr_merged: "#2563eb", ocr_structured: "#059669", translations: "#7c3aed", placements: "#d97706" };
+const COLORS = { ocr_raw: "#e11d48", ocr_merged: "#2563eb", ocr_structured: "#059669", translations: "#7c3aed", placements: "#d97706", clean_boxes: "#dc2626" };
 const DRAG_UNLOCK_PIXELS = 7;
 const RESIZE_HANDLE_VISUAL_PIXELS = 10;
 const RESIZE_HANDLE_HIT_RADIUS_PIXELS = 14;
 
-function oppositeColour(fill) { return fill === "white" ? "black" : "white"; }
-
-function splitWord(ctx, word, maxWidth) {
-  const parts = [];
-  let current = "";
-  for (const character of word) {
-    const candidate = current + character;
-    if (current && ctx.measureText(`${candidate}-`).width > maxWidth) {
-      parts.push(`${current}-`);
-      current = character;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current) parts.push(current);
-  return parts;
-}
-
-function wrapText(ctx, text, maxWidth) {
-  const lines = [];
-  for (const paragraph of String(text).split("\n")) {
-    const words = paragraph.trim().split(/\s+/).filter(Boolean);
-    if (!words.length) { lines.push(""); continue; }
-    let line = "";
-    for (const rawWord of words) {
-      const parts = ctx.measureText(rawWord).width <= maxWidth
-        ? [rawWord]
-        : splitWord(ctx, rawWord, maxWidth);
-      for (const word of parts) {
-        const candidate = line ? `${line} ${word}` : word;
-        if (line && ctx.measureText(candidate).width > maxWidth) {
-          lines.push(line); line = word;
-        } else {
-          line = candidate;
-        }
-      }
-    }
-    if (line) lines.push(line);
-  }
-  return lines;
+function roundPixel(value) {
+  const floor = Math.floor(value);
+  return value - floor === 0.5 ? floor + Math.abs(floor % 2) : Math.round(value);
 }
 
 export class EditorCanvas {
-  constructor(canvas, store, onStatus) {
+  constructor(canvas, store, onStatus, renderTextLayers, groupSelection = null) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.store = store;
     this.onStatus = onStatus;
     this.image = new Image();
     this.showPlacementText = true;
+    this.hideBoxes = false;
     this.busy = false;
     this.drag = null;
     this.drawAction = null;
+    this.layers = new Map();
+    this.layerTimer = null;
+    this.renderingLayers = false;
+    this.layerRequest = null;
+    this.renderTextLayers = renderTextLayers;
+    this.groupSelection = groupSelection;
     this.image.onload = () => { this.resize(); this.draw(); };
     canvas.addEventListener("pointerdown", (event) => this.pointerDown(event));
     canvas.addEventListener("pointermove", (event) => this.pointerMove(event));
     canvas.addEventListener("pointerup", (event) => this.pointerUp(event));
     canvas.addEventListener("pointercancel", (event) => this.pointerUp(event));
+    canvas.addEventListener("dblclick", (event) => this.doubleClick(event));
     store.addEventListener("change", () => this.draw());
   }
 
   load(url, options = {}) {
     this.showPlacementText = options.showPlacementText !== false;
+    if (!this.showPlacementText) {
+      clearTimeout(this.layerTimer);
+      this.layerTimer = null;
+      this.trimLayers(new Set());
+      this.cancelTextLayers();
+    }
+    const image = new Image();
+    this.image = image;
+    const ready = new Promise((resolve) => {
+      image.onload = () => {
+        if (this.image === image) { this.resize(); this.draw(); }
+        resolve(this.image === image);
+      };
+      image.onerror = () => {
+        if (this.image === image) this.onStatus("Could not load the page image.", true);
+        resolve(false);
+      };
+    });
     const separator = url.includes("?") ? "&" : "?";
-    this.image.src = `${url}${separator}v=${Date.now()}`;
+    image.src = `${url}${separator}v=${Date.now()}`;
+    return ready;
+  }
+
+  cancelTextLayers() {
+    for (const layer of this.layers.values()) {
+      if (layer.request === this.layerRequest && layer.state === "pending") {
+        layer.state = "queued";
+        delete layer.request;
+      }
+    }
+    this.layerRequest?.controller.abort();
+    this.layerRequest = null;
+    this.renderingLayers = false;
   }
   setBusy(busy) {
     this.busy = !!busy;
@@ -92,15 +94,128 @@ export class EditorCanvas {
   }
   visibleArtifacts() { return SCREEN[this.store.stage].artifacts; }
 
+  drawTextLayer(record, required) {
+    const region = this.region(record, "placements");
+    if (!region) return;
+    const manual = record.manualLineBreaks?.trim() ? record.manualLineBreaks : "";
+    const text = manual || (this.store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
+    if (!text.trim()) return;
+    const [left, top, right, bottom] = region.map((value, index) => roundPixel(Math.max(0,
+      Math.min(index % 2 ? this.canvas.height : this.canvas.width, value))));
+    const width = right - left, height = bottom - top;
+    if (width <= 0 || height <= 0) return;
+    const entry = {placementRegion: [0, 0, width, height], englishText: text};
+    for (const field of ["font", "fill", "stroke", "strokeWidth", "gravity", "fontSizeWidthPercent", "manualLineBreaks", "lineSpacing", "minPointSize", "maxPointSize", "renderBleed", "rotation", "skewX", "skewY"])
+      if (record[field] !== undefined) entry[field] = record[field];
+    const page = this.store.page;
+    const key = JSON.stringify([page, this.canvas.width, this.canvas.height, this.store.document?.defaultFont, entry]);
+    required.add(key);
+    let layer = this.layers.get(key);
+    if (!layer) {
+      layer = {entry, page, state: "queued"};
+      this.layers.set(key, layer);
+    }
+    if (layer.bitmap) this.ctx.drawImage(layer.bitmap,
+      left + Math.floor((width - layer.bitmap.width) / 2), top + Math.floor((height - layer.bitmap.height) / 2));
+  }
+
+  scheduleLayers() {
+    clearTimeout(this.layerTimer);
+    this.layerTimer = null;
+    if (this.renderingLayers || ![...this.layers.values()].some((layer) => layer.state === "queued")) return;
+    this.layerTimer = setTimeout(() => this.flushLayers(), 200);
+  }
+
+  async flushLayers() {
+    this.layerTimer = null;
+    const batch = [...this.layers].filter(([_key, layer]) => layer.state === "queued").slice(0, 256);
+    if (!batch.length || this.renderingLayers) return;
+    this.renderingLayers = true;
+    const request = {controller: new AbortController()};
+    this.layerRequest = request;
+    for (const [_key, layer] of batch) { layer.state = "pending"; layer.request = request; }
+    this.onStatus(`Rendering ${batch.length} preview text layers...`);
+    try {
+      const pending = this.renderTextLayers(batch[0][1].page, batch.map(([_key, layer]) => layer.entry), request.controller.signal);
+      request.done = pending;
+      const bitmaps = await pending;
+      if (!Array.isArray(bitmaps) || bitmaps.length !== batch.length) {
+        for (const bitmap of bitmaps || []) bitmap.close();
+        throw new Error("The preview batch returned an incorrect layer count.");
+      }
+      batch.forEach(([key, layer], index) => {
+        if (this.layers.get(key) === layer && layer.request === request && this.layerRequest === request) {
+          layer.bitmap = bitmaps[index]; layer.state = "ready";
+        }
+        else bitmaps[index].close();
+      });
+      if (this.layerRequest === request && batch.some(([key, layer]) => this.layers.get(key) === layer))
+        this.onStatus("Preview text rendered with ImageMagick.");
+    } catch (error) {
+      let active = false;
+      for (const [key, layer] of batch) {
+        if (this.layers.get(key) === layer && layer.request === request && this.layerRequest === request) {
+          layer.state = "failed"; active = true;
+        }
+      }
+      if (active && error.name !== "AbortError") this.onStatus(`Could not render preview text: ${error.message}`, true);
+    } finally {
+      if (this.layerRequest === request) {
+        this.layerRequest = null;
+        this.renderingLayers = false;
+        this.draw();
+      }
+    }
+  }
+
+  async prepareTextLayers() {
+    const document = this.store.document;
+    this.draw();
+    while (this.store.document === document && this.showPlacementText) {
+      clearTimeout(this.layerTimer); this.layerTimer = null;
+      if (this.layerRequest) {
+        try { await this.layerRequest.done; } catch { /* flushLayers reports active errors. */ }
+        await Promise.resolve();
+      } else if ([...this.layers.values()].some((layer) => layer.state === "queued")) {
+        await this.flushLayers();
+      } else break;
+    }
+    if (this.store.document === document && [...this.layers.values()].some((layer) => layer.state === "failed"))
+      throw new Error("Some ImageMagick text layers could not be rendered.");
+  }
+
+  trimLayers(required) {
+    for (const [key, layer] of this.layers) {
+      if (!required.has(key) && (!layer.bitmap || this.layers.size > 128)) {
+        layer.bitmap?.close();
+        this.layers.delete(key);
+      }
+    }
+  }
+
   draw() {
+    if (this.layerDocument !== this.store.document) {
+      this.cancelTextLayers();
+      for (const layer of this.layers.values()) {
+        layer.bitmap?.close();
+      }
+      this.layers.clear();
+      this.layerDocument = this.store.document;
+    }
     if (!this.image.complete || !this.canvas.width) return;
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     this.ctx.drawImage(this.image, 0, 0);
-    for (const artifact of this.visibleArtifacts().slice().reverse()) {
+    const required = new Set();
+    if (this.store.stage === "placement" && this.showPlacementText)
+      for (const record of this.store.records.placements || []) this.drawTextLayer(record, required);
+    this.trimLayers(required);
+    this.scheduleLayers();
+    for (const artifact of this.hideBoxes ? [] : this.visibleArtifacts().slice().reverse()) {
       for (const record of this.store.records[artifact] || []) {
         const region = this.region(record, artifact);
         if (!region) continue;
-        const selected = this.store.selection?.recordId === record.recordId;
+        const active = this.store.selection?.recordId === record.recordId;
+        const selected = active || (this.store.stage === "ocr" && this.groupSelection?.has(artifact, record));
         this.ctx.strokeStyle = selected ? "#f59e0b" : (COLORS[artifact] || "#2563eb");
         this.ctx.lineWidth = selected ? 5 : 3;
         this.ctx.strokeRect(region[0], region[1], region[2] - region[0], region[3] - region[1]);
@@ -108,8 +223,8 @@ export class EditorCanvas {
         this.ctx.fillRect(region[0], Math.max(0, region[1] - 24), 44, 24);
         this.ctx.fillStyle = "white";
         this.ctx.font = "bold 18px sans-serif";
-        this.ctx.fillText(String(record.boxno ?? "?"), region[0] + 5, Math.max(18, region[1] - 5));
-        if (selected && SCREEN[this.store.stage].movable) {
+        this.ctx.fillText(`${artifact === "clean_boxes" ? "C" : ""}${record.boxno ?? "?"}`, region[0] + 5, Math.max(18, region[1] - 5));
+        if (active && SCREEN[this.store.stage].movable) {
           const handle = this.imagePixelsForScreenPixels(RESIZE_HANDLE_VISUAL_PIXELS);
           this.ctx.fillStyle = "#f59e0b";
           this.ctx.fillRect(
@@ -129,36 +244,6 @@ export class EditorCanvas {
             handle.x,
             handle.y,
           );
-        }
-        if (artifact === "placements" && this.showPlacementText) {
-          const translation = (this.store.records.translations || []).find((item) => item.boxno === record.boxno);
-          const text = record.manualLineBreaks || translation?.englishText || "";
-          if (text) {
-            const size = record.fontSizeWidthPercent
-              ? Math.max(1, this.canvas.width * Number(record.fontSizeWidthPercent) / 100)
-              : Math.max(1, Number(record._roughPointSize) || Math.min((region[2] - region[0]) / 8, (region[3] - region[1]) / 5));
-            const fontFamily = "sans-serif";
-            const maxWidth = Math.max(1, (region[2] - region[0]) * 0.9);
-            const fill = record.fill || "black";
-            this.ctx.font = `${size}px ${fontFamily}`;
-            const lines = record.manualLineBreaks
-              ? String(record.manualLineBreaks).split("\n")
-              : (record._roughText ? String(record._roughText).split("\n") : wrapText(this.ctx, text, maxWidth));
-            this.ctx.fillStyle = fill;
-            this.ctx.strokeStyle = record.stroke || oppositeColour(fill);
-            this.ctx.lineWidth = Math.max(1, Number(record.strokeWidth) || 2);
-            this.ctx.lineJoin = "round";
-            this.ctx.textAlign = "center";
-            const lineHeight = size * 1.15;
-            const startY = (region[1] + region[3] - lines.length * lineHeight) / 2 + size;
-            lines.forEach((line, index) => {
-              const x = (region[0] + region[2]) / 2;
-              const y = startY + index * lineHeight;
-              this.ctx.strokeText(line, x, y, maxWidth);
-              this.ctx.fillText(line, x, y, maxWidth);
-            });
-            this.ctx.textAlign = "start";
-          }
         }
       }
     }
@@ -201,10 +286,19 @@ export class EditorCanvas {
     if (this.busy) { this.onStatus("Wait for the current OCR request to finish."); return; }
     const point = this.point(event);
     if (this.drawAction) { this.drag = { mode: "draw", start: point, current: point, action: this.drawAction }; return; }
+    if (this.hideBoxes) return;
+    const hits = this.hits(point);
+    const extend = event.ctrlKey || event.metaKey || event.shiftKey;
+    if (this.store.stage === "ocr" && this.groupSelection && extend) {
+      const hit = hits.find((item) => item.artifact === "ocr_raw") || hits[0];
+      if (hit) this.groupSelection.select(hit, true);
+      return;
+    }
     const resizeHit = this.selectedResizeHit(point);
-    const hit = resizeHit || this.hits(point)[0];
-    if (!hit) { this.store.select(null, null); return; }
-    this.store.select(hit.artifact, hit.record.recordId);
+    const hit = resizeHit || hits.find((item) => item.record.recordId === this.store.selection?.recordId
+      && item.artifact === this.store.selection.artifact) || hits[0];
+    this.selectHit(hit);
+    if (!hit) return;
     if (!SCREEN[this.store.stage].movable) return;
     const radius = this.imagePixelsForScreenPixels(RESIZE_HANDLE_HIT_RADIUS_PIXELS);
     const resize = !!resizeHit || (
@@ -221,6 +315,20 @@ export class EditorCanvas {
       recordId: hit.record.recordId,
     };
     this.canvas.setPointerCapture?.(event.pointerId);
+  }
+  selectHit(hit) {
+    if (this.store.stage === "ocr" && this.groupSelection) this.groupSelection.select(hit);
+    else this.store.select(hit?.artifact || null, hit?.record.recordId || null);
+  }
+  doubleClick(event) {
+    if (this.busy || this.hideBoxes || this.drawAction || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const hits = this.hits(this.point(event));
+    if (hits.length < 2) return;
+    event.preventDefault();
+    const current = hits.findIndex((item) => item.artifact === this.store.selection?.artifact
+      && item.record.recordId === this.store.selection.recordId);
+    this.selectHit(hits[(current + 1) % hits.length]);
+    this.drag = null;
   }
   pointerMove(event) {
     if (!this.drag) return;
@@ -240,7 +348,7 @@ export class EditorCanvas {
     const region = this.drag.mode === "move" ? [l + dx, t + dy, r + dx, b + dy] : [l, t, Math.max(l + 2, r + dx), Math.max(t + 2, b + dy)];
     const key = this.drag.artifact === "placements" ? "placementRegion" : "region";
     this.store.updateSelected(
-      { [key]: region.map(Math.round), _roughText: null, _roughPointSize: null },
+      { [key]: region.map(Math.round) },
       { history: false },
     );
   }

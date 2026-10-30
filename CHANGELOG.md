@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.0.0 - 2026-10-30
+
+### Added
+
+- First-party native installation with guided setup and documentation.
+- CLI and JSON API access. Local CLI needs no login; remote access uses revocable tokens.
+- Job editor overhaul; far more functional and easy to use
+- Remember session login and manual release checks.
+- Added Series, special categories with chapter ordering, shared notes, ComicInfo templates, and chapter/volume collection exports.
+
+### Changed
+
+- Native servers bind to 127.0.0.1 by default; use --listen for network access or --address for a specific address.
+- Editor actions can regenerate selected work or finish edits without VLM calls.
+- Improved preview speed with cached text layers, batched rendering, and fewer LaMa calls.
+- CBZ exports run independently of the translation queue, with PNG, WebP, and JXL output.
+
+### Fixed
+
+- Improved editor saves, resets, OCR box tracking, and text rendering.
+- Improved settings persistence, endpoint key handling, and model connection errors.
+- Improved job and series queue safety, export invalidation, and failed-edit recovery.
+- Fixed release checks, container test inputs, and CLI export timeouts.
+- Lots of bug fixes
+
 ## 1.0.0 - 2026-09-04
 
 Devnote:

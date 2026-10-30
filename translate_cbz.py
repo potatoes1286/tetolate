@@ -451,6 +451,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--editor-stage-only", choices=("ocr", "text", "placement"), help=argparse.SUPPRESS)
     parser.add_argument(
         "--thinking-budget-tokens",
         type=int,
@@ -707,8 +708,10 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
     if min_score < 0 or min_score > 1:
         raise PipelineError("Config field ocr.min_score must be between 0 and 1.")
 
+    endpoint = normalize_vlm_base_url(data.get("paddleocr_vl_server_url", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL), "ocr.paddleocr_vl_server_url")
+
     return OCRConfig(
-        engine=paddle_ocr_image.DEFAULT_OCR_ENGINE,
+        engine=paddle_ocr_image.normalize_ocr_engine(data.get("engine", paddle_ocr_image.DEFAULT_OCR_ENGINE)),
         service_url=service_url,
         service_timeout=paddle_ocr_image.DEFAULT_OCR_SERVICE_TIMEOUT,
         lang=language.source.ocr_lang,
@@ -734,9 +737,9 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
         tile_include_full_image=paddle_ocr_image.DEFAULT_TILE_INCLUDE_FULL_IMAGE,
         tile_dedupe_iou=paddle_ocr_image.DEFAULT_TILE_DEDUPE_IOU,
         tile_dedupe_containment=paddle_ocr_image.DEFAULT_TILE_DEDUPE_CONTAINMENT,
-        paddleocr_vl_server_url=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL,
-        paddleocr_vl_model=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL,
-        paddleocr_vl_api_key=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY,
+        paddleocr_vl_server_url=endpoint,
+        paddleocr_vl_model=normalize_vlm_model(data.get("paddleocr_vl_model", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL), "ocr.paddleocr_vl_model"),
+        paddleocr_vl_api_key=data.get("paddleocr_vl_api_key", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY if endpoint.rstrip("/") == paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL.rstrip("/") else None),
         paddleocr_vl_max_concurrency=None,
     )
 
@@ -3948,6 +3951,10 @@ def apply_placements_to_records(
             "manualLineBreaks",
             "minPointSize",
             "maxPointSize",
+            "rotation",
+            "lineSpacing",
+            "skewX",
+            "skewY",
         ):
             if field in placement:
                 record[field] = placement[field]
@@ -4134,11 +4141,13 @@ def clean_render_page(
     records: list[dict[str, Any]],
     output_dir: Path,
     lama_session: lama_inpaint.LaMaSession | None,
+    clean_boxes: list[dict[str, Any]] | None = None,
 ) -> None:
     print(f"Clean page {page.index}", file=sys.stderr)
     cleaned_path = cleaned_pages_dir(output_dir) / f"{page.image_path.stem}.png"
     keep_mask = debug_image_path(output_dir, "masks", page)
     clean_entries = [record for record in records if not record["openLettering"]]
+    clean_entries.extend(clean_boxes or [])
     clean_text_regions.clean_text_regions(
         clean_entries,
         page.image_path,
@@ -4182,13 +4191,15 @@ def typeset_render_page(
                 "stroke": outline_for_fill(fill),
                 "strokeWidth": DEFAULT_RENDER_STROKE_WIDTH,
                 "gravity": config.render_gravity,
+                **{field: record[field] for field in overlay_text.TEXT_TRANSFORM_LIMITS if field in record},
+                **({"lineSpacing": record["lineSpacing"]} if "lineSpacing" in record else {}),
                 **(
                     {"fontSizeWidthPercent": record["fontSizeWidthPercent"]}
                     if isinstance(record.get("fontSizeWidthPercent"), (int, float))
                     else {}
                 ),
                 **(
-                    {"englishText": record["manualLineBreaks"]}
+                    {"englishText": record["manualLineBreaks"], "manualLineBreaks": record["manualLineBreaks"]}
                     if isinstance(record.get("manualLineBreaks"), str)
                     and record["manualLineBreaks"].strip()
                     else {}
@@ -4230,7 +4241,8 @@ def render_pages(
     ensure_translated_pages(selected_pages, structured_by_page)
     ensure_placed_pages(selected_pages, structured_by_page)
 
-    needs_lama = any(
+    manual_clean_boxes = {page.index: editor_runtime.clean_boxes(page.index) for page in selected_pages}
+    needs_lama = any(manual_clean_boxes.values()) or any(
         not record["openLettering"]
         for page in selected_pages
         for record in structured_by_page[page.index]
@@ -4252,6 +4264,7 @@ def render_pages(
                     structured_by_page[page.index],
                     output_dir,
                     lama_session,
+                    manual_clean_boxes[page.index],
                 )
                 for page in selected_pages
             }
@@ -4700,11 +4713,20 @@ def rewind_resume_page_for_missing_artifacts(
     return requested_page
 
 
+def check_ocr_endpoint(config: OCRConfig) -> None:
+    if config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL and not config.service_url:
+        paddle_ocr_image.check_paddleocr_vl_endpoint(
+            config.paddleocr_vl_server_url, config.paddleocr_vl_model,
+            api_key=config.paddleocr_vl_api_key,
+        )
+
+
 def run_full_pipeline(
     args: argparse.Namespace,
     config: PipelineConfig,
     translation_notes: dict[str, Any],
 ) -> None:
+    check_ocr_endpoint(config.ocr)
     prepare_output_dir(args.output_dir, args.overwrite)
 
     pages = extract_cbz(args.input_cbz, args.output_dir)
@@ -4755,6 +4777,9 @@ def run_single_page_resume_pipeline(
 
     other_pages = pages_except(pages, target_page)
     selected_pages = pages_in_range(pages, target_page, target_page)
+    stage_only = getattr(args, "editor_stage_only", None)
+    if stage_only is not None and phase != {"ocr": "ocr_raw", "text": "ocr_structured", "placement": "placements"}.get(stage_only):
+        raise PipelineError("Editor stage-only reruns require that stage's first pipeline pass.")
 
     if phase == "ocr_raw":
         raw_existing = load_phase_records(
@@ -4773,6 +4798,11 @@ def run_single_page_resume_pipeline(
         )
     else:
         raw_by_page = load_phase_records(args.output_dir, "ocr_raw", pages, "OCR records")
+
+    if stage_only == "ocr":
+        run_ocr_merge_phase(pages, raw_by_page, args.output_dir, config,
+                            start_page=target_page, end_page=target_page)
+        return
 
     if phase in {"ocr_raw", "ocr_structured"}:
         structured_existing = load_structured_records(args.output_dir, other_pages)
@@ -4823,7 +4853,7 @@ def run_single_page_resume_pipeline(
     else:
         attach_translations(selected_pages, args.output_dir, structured_by_page)
 
-    if args.translation_boxno is not None:
+    if args.translation_boxno is not None or stage_only == "text":
         return
 
     if phase in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements"}:
@@ -4879,6 +4909,9 @@ def run_resume_pipeline(
         )
     if phase in {"extract", "proofreading", "translation_notes", "package"} and args.resume_page != 0:
         raise PipelineError(f"--resume-page is not used with --resume-from {phase}.")
+
+    if phase in {"extract", "ocr_raw"}:
+        check_ocr_endpoint(config.ocr)
 
     if phase == "extract":
         pages = extract_cbz(args.input_cbz, args.output_dir)
@@ -5185,6 +5218,8 @@ def needs_vlm(args: argparse.Namespace) -> bool:
         return False
     if args.stop_after == "ocr_merged":
         return False
+    if getattr(args, "editor_stage_only", None) == "ocr":
+        return False
     return args.resume_from not in {"render", "package"}
 
 
@@ -5205,6 +5240,8 @@ def main() -> int:
             raise PipelineError("--resume-page requires --resume-from.")
         if args.resume_from is None and args.single_page:
             raise PipelineError("--single-page requires --resume-from.")
+        if getattr(args, "editor_stage_only", None) and not args.single_page:
+            raise PipelineError("--editor-stage-only requires --single-page.")
         if args.translation_boxno is not None:
             if args.translation_boxno < 0:
                 raise PipelineError("--translation-boxno must be zero or greater.")
@@ -5275,11 +5312,13 @@ def main() -> int:
         if args.vlm_base_url is not None:
             if config.vlm is None:
                 raise PipelineError("--vlm-base-url requires a VLM config.")
+            endpoint = normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url")
             config = replace(
                 config,
                 vlm=replace(
                     config.vlm,
-                    base_url=normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url"),
+                    base_url=endpoint,
+                    api_key=config.vlm.api_key if endpoint.rstrip("/") == config.vlm.base_url.rstrip("/") else "not-needed",
                 ),
             )
         if args.vlm_model is not None:
@@ -5354,7 +5393,8 @@ def main() -> int:
                         args.paddleocr_vl_api_key
                         if args.paddleocr_vl_api_key is not None
                         else os.environ.get("TETOLATE_PADDLEOCR_VL_API_KEY")
-                        or config.ocr.paddleocr_vl_api_key
+                        or (config.ocr.paddleocr_vl_api_key if args.paddleocr_vl_server_url is None
+                            or args.paddleocr_vl_server_url.rstrip("/") == config.ocr.paddleocr_vl_server_url.rstrip("/") else None)
                     ),
                     paddleocr_vl_max_concurrency=(
                         args.paddleocr_vl_max_concurrency

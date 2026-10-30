@@ -4,9 +4,37 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+@contextmanager
+def rollback_files(paths, backup_dir: Path):
+    """Restore a bounded set of files if a multi-file publication fails.
+
+    The caller must hold its publication lock. This handles exceptions, not
+    power loss; each individual replacement remains atomic.
+    """
+    backups = {}
+    for index, path in enumerate(dict.fromkeys(paths)):
+        backup = backup_dir / str(index)
+        if path.exists():
+            shutil.copy2(path, backup)
+            backups[path] = backup
+        else:
+            backups[path] = None
+    try:
+        yield
+    except BaseException:
+        for path, backup in reversed(list(backups.items())):
+            if backup is None:
+                path.unlink(missing_ok=True)
+            else:
+                os.replace(backup, path)
+        raise
 
 
 def write_json_atomic(path: Path, data: Any, *, mode: int | None = None) -> None:

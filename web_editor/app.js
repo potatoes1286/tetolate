@@ -1,7 +1,8 @@
 import { EditorApi } from "./api.js";
 import { EditorStore } from "./store.js";
 import { EditorCanvas } from "./canvas.js";
-import { STAGES, SCREEN, recordLabel, fieldsFor, applyFields } from "./screens.js";
+import { PreviewController } from "./preview.js";
+import { STAGES, SCREEN, ALIGNMENT_LABELS, recordLabel, fieldsFor, applyFields, textFieldTarget, updateTextField } from "./screens.js";
 
 const config = window.TETOLATE_EDITOR_V2;
 const AVAILABLE_STAGES = Array.isArray(config.availableStages)
@@ -10,16 +11,28 @@ const AVAILABLE_STAGES = Array.isArray(config.availableStages)
 const api = new EditorApi(config.category, config.jobId);
 const store = new EditorStore(config);
 const byId = (id) => document.getElementById(id);
-const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus);
+const canvas = new EditorCanvas(byId("page-canvas"), store, setStatus, (page, records, signal) => api.textLayers(page, records, signal),
+  {select: selectOcrBoxes, has: ocrBoxesChecked});
+const preview = new PreviewController(store, canvas, api, setStatus);
 const mergeSelection = new Set();
 let loading = false;
+let loadRequest = 0;
+let loadController = null;
+let currentPreviewRequest = null;
+let navigationPage = null;
+let navigationRequest = 0;
+let savePromise = null;
+let resetting = false;
 let ocrAreaRunning = false;
 let queuedAction = "";
 let tooltipAnchor = null;
 let tooltipTimer = null;
+let lineBreaksTimer = null;
+let lineBreaksController = null;
 const typesettingViewKey = `tetolate-editor-view:${config.category}:${config.jobId}`;
 const TYPESETTING_VIEWS = new Set(["current", "original", "preview", "render"]);
 let typesettingView = localStorage.getItem(typesettingViewKey) || "current";
+let hideEditorBoxes = false;
 if (!TYPESETTING_VIEWS.has(typesettingView)) typesettingView = "current";
 const paneWidthKey = `tetolate-editor-panes:${config.category}:${config.jobId}`;
 const paneWidths = { record: 288, inspector: 352 };
@@ -47,15 +60,14 @@ function setOcrAreaRunning(running) {
 
 function setQueuedAction(action, message = "") {
   queuedAction = action;
-  const regenerateButton = byId("regenerate");
-  const regenerateAllButton = byId("regenerate-all");
   const busy = !!action;
-  regenerateButton.disabled = busy;
-  regenerateAllButton.disabled = busy;
-  regenerateButton.setAttribute("aria-busy", String(busy));
-  regenerateAllButton.setAttribute("aria-busy", String(busy));
-  regenerateButton.textContent = action === "downstream" ? "Queueing regeneration..." : "Regenerate downstream";
-  regenerateAllButton.textContent = action === "all" ? "Queueing regeneration..." : "Regenerate all changes";
+  for (const [key, label] of [["stage", "Regenerate stage"], ["page", "Regenerate page"],
+    ["all-pages", "Regenerate all pages"], ["finish-edits", "Finish Edits"]]) {
+    const button = byId(key === "finish-edits" ? key : `regenerate-${key}`);
+    button.disabled = busy;
+    button.setAttribute("aria-busy", String(busy));
+    button.textContent = action === key ? "Queueing..." : label;
+  }
   renderTools();
   if (message) setStatus(message);
 }
@@ -102,19 +114,19 @@ function showTooltip(anchor) {
 }
 
 document.addEventListener("pointerover", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) showTooltip(anchor);
 });
 document.addEventListener("pointerout", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor && !anchor.contains(event.relatedTarget)) scheduleTooltipHide();
 });
 document.addEventListener("focusin", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) showTooltip(anchor);
 });
 document.addEventListener("focusout", (event) => {
-  const anchor = event.target.closest?.("button[data-tooltip]");
+  const anchor = event.target.closest?.("[data-tooltip]");
   if (anchor) scheduleTooltipHide();
 });
 byId("editor-tooltip").addEventListener("pointerenter", () => clearTimeout(tooltipTimer));
@@ -187,17 +199,74 @@ function initPaneResizer(id, pane, direction) {
   });
 }
 
+function initEditorHeightResizer() {
+  const handle = byId("height-resizer");
+  let extraHeight = 0, drag = null, frame = null;
+  const resizeBy = (delta) => {
+    const previous = extraHeight;
+    extraHeight = Math.round(Math.max(0, Math.min(20000, extraHeight + delta)));
+    document.body.style.setProperty("--editor-extra-height", `${extraHeight}px`);
+    handle.setAttribute("aria-valuenow", String(extraHeight));
+    handle.setAttribute("aria-valuetext", `${extraHeight} extra pixels`);
+    return extraHeight - previous;
+  };
+  const extendAtEdge = () => {
+    frame = null;
+    if (!drag?.growing || drag.y < window.innerHeight - 32) return;
+    const added = resizeBy(12);
+    if (!added) return;
+    window.scrollBy(0, added);
+    frame = requestAnimationFrame(extendAtEdge);
+  };
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    drag = {y: event.clientY, growing: false};
+    handle.focus({preventScroll: true});
+    handle.classList.add("dragging");
+    handle.setPointerCapture(event.pointerId);
+  });
+  handle.addEventListener("pointermove", (event) => {
+    if (!drag) return;
+    const delta = event.clientY - drag.y;
+    drag.y = event.clientY;
+    if (delta) drag.growing = delta > 0;
+    resizeBy(delta);
+    if (frame === null) frame = requestAnimationFrame(extendAtEdge);
+  });
+  const finish = () => {
+    drag = null;
+    if (frame !== null) cancelAnimationFrame(frame);
+    frame = null;
+    handle.classList.remove("dragging");
+  };
+  for (const event of ["pointerup", "pointercancel", "lostpointercapture"]) handle.addEventListener(event, finish);
+  handle.addEventListener("dblclick", () => { finish(); resizeBy(-extraHeight); });
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown", "Home"].includes(event.key)) return;
+    event.preventDefault();
+    resizeBy(event.key === "Home" ? -extraHeight : event.key === "ArrowDown" ? 40 : -40);
+  });
+}
+
 applyPaneWidths();
 initPaneResizer("record-resizer", "record", 1);
 initPaneResizer("inspector-resizer", "inspector", -1);
+initEditorHeightResizer();
 window.addEventListener("resize", applyPaneWidths);
 
 function selectedArtifact() {
   return store.selection?.artifact || SCREEN[store.stage].primary;
 }
 
-function nextBoxno(records) {
-  return records.reduce((largest, record) => Math.max(largest, Number(record.boxno) || 0), -1) + 1;
+function nextBoxno(records, artifact = null) {
+  const visible = records.reduce((largest, record) => Math.max(largest, Number(record.boxno) || 0), -1) + 1;
+  if (!artifact) return visible;
+  const counters = store.boxnoCounters ||= {};
+  const key = `${store.page}:${artifact}`;
+  const number = Math.max(visible, store.document?.nextBoxnos?.[artifact] || 0, counters[key] || 0);
+  counters[key] = number + 1;
+  return number;
 }
 
 function newRecordId(prefix = "manual") {
@@ -213,23 +282,14 @@ function currentStageState() {
   return store.document?.stageStates?.[store.stage] || {};
 }
 
-function downstreamRegenerationTooltip() {
-  const definitions = store.document?.stageDefinitions || [];
-  const labels = new Map(definitions.map((item) => [item.key, item.label]));
-  const current = definitions.find((item) => item.key === store.stage);
-  const later = (current?.invalidates || []).map((stage) => labels.get(stage) || stage);
-  if (!later.includes("Render")) later.push("Render");
-  const passList = later.length ? later.join(", ") : "later stages";
-  return `Save this page, then rerun ${passList} for this page. ${current?.label || "The current stage"} is used as input and is not regenerated.`;
-}
-
 async function loadTypesettingView() {
+  preview.hide();
+  currentPreviewRequest?.abort();
   if (typesettingView === "original") {
     canvas.load(imageUrl("original"), { showPlacementText: false });
     setStatus("Original page loaded.");
   } else if (typesettingView === "preview") {
-    canvas.load(imageUrl("cleaned"));
-    setStatus("Rough typesetting preview loaded.");
+    preview.show();
   } else if (typesettingView === "render") {
     canvas.load(imageUrl("final"), { showPlacementText: false });
     setStatus("Last saved render loaded.");
@@ -247,34 +307,59 @@ async function selectTypesettingView(view) {
 }
 
 async function load(stage = store.stage, page = store.page) {
-  if (loading) return;
+  const request = ++loadRequest;
+  loadController?.abort();
+  const controller = new AbortController();
+  loadController = controller;
+  currentPreviewRequest?.abort();
+  preview.hide();
+  navigationPage = page;
   loading = true;
   byId("save-state").textContent = "Loading...";
   try {
-    const document = await api.load(stage, page);
+    const document = await api.load(stage, page, controller.signal);
+    if (request !== loadRequest) return;
     store.setDocument(document);
     mergeSelection.clear();
     byId("page-select").value = String(page);
-    if (stage === "placement") await loadTypesettingView();
-    else canvas.load(document.image.url);
     setStatus(store.dirty ? "Recovered an unsaved browser draft." : "");
-    await loadRevisions();
+    if (stage === "placement") void loadTypesettingView();
+    else canvas.load(document.image.url);
+    void loadRevisions();
   } catch (error) {
-    setStatus(error.message, true);
-    byId("save-state").textContent = "Load failed";
+    if (request === loadRequest && error.name !== "AbortError") {
+      setStatus(error.message, true);
+      byId("save-state").textContent = "Load failed";
+    }
   } finally {
-    loading = false;
+    if (request === loadRequest) { loading = false; navigationPage = null; }
   }
 }
 
 async function navigate(stage, page) {
-  if (page < 0 || page >= config.pageCount || !AVAILABLE_STAGES.includes(stage)) return;
+  if (!Number.isInteger(page) || page < 0 || page >= config.pageCount || !AVAILABLE_STAGES.includes(stage)) return;
+  const request = ++navigationRequest;
+  navigationPage = page;
+  loadController?.abort();
+  ++loadRequest;
+  loading = false;
   if (store.dirty) {
     setStatus("Saving changes before navigation...");
     await save();
-    if (store.dirty) return;
+    if (request !== navigationRequest) return;
+    if (store.dirty) { navigationPage = null; return; }
   }
+  if (request !== navigationRequest) return;
   await load(stage, page);
+}
+
+async function selectPage() {
+  const input = byId("page-select");
+  if (!input.reportValidity()) return;
+  const page = input.valueAsNumber;
+  if (page === (navigationPage ?? store.page)) return;
+  await navigate(store.stage, page);
+  input.value = String(navigationPage ?? store.page);
 }
 
 function recordsForList() {
@@ -283,6 +368,26 @@ function recordsForList() {
     for (const record of store.records[artifact] || []) result.push({ artifact, record });
   }
   return result;
+}
+
+function rawBoxesFor(artifact, record) {
+  if (artifact === "ocr_raw") return [record];
+  const sources = new Set(record.sourceBoxnos || []);
+  return (store.records.ocr_raw || []).filter((raw) => sources.has(raw.boxno));
+}
+
+function ocrBoxesChecked(artifact, record) {
+  const raw = rawBoxesFor(artifact, record);
+  return raw.length > 0 && raw.every((item) => mergeSelection.has(item.recordId));
+}
+
+function selectOcrBoxes(hit, extend = false) {
+  if (!extend) mergeSelection.clear();
+  if (!hit) { store.select(null, null); return; }
+  const raw = rawBoxesFor(hit.artifact, hit.record);
+  const remove = extend && raw.length > 0 && raw.every((item) => mergeSelection.has(item.recordId));
+  for (const item of raw) remove ? mergeSelection.delete(item.recordId) : mergeSelection.add(item.recordId);
+  store.select(hit.artifact, hit.record.recordId);
 }
 
 function renderStageTabs() {
@@ -299,39 +404,50 @@ function renderStageTabs() {
 
 function renderRecordList() {
   const target = byId("record-list");
+  const focused = document.activeElement;
+  const focusedId = focused?.dataset?.recordId;
   const filter = byId("record-filter").value.trim().toLowerCase();
   target.replaceChildren();
   for (const { artifact, record } of recordsForList()) {
-    const displayRecord = artifact === "placements"
+    const displayRecord = ["placements", "ocr_structured"].includes(artifact)
       ? { ...record, englishText: (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "" }
       : record;
-    const label = recordLabel(store.stage, displayRecord);
+    const label = recordLabel(store.stage, displayRecord, artifact);
     if (filter && !label.toLowerCase().includes(filter)) continue;
-    const row = document.createElement("button");
-    row.type = "button";
+    const row = document.createElement("div");
     row.className = "record-row";
-    row.classList.toggle("active", store.selection?.recordId === record.recordId);
-    row.textContent = label;
+    row.classList.toggle("active", store.selection?.recordId === record.recordId ||
+      (store.stage === "ocr" && ocrBoxesChecked(artifact, record)));
+    const select = document.createElement("button"); select.type = "button";
+    select.dataset.recordId = record.recordId;
+    select.className = "record-select"; select.textContent = label;
     const meta = document.createElement("span");
     meta.className = "record-meta";
     const protection = store.document?.protection?.recordStates?.[record.recordId];
     meta.textContent = `${artifact.replace("ocr_", "").replace("placements", "placement")}${protection ? ` · ${protection.protected ? "protected" : "unprotected"} ${protection.kind}` : ""}`;
-    row.append(meta);
+    select.append(meta);
     if (store.stage === "ocr" && artifact === "ocr_raw") {
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
+      checkbox.dataset.recordId = record.recordId;
       checkbox.checked = mergeSelection.has(record.recordId);
       checkbox.title = "Select raw box for grouping";
       checkbox.addEventListener("click", (event) => {
         event.stopPropagation();
         checkbox.checked ? mergeSelection.add(record.recordId) : mergeSelection.delete(record.recordId);
+        store.select(artifact, record.recordId);
       });
       row.prepend(checkbox);
     }
-    row.addEventListener("click", () => store.select(artifact, record.recordId));
+    select.addEventListener("click", (event) => store.stage === "ocr"
+      ? selectOcrBoxes({artifact, record}, event.ctrlKey || event.metaKey || event.shiftKey)
+      : store.select(artifact, record.recordId));
+    row.append(select);
     target.append(row);
   }
   if (!target.childElementCount) target.textContent = "No records.";
+  if (focusedId) [...target.querySelectorAll("button, input")]
+    .find((element) => element.dataset.recordId === focusedId && element.type === focused.type)?.focus({preventScroll: true});
 }
 
 function sourceRecord(record) {
@@ -342,12 +458,35 @@ function protectionFor(recordId, field) {
   return store.document?.protection?.records?.[recordId]?.[field];
 }
 
+function refreshLineBreaks(input, record) {
+  clearTimeout(lineBreaksTimer);
+  lineBreaksController?.abort();
+  if (record.manualLineBreaks?.trim()) return;
+  const pageDocument = store.document;
+  const page = store.page;
+  const translation = (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || "";
+  const entry = {...record, englishText: translation};
+  lineBreaksTimer = setTimeout(async () => {
+    if (!input.isConnected || input.dataset.userEdited) return;
+    const controller = new AbortController();
+    lineBreaksController = controller;
+    try {
+      const text = await api.textLayout(page, entry, controller.signal);
+      if (!controller.signal.aborted && store.document === pageDocument && input.isConnected && !input.dataset.userEdited) input.value = text;
+    } catch (error) {
+      if (!controller.signal.aborted && store.document === pageDocument && input.isConnected && !input.dataset.userEdited)
+        setStatus(`Could not load automatic line breaks: ${error.message}`, true);
+    }
+  }, 200);
+}
+
 function renderInspector() {
   const form = byId("record-form");
   form.replaceChildren();
   const record = store.selectedRecord();
-  byId("selection-label").textContent = record ? `Box ${record.boxno ?? "?"}` : "No selection";
-  byId("notes-panel").hidden = store.stage !== "translation";
+  const cleanOnly = store.selection?.artifact === "clean_boxes";
+  byId("selection-label").textContent = record ? `${cleanOnly ? "Clean box" : "Box"} ${record.boxno ?? "?"}` : "No selection";
+  byId("notes-panel").hidden = store.stage !== "text";
   if (store.document) {
     byId("job-notes").value = store.document.translationNotes?.job || "";
     byId("page-notes").value = store.document.translationNotes?.page || "";
@@ -355,29 +494,37 @@ function renderInspector() {
   if (!record) return;
   const formTarget = { ...store.selection, stage: store.stage };
 
-  if (["translation", "placement"].includes(store.stage)) {
-    const source = sourceRecord(record);
-    if (source) {
-      const label = document.createElement("label");
-      label.textContent = "Source text";
-      const area = document.createElement("textarea");
-      area.rows = 3; area.readOnly = true; area.value = source.text || "";
-      label.append(area); form.append(label);
-    }
-  }
-
   const values = {};
-  for (const [name, labelText, type, value, choices] of fieldsFor(store.stage, record, store.document?.fonts || [])) {
-    const wrapper = document.createElement("label");
+  const regionFields = document.createElement("div");
+  regionFields.className = "field-grid";
+  const pairedFields = new Map();
+  const pairs = {font: "font", fill: "font", stroke: "outline", strokeWidth: "outline", gravity: "size", fontSizeWidthPercent: "size"};
+  const source = store.stage === "placement" && !cleanOnly ? sourceRecord(record) : record;
+  const displayRecord = store.stage === "text" || (store.stage === "placement" && !cleanOnly)
+    ? {...record, text: source?.text || "", englishText: (store.records.translations || []).find((item) => item.boxno === record.boxno)?.englishText || ""}
+    : record;
+  for (const [name, labelText, type, value, choices] of fieldsFor(store.stage, displayRecord, store.document?.fonts || [], store.selection.artifact)) {
+    const isAngle = ["rotation", "skewX", "skewY"].includes(name);
+    const wrapper = document.createElement(isAngle ? "div" : "label");
     wrapper.className = "field-row";
-    wrapper.append(document.createTextNode(labelText));
+    const heading = document.createElement("span"); heading.className = "field-label";
+    wrapper.append(heading);
+    if (["manualLineBreaks", "fontSizeWidthPercent"].includes(name)) {
+      const help = document.createElement("span"); help.className = "field-help"; help.tabIndex = 0;
+      help.textContent = labelText;
+      help.dataset.tooltip = name === "fontSizeWidthPercent"
+        ? "Font size as a percentage of page width. Clear the field to use the automatic size shown here."
+        : "Shows the current automatic line breaks as the box and text settings change. Editing this text fixes your chosen line breaks; resizing then shrinks the font rather than adding breaks. Clear the field to return to automatic wrapping. The saved translation is unchanged.";
+      heading.append(help);
+    } else heading.append(document.createTextNode(labelText));
     let input;
     if (type === "textarea") {
-      input = document.createElement("textarea"); input.rows = 4; input.value = value;
+      input = document.createElement("textarea"); input.rows = ["text", "englishText"].includes(name) ? 2 : 4; input.value = value;
     } else if (type === "select") {
       input = document.createElement("select");
       for (const choice of choices || []) {
-        const option = document.createElement("option"); option.value = choice; option.textContent = choice || "Auto / backup";
+        const option = document.createElement("option"); option.value = choice;
+        option.textContent = name === "gravity" ? ALIGNMENT_LABELS[choice] : (choice || "Auto / backup");
         input.append(option);
       }
       input.value = value;
@@ -386,62 +533,131 @@ function renderInspector() {
       if (type === "checkbox") input.checked = !!value;
       else input.value = value;
       if (name === "fontSizeWidthPercent") { input.min = "0.05"; input.max = "100"; input.step = "0.05"; }
+      if (name === "lineSpacing") { input.min = "-200"; input.max = "200"; input.step = "1"; }
+      if (isAngle) {
+        const limit = name === "rotation" ? 180 : 60;
+        input.min = String(-limit); input.max = String(limit); input.step = "0.5";
+      }
     }
     input.name = name;
+    input.setAttribute("aria-label", labelText);
     values[name] = input;
-    input.addEventListener("change", () => applyInspector(values, formTarget));
-    wrapper.append(input);
+    if (isAngle) {
+      const controls = document.createElement("div"); controls.className = "angle-controls";
+      const slider = document.createElement("input"); slider.type = "range";
+      slider.min = input.min; slider.max = input.max; slider.step = input.step; slider.value = value;
+      slider.tabIndex = -1;
+      slider.setAttribute("aria-label", labelText);
+      input.setAttribute("aria-label", labelText);
+      slider.addEventListener("input", () => { input.value = slider.value; });
+      slider.addEventListener("change", () => {
+        input.value = slider.value;
+        applyInspector(values, formTarget, name);
+      });
+      input.addEventListener("change", () => {
+        slider.value = input.value === "" ? "0" : input.value;
+        applyInspector(values, formTarget, name);
+      });
+      controls.append(input, slider); wrapper.append(controls);
+    } else {
+      input.addEventListener("change", () => applyInspector(values, formTarget, name));
+      wrapper.append(input);
+    }
+    if (name === "manualLineBreaks") {
+      input.addEventListener("input", () => { input.dataset.userEdited = "1"; });
+      refreshLineBreaks(input, record);
+    }
 
     const overrideField = ["left", "top", "right", "bottom"].includes(name)
-      ? (store.stage === "placement" ? "placementRegion" : "region")
+      ? (store.stage === "placement" && !cleanOnly ? "placementRegion" : "region")
       : name;
-    const protectedValue = protectionFor(record.recordId, overrideField);
+    const fieldTarget = source && (store.stage === "text" || (store.stage === "placement" && ["text", "englishText"].includes(name)))
+      ? textFieldTarget(store.records, source, name) : null;
+    const protectedValue = protectionFor(fieldTarget ? fieldTarget.recordId : record.recordId, overrideField);
     if (protectedValue !== undefined) {
       const controls = document.createElement("span"); controls.className = "field-protection";
       const toggle = document.createElement("button"); toggle.type = "button";
-      toggle.textContent = protectedValue ? "Unprotect" : "Protect";
+      toggle.textContent = "P";
+      toggle.setAttribute("aria-pressed", String(!!protectedValue));
+      toggle.setAttribute("aria-label", `${protectedValue ? "Unprotect" : "Protect"} ${labelText}`);
       toggle.dataset.tooltip = protectedValue
         ? "Allow a later model rerun to replace this saved field."
         : "Keep this saved field unchanged during later model reruns.";
-      toggle.addEventListener("click", () => changeProtection("field", record, overrideField, !protectedValue));
-      const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "Use generated";
+      toggle.addEventListener("click", () => changeProtection("field", record, overrideField, !protectedValue, fieldTarget));
+      const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "R";
+      revert.className = "reset-field";
+      revert.setAttribute("aria-label", `Reset ${labelText} to generated value`);
       revert.dataset.tooltip = "Remove this field override and restore the latest generated value.";
-      revert.addEventListener("click", () => changeProtection("revert-field", record, overrideField, false));
-      controls.append(toggle, revert); wrapper.append(controls);
+      revert.addEventListener("click", () => changeProtection("revert-field", record, overrideField, false, fieldTarget));
+      controls.append(toggle, revert); heading.append(controls);
     }
-    form.append(wrapper);
+    if (["left", "top", "right", "bottom"].includes(name)) {
+      if (!regionFields.parentNode) form.append(regionFields);
+      regionFields.append(wrapper);
+    } else if (store.stage === "placement" && pairs[name]) {
+      const pair = pairs[name];
+      if (!pairedFields.has(pair)) {
+        const row = document.createElement("div"); row.className = `field-pair ${pair}-pair`;
+        pairedFields.set(pair, row); form.append(row);
+      }
+      pairedFields.get(pair).append(wrapper);
+    } else {
+      form.append(wrapper);
+    }
   }
 
-  if (store.document?.protection?.recordStates?.[record.recordId] || store.document?.protection?.records?.[record.recordId]) {
+  const relatedIds = store.stage === "text"
+    ? [...new Set([record.recordId, textFieldTarget(store.records, record, "englishText").recordId].filter(Boolean))]
+    : [record.recordId];
+  if (cleanOnly) {
+    const note = document.createElement("p");
+    note.textContent = "LaMa cleans this area without adding text. It can alter artwork. Preview refreshes automatically. Press Delete to remove this box.";
+    form.append(note);
+  } else if (relatedIds.some((rid) => store.document?.protection?.recordStates?.[rid] || store.document?.protection?.records?.[rid])) {
     const row = document.createElement("div"); row.className = "field-protection";
-    const toggle = document.createElement("button"); toggle.type = "button"; toggle.textContent = "Toggle record protection";
+    const toggle = document.createElement("button"); toggle.type = "button"; toggle.textContent = "P";
     toggle.dataset.tooltip = "Protect or unprotect all saved changes for this record.";
-    const fieldStates = Object.values(store.document?.protection?.records?.[record.recordId] || {});
-    const recordState = store.document?.protection?.recordStates?.[record.recordId];
-    const allProtected = (fieldStates.length > 0 || !!recordState)
+    const fieldStates = relatedIds.flatMap((rid) => Object.values(store.document?.protection?.records?.[rid] || {}));
+    const recordStates = relatedIds.map((rid) => store.document?.protection?.recordStates?.[rid]).filter(Boolean);
+    const allProtected = (fieldStates.length > 0 || !!recordStates.length)
       && fieldStates.every(Boolean)
-      && (!recordState || recordState.protected);
+      && recordStates.every((state) => state.protected);
+    toggle.setAttribute("aria-pressed", String(allProtected));
+    toggle.setAttribute("aria-label", `${allProtected ? "Unprotect" : "Protect"} record`);
     toggle.addEventListener("click", () => changeProtection("record", record, null, !allProtected));
-    const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "Revert record";
+    const revert = document.createElement("button"); revert.type = "button"; revert.textContent = "R";
+    revert.className = "reset-field"; revert.setAttribute("aria-label", "Reset record to generated values");
     revert.dataset.tooltip = "Remove all saved overrides for this record and restore its generated values.";
     revert.addEventListener("click", () => changeProtection("revert-record", record, null, false));
-    row.append(toggle, revert); form.append(row);
+    row.append(document.createTextNode("Record "), toggle, revert); form.append(row);
   }
 }
 
-function applyInspector(inputs, target) {
+function applyInspector(inputs, target, changedField) {
   const record = (store.records[target.artifact] || []).find(
     (item) => item.recordId === target.recordId,
   );
   if (!record) return;
+  if (target.stage === "text" || (target.stage === "placement" && target.artifact === "placements" && ["text", "englishText"].includes(changedField))) {
+    const source = target.stage === "text" ? record : sourceRecord(record);
+    if (!source) return;
+    const input = inputs[changedField];
+    store.mutate((records) => updateTextField(records, source, changedField,
+      input.type === "checkbox" ? input.checked : input.value, store.page, newRecordId));
+    return;
+  }
   const values = {};
   for (const [name, input] of Object.entries(inputs)) {
+    if (target.stage === "placement" && ["text", "englishText"].includes(name)) continue;
+    if (name === "manualLineBreaks" && changedField !== name) continue;
     values[name] = input.type === "checkbox" ? input.checked : input.value;
     if (input.type === "number" && input.value !== "") values[name] = Number(input.value);
   }
-  if (target.stage === "erase") values.safeToEraseOriginal = !values.openLettering;
-  const updated = applyFields(target.stage, record, values);
-  store.updateRecord(target.artifact, target.recordId, updated);
+  const updated = applyFields(target.stage, record, values, target.artifact);
+  store.mutate((records) => {
+    const items = records[target.artifact];
+    items[items.indexOf(record)] = updated;
+  });
 }
 
 function addButton(target, text, handler, title = "", tooltip = "", shortcut = "") {
@@ -455,24 +671,26 @@ function addButton(target, text, handler, title = "", tooltip = "", shortcut = "
 
 function renderTools() {
   const target = byId("stage-tools"); target.replaceChildren();
+  const canHideBoxes = store.stage !== "placement" || typesettingView === "preview";
+  const hideBoxes = canHideBoxes && hideEditorBoxes;
+  if (canvas.hideBoxes !== hideBoxes) { canvas.hideBoxes = hideBoxes; canvas.draw(); }
   if (store.stage === "ocr") {
     addButton(target, "Add raw box", () => canvas.startDraw(addRawBox), "Draw a missing OCR box", "Draw one raw OCR box manually.", "z");
     addButton(target, ocrAreaRunning ? "OCR running..." : "OCR area", () => canvas.startDraw(ocrArea), "OCR a selected region", "Draw a region to scan only that area. The result adds raw OCR boxes and merges the new boxes with one another.", "x");
-    addButton(target, "Group checked", groupChecked, "Merge checked raw boxes", "Create one merged OCR group from the checked raw boxes. Those boxes are removed from their existing groups.", "c");
+    addButton(target, "Group checked", groupChecked, "Merge checked raw boxes", "Ctrl/Shift-click boxes or check raw rows, then group them. Double-click the page to cycle overlapping boxes.", "c");
     addButton(target, "Split group", splitGroup, "Split the selected merged group", "Delete the selected merged group and create one separate group for each of its source OCR boxes.", "v");
     addButton(target, "Delete", deleteSelected, "Delete selected", "Delete the selected raw box or merged group.", "b");
-  } else if (store.stage === "structure") {
+  } else if (store.stage === "text") {
     addButton(target, "Move earlier", () => moveSelected(-1), "Move earlier in reading order", "Move the selected record one position earlier in the page reading order. The translation pass follows this order.", "z");
     addButton(target, "Move later", () => moveSelected(1), "Move later in reading order", "Move the selected record one position later in the page reading order. The translation pass follows this order.", "x");
     addButton(target, "Reject", deleteSelected, "Reject this OCR group", "Remove the selected structured record from translation, typesetting, and rendering. Use this only for OCR that is not real text.", "c");
-  } else if (store.stage === "translation") {
     addButton(
       target,
       queuedAction ? "Translation request running..." : "Retranslate page",
       () => retranslate("page"),
       "Request a new VLM translation for this page",
       "Replace all translations on this page with a new VLM translation, then rerun Typesetting and Render.",
-      "z",
+      "v",
     );
     addButton(
       target,
@@ -480,20 +698,33 @@ function renderTools() {
       () => retranslate("record"),
       "Request a new VLM translation for the selected record",
       "Replace only the selected translation with a new VLM translation. Other records remain unchanged.",
-      "x",
+      "b",
     );
   } else if (store.stage === "placement") {
     const views = [
       ["current", "Current", "Show the exact current draft. This uses the saved render when it is current, or creates a cached ImageMagick preview when needed."],
       ["original", "Original", "Show the original source page without translated text."],
-      ["preview", "Preview", "Show the cleaned page with the fast editable text preview."],
-      ["render", "Render", "Show the last page produced by the pipeline Render pass."],
+      ["preview", "Preview", "Show ImageMagick text layers first, then clean the background with LaMa. Clean-box edits refresh automatically."],
+      ["render", "Last Render", "Show the last page produced by the pipeline Render pass."],
     ];
     const shortcuts = ["z", "x", "c", "v"];
     for (const [index, [view, label, tooltip]] of views.entries()) {
       const button = addButton(target, label, () => selectTypesettingView(view), "", tooltip, shortcuts[index]);
       button.classList.toggle("active", typesettingView === view);
     }
+    addButton(target, "Add clean box", () => canvas.startDraw(addCleanBox), "Draw a clean-only area",
+      "LaMa cleans this rectangle without adding text or calling the VLM. Preview refreshes automatically.", "b");
+  }
+  if (canHideBoxes) {
+    const label = document.createElement("label"); label.className = "box-toggle";
+    const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = hideEditorBoxes;
+    toggle.dataset.shortcut = "h";
+    toggle.addEventListener("change", () => {
+      hideEditorBoxes = toggle.checked;
+      canvas.hideBoxes = hideEditorBoxes;
+      canvas.draw();
+    });
+    label.append(toggle, document.createTextNode(" Hide boxes [H]")); target.append(label);
   }
   if (ocrAreaRunning) {
     for (const button of target.querySelectorAll("button")) button.disabled = true;
@@ -502,7 +733,7 @@ function renderTools() {
     progress.setAttribute("role", "status");
     progress.textContent = "OCR is processing the selected area.";
     target.append(progress);
-  } else if (queuedAction && store.stage === "translation") {
+  } else if (queuedAction && store.stage === "text") {
     for (const button of target.querySelectorAll("button")) button.disabled = true;
     const progress = document.createElement("span");
     progress.className = "tool-progress";
@@ -512,11 +743,25 @@ function renderTools() {
   }
 }
 
+function addCleanBox(region) {
+  store.mutate((records) => {
+    const boxes = records.clean_boxes ||= [];
+    const record = {page: store.page, boxno: nextBoxno(boxes), recordId: newRecordId("clean"), region};
+    boxes.push(record);
+    store.selection = {artifact: "clean_boxes", recordId: record.recordId};
+  });
+  setStatus("Clean box added. Preview refreshes automatically.");
+}
+
 function addRawBox(region) {
   store.mutate(() => {
     const records = store.records.ocr_raw || (store.records.ocr_raw = []);
-    const record = { page: store.page, boxno: nextBoxno(records), recordId: newRecordId("raw"), region, text: "", ocrSource: "manual" };
+    const record = { page: store.page, boxno: nextBoxno(records, "ocr_raw"), recordId: newRecordId("raw"), region, text: "", ocrSource: "manual" };
     records.push(record); store.selection = { artifact: "ocr_raw", recordId: record.recordId };
+    const groups = store.records.ocr_merged ||= [];
+    groups.push({page: store.page, boxno: nextBoxno(groups, "ocr_merged"), recordId: newRecordId("group"),
+      sourceBoxnos: [record.boxno], sourceTexts: [""], text: "", region: [...region], ocrSource: "manual"});
+    mergeSelection.clear(); mergeSelection.add(record.recordId);
   });
 }
 
@@ -531,13 +776,13 @@ async function ocrArea(region) {
       const rawRecords = result.rawRecords || result.records || [];
       const boxMap = new Map();
       for (const item of rawRecords) {
-        const old = item.boxno, boxno = nextBoxno(store.records.ocr_raw || []);
+        const old = item.boxno, boxno = nextBoxno(store.records.ocr_raw || [], "ocr_raw");
         boxMap.set(old, boxno);
         (store.records.ocr_raw ||= []).push({ ...item, page: store.page, boxno, recordId: newRecordId("raw") });
       }
       for (const item of result.mergedRecords || []) {
         const sourceBoxnos = (item.sourceBoxnos || []).map((boxno) => boxMap.get(boxno)).filter(Number.isInteger);
-        (store.records.ocr_merged ||= []).push({ ...item, page: store.page, boxno: nextBoxno(store.records.ocr_merged), sourceBoxnos, recordId: newRecordId("group") });
+        (store.records.ocr_merged ||= []).push({ ...item, page: store.page, boxno: nextBoxno(store.records.ocr_merged, "ocr_merged"), sourceBoxnos, recordId: newRecordId("group") });
       }
     });
     setStatus(`OCR added ${(result.rawRecords || result.records || []).length} raw boxes.`);
@@ -554,12 +799,19 @@ function groupChecked() {
   if (!raw.length) return setStatus("Check one or more raw boxes first.", true);
   store.mutate(() => {
     const selectedBoxnos = new Set(raw.map((item) => item.boxno));
+    const boxno = nextBoxno(store.records.ocr_merged || [], "ocr_merged");
+    const rawByBoxno = new Map((store.records.ocr_raw || []).map((item) => [item.boxno, item]));
     store.records.ocr_merged = (store.records.ocr_merged || []).filter((group) => {
       group.sourceBoxnos = (group.sourceBoxnos || []).filter((boxno) => !selectedBoxnos.has(boxno));
+      const remaining = group.sourceBoxnos.map((source) => rawByBoxno.get(source)).filter(Boolean);
+      if (remaining.length) {
+        group.sourceTexts = remaining.map((item) => item.text || "");
+        group.text = group.sourceTexts.join(""); group.region = unionRegion(remaining);
+      }
       return group.sourceBoxnos.length;
     });
     const groups = store.records.ocr_merged;
-    const record = { page: store.page, boxno: nextBoxno(groups), recordId: newRecordId("group"), sourceBoxnos: raw.map((item) => item.boxno), sourceTexts: raw.map((item) => item.text || ""), text: raw.map((item) => item.text || "").join(""), region: unionRegion(raw) };
+    const record = { page: store.page, boxno, recordId: newRecordId("group"), sourceBoxnos: raw.map((item) => item.boxno), sourceTexts: raw.map((item) => item.text || ""), text: raw.map((item) => item.text || "").join(""), region: unionRegion(raw) };
     groups.push(record); store.selection = { artifact: "ocr_merged", recordId: record.recordId };
     mergeSelection.clear();
   });
@@ -573,7 +825,7 @@ function splitGroup() {
     store.records.ocr_merged = (store.records.ocr_merged || []).filter((item) => item.recordId !== group.recordId);
     for (const boxno of group.sourceBoxnos || []) {
       const raw = rawByBox.get(boxno); if (!raw) continue;
-      store.records.ocr_merged.push({ page: store.page, boxno: nextBoxno(store.records.ocr_merged), recordId: newRecordId("group"), sourceBoxnos: [boxno], sourceTexts: [raw.text || ""], text: raw.text || "", region: [...raw.region] });
+      store.records.ocr_merged.push({ page: store.page, boxno: nextBoxno(store.records.ocr_merged, "ocr_merged"), recordId: newRecordId("group"), sourceBoxnos: [boxno], sourceTexts: [raw.text || ""], text: raw.text || "", region: [...raw.region] });
     }
     store.selection = null;
   });
@@ -581,13 +833,30 @@ function splitGroup() {
 
 function deleteSelected() {
   if (!store.selection) return;
-  if (["translation", "placement", "erase"].includes(store.stage)) return setStatus("Delete the source record from Structure.", true);
+  if (store.stage === "placement") {
+    if (store.selection.artifact !== "clean_boxes") return setStatus("Select a clean box to delete it. Reject text in Text & Translation.", true);
+    store.deleteSelected();
+    setStatus("Clean box deleted. Preview refreshes automatically.");
+    return;
+  }
+  if (store.stage === "text") {
+    const record = store.selectedRecord();
+    store.mutate((records) => {
+      records.ocr_structured = records.ocr_structured.filter((item) => item.boxno !== record.boxno);
+      store.selection = null;
+    });
+    return;
+  }
   if (store.stage === "ocr" && store.selection.artifact === "ocr_raw") {
     const raw = store.selectedRecord();
     store.mutate(() => {
       store.records.ocr_raw = (store.records.ocr_raw || []).filter((item) => item.recordId !== raw.recordId);
       store.records.ocr_merged = (store.records.ocr_merged || []).filter((group) => {
         group.sourceBoxnos = (group.sourceBoxnos || []).filter((boxno) => boxno !== raw.boxno);
+        const remaining = group.sourceBoxnos.map((boxno) => store.records.ocr_raw.find((item) => item.boxno === boxno)).filter(Boolean);
+        group.sourceTexts = remaining.map((item) => item.text || "");
+        group.text = group.sourceTexts.join("");
+        if (remaining.length) group.region = unionRegion(remaining);
         return group.sourceBoxnos.length;
       });
       store.selection = null;
@@ -605,31 +874,85 @@ function moveSelected(delta) {
     const target = Math.max(0, Math.min(records.length - 1, index + delta));
     if (index < 0 || index === target) return;
     const [record] = records.splice(index, 1); records.splice(target, 0, record);
-    records.forEach((item, boxno) => { item.boxno = boxno; });
   });
 }
 
 async function save() {
+  if (savePromise) return savePromise;
+  if (resetting) return;
   if (!store.document || !store.dirty) return;
+  const previous = store.document;
+  const snapshot = JSON.stringify([store.records, store.document.translationNotes]);
   byId("save").disabled = true; byId("save-state").textContent = "Saving...";
-  try {
-    const document = await api.save(store.stage, store.page, {
-      baseRevision: store.document.revision,
-      recordsByArtifact: Object.fromEntries(
-        SCREEN[store.stage].artifacts.map((artifact) => [artifact, store.records[artifact] || []]),
-      ),
-      translationNotes: store.stage === "translation" ? { job: byId("job-notes").value, page: byId("page-notes").value } : undefined,
-    });
-    store.markSaved(document); setStatus("Saved. Changed fields are protected.");
-  } catch (error) { setStatus(error.message, true); }
-  finally { byId("save").disabled = false; }
+  savePromise = (async () => {
+    try {
+      const document = await api.save(store.stage, store.page, {
+        baseRevision: store.document.revision,
+        deletedOcrGroupIds: store.stage === "ocr" ? (store.records.ocr_removed_groups || []) : undefined,
+        textEdits: store.stage === "placement" ? ["ocr_structured", "translations"].flatMap((artifact) => {
+          const field = artifact === "translations" ? "englishText" : "text";
+          return (store.records[artifact] || []).filter((record) => {
+            const previous = (store.document.recordsByArtifact[artifact] || []).find((item) => item.recordId === record.recordId);
+            return (record[field] || "") !== (previous?.[field] || "");
+          }).map((record) => ({artifact, recordId: record.recordId, boxno: record.boxno, value: record[field] || ""}));
+        }) : undefined,
+        recordsByArtifact: Object.fromEntries(
+          [...SCREEN[store.stage].artifacts, ...(store.stage === "text" ? ["translations"] : [])]
+            .map((artifact) => [artifact, store.records[artifact] || []]),
+        ),
+        translationNotes: store.stage === "text" ? { job: byId("job-notes").value, page: byId("page-notes").value } : undefined,
+      });
+      if (store.document !== previous) return;
+      if (JSON.stringify([store.records, store.document.translationNotes]) === snapshot) store.markSaved(document);
+      else {
+        // Keep the draft and undo history, but compare the next save with what
+        // the server now holds, not the baseline from before this save.
+        Object.assign(store.document, document, {translationNotes: store.document.translationNotes});
+        store.saveDraft();
+      }
+      setStatus(store.dirty ? "Saved. Newer edits still need saving." : "Saved. Changed fields are protected.");
+    } catch (error) { setStatus(error.message, true); }
+    finally { byId("save").disabled = false; }
+  })();
+  try { await savePromise; }
+  finally { savePromise = null; }
 }
 
-async function changeProtection(action, record, field, protectedValue) {
+async function resetStage() {
+  if (!store.document || loading || resetting || ocrAreaRunning || queuedAction) return;
+  const label = currentStageState().label;
+  if (!confirm(`Reset ${label} on page ${store.page}? All saved and unsaved edits and protection flags for this stage will be removed. Other stages, pages, and saved translation notes are kept.`)) return;
+  resetting = true;
+  byId("editor-app").inert = true;
+  byId("reset-stage").disabled = true;
+  setStatus("Resetting stage...");
+  try {
+    const document = await api.reset(store.stage, store.page, store.document.revision);
+    mergeSelection.clear();
+    store.markSaved(document);
+    if (store.stage === "placement") await loadTypesettingView();
+    else canvas.load(document.image.url);
+    await loadRevisions();
+    setStatus(config.reviewCheckpoint === "ocr"
+      ? "Stage reset. Continue processing when the OCR review is complete."
+      : document.rerunFrom ? "Stage reset. Regenerate page to update the output."
+        : "Stage reset. No changes need regeneration.");
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    resetting = false;
+    byId("editor-app").inert = false;
+    byId("reset-stage").disabled = false;
+    byId("reset-stage").focus();
+  }
+}
+
+async function changeProtection(action, record, field, protectedValue, fieldTarget = null) {
   if (store.dirty) { setStatus("Save the current draft before changing protection.", true); return; }
   try {
     const document = await api.protect(store.stage, store.page, {
       baseRevision: store.document.revision, action, artifact: selectedArtifact(), recordId: record.recordId, field, protected: protectedValue,
+      ...(fieldTarget || {}),
     });
     store.setDocument(document); setStatus("Protection updated.");
   } catch (error) { setStatus(error.message, true); }
@@ -644,26 +967,21 @@ async function toggleFreeze(scope) {
   } catch (error) { setStatus(error.message, true); }
 }
 
-async function regenerate() {
-  if (queuedAction) return;
-  if (store.dirty) await save();
-  if (store.dirty) return;
-  setQueuedAction("downstream", "Adding this page regeneration to the job queue...");
+async function regenerate(action) {
+  if (queuedAction || loading || resetting || ocrAreaRunning) return;
+  if (action === "stage" && !confirm("Regenerate this stage on this page? Unprotected generated values can be replaced. Later stages stay out of date.")) return;
+  if (action === "finish-edits" && !confirm("Apply all saved edits as the job output? This uses LaMa and ImageMagick only. No OCR or VLM calls are made; untranslated boxes stay untranslated. Old CBZ exports will be deleted.")) return;
+  setQueuedAction(action, "Saving edits and queueing the action...");
+  byId("editor-app").inert = true;
   try {
-    const result = await api.regenerate(store.stage, store.page);
+    if (store.dirty) await save();
+    if (store.dirty) { setQueuedAction(""); return; }
+    const result = action === "stage" ? await api.regenerate(store.stage, store.page)
+      : action === "page" ? await api.regeneratePage(store.page)
+        : action === "all-pages" ? await api.regenerateAllPages() : await api.finishEdits();
     window.location.href = result.url;
   } catch (error) { setQueuedAction(""); setStatus(error.message, true); }
-}
-
-async function regenerateAll() {
-  if (queuedAction) return;
-  if (store.dirty) await save();
-  if (store.dirty) return;
-  setQueuedAction("all", "Adding all changed pages to the job queue...");
-  try {
-    const result = await api.regenerateChanges();
-    window.location.href = result.url;
-  } catch (error) { setQueuedAction(""); setStatus(error.message, true); }
+  finally { byId("editor-app").inert = false; }
 }
 
 async function continueProcessing() {
@@ -688,8 +1006,9 @@ async function continueProcessing() {
 }
 
 async function retranslate(scope) {
-  if (queuedAction || store.stage !== "translation") return;
-  const selected = scope === "record" ? store.selectedRecord() : null;
+  if (queuedAction || store.stage !== "text") return;
+  const source = scope === "record" ? store.selectedRecord() : null;
+  const selected = source ? (store.records.translations || []).find((item) => item.boxno === source.boxno) : null;
   if (scope === "record" && !selected) {
     setStatus("Select one translation record first.", true);
     return;
@@ -719,6 +1038,9 @@ async function retranslate(scope) {
 }
 
 async function exactPreview() {
+  const document = store.document, page = store.page;
+  const controller = new AbortController();
+  currentPreviewRequest = controller;
   try {
     const placementState = store.document?.stageStates?.placement || {};
     const renderIsCurrent = !store.dirty && !placementState.pending && !placementState.stale;
@@ -727,26 +1049,36 @@ async function exactPreview() {
       setStatus("Saved render loaded. No preview generation was needed.");
       return;
     }
+    canvas.load(imageUrl("original"), {showPlacementText: false});
     setStatus("Checking the cleaning mask and preparing Current...");
     const result = await api.preview(
       "placement",
       store.page,
       store.records.placements || [],
       store.records.ocr_structured || [],
+      store.records.clean_boxes || [],
+      store.records.translations || [],
+      controller.signal,
     );
+    if (controller.signal.aborted || store.document !== document || store.page !== page || typesettingView !== "current") return;
     canvas.load(result.url, { showPlacementText: false });
     if (result.cleanedWithLama) {
       setStatus("Current was cleaned with LaMa and rendered with ImageMagick.");
     } else {
       setStatus(result.cached ? "Cached Current preview loaded." : "Current preview rendered with ImageMagick.");
     }
-  } catch (error) { setStatus(error.message, true); }
+  } catch (error) {
+    if (!controller.signal.aborted && store.document === document && error.name !== "AbortError") setStatus(error.message, true);
+  }
 }
 
 async function loadRevisions() {
+  const pageDocument = store.document;
   const target = byId("revision-list"); target.textContent = "Loading...";
   try {
-    const data = await api.revisions(); target.replaceChildren();
+    const data = await api.revisions();
+    if (store.document !== pageDocument) return;
+    target.replaceChildren();
     for (const item of (data.revisions || []).slice(0, 50)) {
       const row = document.createElement("div"); row.className = "history-row";
       row.append(document.createTextNode(`#${item.revision} ${item.updatedAt ? new Date(item.updatedAt).toLocaleString() : ""}`));
@@ -759,7 +1091,7 @@ async function loadRevisions() {
       row.append(button); target.append(row);
     }
     if (!target.childElementCount) target.textContent = "No saved revisions.";
-  } catch (error) { target.textContent = error.message; }
+  } catch (error) { if (store.document === pageDocument) target.textContent = error.message; }
 }
 
 function render() {
@@ -778,22 +1110,26 @@ function render() {
   byId("freeze-page").dataset.tooltip = pageFrozen
     ? "Allow later reruns to replace values on this page. Individual protected edits remain protected."
     : "Protect all editor stages on this page. Later reruns keep their current values until you unprotect the page.";
-  byId("regenerate").dataset.tooltip = downstreamRegenerationTooltip();
 }
 
 store.addEventListener("change", render);
 document.querySelectorAll(".stage-tab").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.stage, store.page)));
-byId("page-select").addEventListener("change", (event) => navigate(store.stage, Number(event.target.value)));
-byId("prev-page").addEventListener("click", () => navigate(store.stage, store.page - 1));
-byId("next-page").addEventListener("click", () => navigate(store.stage, store.page + 1));
+byId("page-select").addEventListener("change", selectPage);
+byId("page-select").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { event.preventDefault(); void selectPage(); }
+});
+byId("prev-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) - 1));
+byId("next-page").addEventListener("click", () => navigate(store.stage, (navigationPage ?? store.page) + 1));
 byId("record-filter").addEventListener("input", renderRecordList);
 byId("undo").addEventListener("click", () => store.undo());
 byId("redo").addEventListener("click", () => store.redo());
 byId("save").addEventListener("click", save);
+byId("reset-stage").addEventListener("click", resetStage);
 byId("freeze-stage").addEventListener("click", () => toggleFreeze("stage"));
 byId("freeze-page").addEventListener("click", () => toggleFreeze("page"));
-byId("regenerate").addEventListener("click", regenerate);
-byId("regenerate-all").addEventListener("click", regenerateAll);
+for (const action of ["stage", "page", "all-pages", "finish-edits"]) {
+  byId(action === "finish-edits" ? action : `regenerate-${action}`).addEventListener("click", () => regenerate(action));
+}
 byId("continue-processing").addEventListener("click", continueProcessing);
 for (const id of ["job-notes", "page-notes"]) byId(id).addEventListener("input", () => {
   store.document.translationNotes = {
@@ -806,7 +1142,9 @@ for (const id of ["job-notes", "page-notes"]) byId(id).addEventListener("input",
   byId("save-state").textContent = "Unsaved draft";
 });
 document.addEventListener("keydown", (event) => {
-  const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName);
+  if (resetting) return;
+  const typing = event.target.isContentEditable ||
+    (["INPUT", "TEXTAREA", "SELECT"].includes(event.target.tagName) && event.target.type !== "checkbox");
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(); return; }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? store.redo() : store.undo(); return; }
   if (typing) return;
@@ -817,10 +1155,10 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault(); navigate(AVAILABLE_STAGES[stageIndex], store.page); return;
   }
   if (key === "a") {
-    event.preventDefault(); navigate(store.stage, store.page - 1); return;
+    event.preventDefault(); navigate(store.stage, (navigationPage ?? store.page) - 1); return;
   }
   if (key === "d") {
-    event.preventDefault(); navigate(store.stage, store.page + 1); return;
+    event.preventDefault(); navigate(store.stage, (navigationPage ?? store.page) + 1); return;
   }
   if (event.key === "Delete") {
     event.preventDefault(); deleteSelected(); return;

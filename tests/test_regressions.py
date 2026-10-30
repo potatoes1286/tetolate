@@ -37,6 +37,16 @@ import web_security
 
 
 class RepositoryHygieneTests(unittest.TestCase):
+    def test_shared_footer_has_an_on_demand_update_check(self) -> None:
+        page = web_pages.base_page("Test", "<h1>Test</h1>").body.decode()
+        footer = page.split('<footer class="muted">', 1)[1].split("</footer>", 1)[0]
+        self.assertIn(f"tetolate {web_pages.VERSION}", footer)
+        self.assertIn(f'data-version="{web_pages.VERSION}"', footer)
+        self.assertIn('id="check-updates"', footer)
+        self.assertIn('>Check for updates</a>', footer)
+        self.assertIn('id="update-status" role="status"', footer)
+        self.assertIn(web_pages.UPDATE_CHECK_SCRIPT, page)
+
     def test_checked_in_examples_do_not_contain_credentials(self) -> None:
         repo_dir = Path(__file__).resolve().parents[1]
         config_dir = repo_dir / "data" / "config"
@@ -95,7 +105,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assertEqual(config.ocr.engine, paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL)
         self.assertEqual(config.render_font, "ComicNeue-Bold.ttf")
 
-    def test_hidden_ocr_options_are_not_read_from_vlm_config(self) -> None:
+    def test_ocr_engine_is_configurable_but_low_level_options_stay_hidden(self) -> None:
         language = translate_cbz.language_config_from_codes("jp", "en")
         config = translate_cbz.load_ocr_config(
             {
@@ -108,7 +118,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         )
 
         self.assertEqual(config.min_score, 0.8)
-        self.assertEqual(config.engine, paddle_ocr_image.DEFAULT_OCR_ENGINE)
+        self.assertEqual(config.engine, "paddle")
         self.assertEqual(config.service_url, paddle_ocr_image.DEFAULT_OCR_SERVICE_URL)
         self.assertEqual(config.tile_enabled, paddle_ocr_image.DEFAULT_TILE_ENABLED)
 
@@ -753,6 +763,7 @@ class WebAuthenticationTests(unittest.TestCase):
         manager = object.__new__(web_app.JobManager)
         manager._lock = threading.RLock()
         manager._admin_sessions = {}
+        manager._remembered_admin_sessions = {}
 
         first = manager.create_admin_session()
         second = manager.create_admin_session()
@@ -917,6 +928,7 @@ class WebAuthenticationTests(unittest.TestCase):
             imagemagick_workers=4,
             has_vlm_auth_token=True,
             has_paddleocr_vl_auth_token=True,
+            test_job_id="12345678",
         )
 
         self.assertIn("<legend>Workflow</legend>", markup)
@@ -1016,7 +1028,7 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertIn("Translate with VLM", titled_body)
         self.assertIn("<summary>Title settings</summary>", titled_body)
         self.assertIn('<legend>Translation VLM</legend>', titled_body)
-        self.assertIn("Save advanced options", titled_body)
+        self.assertIn("Copy to Category Settings", titled_body)
         self.assertIn('name="title_mode"', titled_body)
         self.assertNotIn("Regenerate an existing CBZ download", titled_body)
 
@@ -1079,7 +1091,7 @@ class WebAuthenticationTests(unittest.TestCase):
             with self.assertRaisesRegex(HTTPException, "VLM model is required"):
                 manager.build_command("default", job_id)
 
-    def test_package_only_command_without_vlm_model_is_allowed(self) -> None:
+    def test_package_generation_is_not_a_web_pipeline_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manager = self.initialized_manager(root, ["default"])
@@ -1088,11 +1100,8 @@ class WebAuthenticationTests(unittest.TestCase):
             manager.job_dir("default", job_id).mkdir(parents=True)
             manager.save_status("default", job_id, {"status": "complete"})
 
-            command = manager.build_command(
-                "default", job_id, "package", 0, package_variant="webp"
-            )
-
-        self.assertNotIn("--vlm-model", command)
+            with self.assertRaisesRegex(HTTPException, "independently"):
+                manager.build_command("default", job_id, "package", 0)
 
     def test_job_rename_preserves_translated_title_and_sets_download_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1337,7 +1346,9 @@ class WebAuthenticationTests(unittest.TestCase):
             manager = self.initialized_manager(root, ["default"])
             code, job_id = "default", "12345678"
             manager.job_dir(code, job_id).mkdir(parents=True)
-            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.save_status(code, job_id, {
+                "status": "failed", "vlmModel": "model", "vlmBaseUrl": "http://vlm.example/v1",
+            })
             manager.update_job_auth_tokens(
                 code,
                 job_id,
@@ -1402,7 +1413,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     probe.call_args_list,
                     [
                         mock.call("http://vlm.example/v1", "supplied-token"),
-                        mock.call("http://vlm.example/v1", None),
+                        mock.call("http://vlm.example/v1", "supplied-token"),
                     ],
                 )
 
@@ -1415,7 +1426,9 @@ class WebAuthenticationTests(unittest.TestCase):
             manager = self.initialized_manager(root, ["default"])
             code, job_id = "default", "12345678"
             manager.job_dir(code, job_id).mkdir(parents=True)
-            manager.save_status(code, job_id, {"status": "failed", "vlmModel": "model"})
+            manager.save_status(code, job_id, {
+                "status": "failed", "vlmModel": "model", "vlmBaseUrl": "http://vlm.example/v1",
+            })
             app = web_app.create_app(config_path)
             app.state.manager = manager
             session = manager.authenticate_admin(self.ADMIN_PASSWORD)
@@ -1458,6 +1471,128 @@ class WebAuthenticationTests(unittest.TestCase):
                 self.assertNotIn("supplied-token", response.text)
 
             asyncio.run(exercise())
+
+    def test_category_vlm_key_survives_restart_and_is_used_by_new_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            endpoint = manager.config.default_vlm_base_url
+            app = web_app.create_app(root / "web_config.json")
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with (
+                        mock.patch.object(manager, "probe_vlm_models", return_value=["model"]),
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "vlmBaseUrl": endpoint,
+                            "vlmAuthToken": "persistent-token",
+                        })
+                    self.assertEqual(response.status_code, 200)
+                    self.assertNotIn("persistent-token", response.text)
+
+                    restarted = web_app.JobManager(manager.config)
+                    restarted.initialize_web_state()
+                    app.state.manager = restarted
+                    session_after_restart = restarted.authenticate_admin(self.ADMIN_PASSWORD)
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session_after_restart)
+                    with (
+                        mock.patch.object(restarted, "probe_vlm_models", return_value=["model"]) as probe,
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "vlmBaseUrl": endpoint + "/",
+                        })
+                        probe.assert_called_once_with(endpoint, "persistent-token")
+                    self.assertEqual(response.status_code, 200)
+                    category = restarted.public_category_jobs("default")
+                    self.assertTrue(category["hasVlmAuthToken"])
+                    markup = web_pages.category_jobs_page("default", category).body.decode()
+                    self.assertIn("A saved token is set", markup)
+                    self.assertNotIn("persistent-token", markup)
+                    self.assertNotIn("persistent-token", json.dumps(category))
+                    job_id = restarted.create_job_id("default")
+                    restarted.job_dir("default", job_id).mkdir(parents=True)
+                    restarted.submit_job("default", job_id, "input.cbz")
+                    self.assertEqual(
+                        restarted.load_job_secrets("default", job_id)["vlmAuthToken"],
+                        "persistent-token",
+                    )
+                    self.assertNotIn("persistent-token", restarted.status_path("default", job_id).read_text())
+
+            asyncio.run(exercise())
+            path = manager.config.jobs_dir / web_app.VLM_SECRETS_FILENAME
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_saved_vlm_keys_are_scoped_to_endpoint_and_can_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manager = self.initialized_manager(root, ["default"])
+            old_endpoint = manager.config.default_vlm_base_url
+            new_endpoint = "https://other.example/v1"
+            job_id = manager.create_job_id("default")
+            manager.job_dir("default", job_id).mkdir(parents=True)
+            manager.submit_job("default", job_id, "input.cbz", vlm_auth_token="old-token")
+            status = manager.load_status("default", job_id)
+            assert status is not None
+            status["status"] = "failed"
+            manager.save_status("default", job_id, status)
+            app = web_app.create_app(root / "web_config.json")
+            app.state.manager = manager
+            session = manager.authenticate_admin(self.ADMIN_PASSWORD)
+            assert session is not None
+
+            async def direct_run_in_threadpool(function: object, *args: object) -> object:
+                return function(*args)  # type: ignore[operator]
+
+            async def exercise() -> None:
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://testserver",
+                ) as client:
+                    client.cookies.set(web_app.ADMIN_COOKIE_NAME, session)
+                    with (
+                        mock.patch.object(manager, "probe_vlm_models", return_value=["model"]) as probe,
+                        mock.patch.object(web_app, "run_in_threadpool", new=direct_run_in_threadpool),
+                    ):
+                        response = await client.post("/api/vlm/test", json={
+                            "category": "default", "jobId": job_id, "vlmBaseUrl": new_endpoint,
+                        })
+                        self.assertEqual(response.status_code, 200)
+                        probe.assert_called_once_with(new_endpoint, None)
+                    response = await client.post(f"/job/default/{job_id}/advanced-options", data={
+                        "vlm_base_url": new_endpoint, "vlm_model": "model",
+                    })
+                    self.assertEqual(response.status_code, 303)
+                    self.assertNotIn("vlmAuthToken", manager.load_job_secrets("default", job_id))
+                    self.assertIsNone(manager.saved_vlm_token(new_endpoint))
+                    self.assertEqual(manager.saved_vlm_token(old_endpoint), "old-token")
+
+            asyncio.run(exercise())
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token="new-token", paddleocr_vl_auth_token=None,
+            )
+            self.assertEqual(manager.saved_vlm_token(new_endpoint), "new-token")
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token=None, paddleocr_vl_auth_token=None,
+            )
+            self.assertEqual(manager.load_job_secrets("default", job_id)["vlmAuthToken"], "new-token")
+            manager.update_job_auth_tokens(
+                "default", job_id, vlm_auth_token=None, paddleocr_vl_auth_token=None,
+                clear_vlm_auth_token=True,
+            )
+            self.assertIsNone(manager.saved_vlm_token(new_endpoint))
+            self.assertNotIn("vlmAuthToken", manager.load_job_secrets("default", job_id))
+            self.assertEqual(manager.saved_vlm_token(old_endpoint), "old-token")
 
     def test_vlm_probe_failure_adds_docker_note_only_for_localhost(self) -> None:
         self.assertEqual(
@@ -1546,7 +1681,7 @@ class WebAuthenticationTests(unittest.TestCase):
         self.assertEqual(command[command.index("--lama-workers") + 1], "3")
         self.assertEqual(command[command.index("--imagemagick-workers") + 1], "4")
 
-    def test_web_pipeline_skips_archives_and_package_generation_selects_one_variant(self) -> None:
+    def test_web_pipeline_and_render_reruns_always_skip_archives(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             manager = self.initialized_manager(root, ["default"])
@@ -1555,17 +1690,12 @@ class WebAuthenticationTests(unittest.TestCase):
             manager.save_status("default", job_id, {"status": "failed"})
 
             normal_command = manager.build_command("default", job_id)
-            package_command = manager.build_command(
-                "default", job_id, "package", 0, package_variant="webp"
-            )
+            render_command = manager.build_command("default", job_id, "render", 0)
 
         self.assertIn("--skip-package", normal_command)
         self.assertNotIn("--package-variant", normal_command)
-        self.assertNotIn("--skip-package", package_command)
-        self.assertEqual(
-            package_command[package_command.index("--package-variant") + 1],
-            "webp",
-        )
+        self.assertIn("--skip-package", render_command)
+        self.assertNotIn("--package-variant", render_command)
 
     def test_case_colliding_saved_categories_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1695,7 +1825,7 @@ class WebAuthenticationTests(unittest.TestCase):
                     self.assertIn("httponly", cookie_header)
                     self.assertIn("samesite=strict", cookie_header)
 
-                    self.assertIn("max-age=", cookie_header)
+                    self.assertNotIn("max-age=", cookie_header)
 
                     response = await client.get("/admin")
                     self.assertEqual(response.status_code, 200)
@@ -2641,7 +2771,7 @@ class PipelineSmokeTests(unittest.TestCase):
                 fixture_dir=fixture_dir,
             )
             config = translate_cbz.load_config(None, fixture_dir)
-            with mock.patch.object(
+            with mock.patch.object(paddle_ocr_image, "check_paddleocr_vl_endpoint"), mock.patch.object(
                 paddle_ocr_image,
                 "create_paddleocr_vl",
                 return_value=mock.sentinel.ocr,
@@ -2703,7 +2833,7 @@ class PipelineSmokeTests(unittest.TestCase):
                 fixture_dir=fixture_dir,
             )
             config = translate_cbz.load_config(None, fixture_dir)
-            with mock.patch.object(
+            with mock.patch.object(paddle_ocr_image, "check_paddleocr_vl_endpoint"), mock.patch.object(
                 paddle_ocr_image,
                 "create_paddleocr_vl",
                 return_value=mock.sentinel.ocr,
@@ -4491,34 +4621,49 @@ class EditorV2Tests(unittest.TestCase):
         self.assertNotIn("/api/job/{code}/{job_id}/edit/{stage}/{page}", paths)
         self.assertNotIn("/api/job/{code}/{job_id}/edit/regenerate", paths)
 
-    def test_editor_page_uses_five_stage_module_shell(self) -> None:
+    def test_editor_page_uses_three_tab_module_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             manager, code, job_id = self.create_job(Path(temp_dir))
             manager.initialize_editor_v2(code, job_id)
             body = web_pages.editor_page(manager, code, job_id).body.decode("utf-8")
             for label in (
                 "OCR &amp; Merge",
-                "Structure",
-                "Erase &amp; Alternate Placement",
-                "Translation",
+                "Text &amp; Translation",
                 "Typesetting",
             ):
                 self.assertIn(label, body)
-            self.assertEqual(body.count('class="stage-tab"'), 5)
+            self.assertEqual(body.count('class="stage-tab"'), 3)
+            for removed in ("structure", "erase", "translation"):
+                self.assertNotIn(f'data-stage="{removed}"', body)
             self.assertNotIn('data-stage="preview"', body)
-            self.assertIn('/assets/editor-v2/app.js?v=8', body)
+            self.assertIn('/assets/editor-v2/app.js?v=16', body)
+            self.assertIn('id="page-select" type="number" min="0"', body)
+            last_page = max(0, len(manager.original_page_files(code, job_id)) - 1)
+            self.assertIn(f'value="0" required> / {last_page}</label>', body)
+            self.assertNotIn('id="page-list"', body)
+            self.assertNotIn('<datalist', body)
+            self.assertNotIn('<select id="page-select"', body)
             self.assertIn('Previous [A]', body)
             self.assertIn('Next [D]', body)
             self.assertIn('id="record-list"', body)
             self.assertIn('id="record-form"', body)
+            header_end = body.index('</header>')
+            for control in ('class="job-details"', 'class="stage-tabs"', 'class="page-nav"', 'class="action-bar"'):
+                self.assertLess(body.index(control), header_end)
+            self.assertLess(header_end, body.index('id="stage-tools"'))
+            self.assertLess(body.index('id="editor-status"'), body.index('<main class="editor-workspace">'))
+            self.assertLess(body.index('id="stage-tools"'), body.index('id="editor-status"'))
+            self.assertLess(body.index('id="editor-status"'), body.index('id="canvas-wrap"'))
             self.assertIn('id="record-resizer"', body)
             self.assertIn('id="inspector-resizer"', body)
+            self.assertIn('id="height-resizer" role="separator"', body)
+            self.assertIn('aria-label="Resize editor height"', body)
             self.assertIn(
-                "The current stage is used as input and is not regenerated.",
+                "rerun only the steps required by its saved edits",
                 body,
             )
             self.assertIn(
-                "Rerun every page with saved editor changes",
+                "Rerun only the required steps on all pages with saved edits",
                 body,
             )
             self.assertIn('id="editor-tooltip"', body)
@@ -4533,7 +4678,7 @@ class EditorV2Tests(unittest.TestCase):
             self.assertIn('let typesettingView = localStorage.getItem(typesettingViewKey) || "current"', editor_script)
             self.assertIn('"Retranslate page"', editor_script)
             self.assertIn('"Retranslate selected"', editor_script)
-            self.assertIn('"Queueing regeneration..."', editor_script)
+            self.assertIn('"Queueing..."', editor_script)
 
     def test_ocr_review_checkpoint_exposes_only_ocr_editor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4663,14 +4808,14 @@ class EditorV2Tests(unittest.TestCase):
                 overlay_text, "overlay_text", side_effect=fake_overlay
             ) as render:
                 _path, first_cached, _first_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, placements, []
+                    code, job_id, 0, placements, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
                 _path, second_cached, _second_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, placements, []
+                    code, job_id, 0, placements, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
                 changed = [{**placements[0], "placementRegion": [20, 10, 90, 90]}]
                 _path, changed_cached, _changed_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, changed, []
+                    code, job_id, 0, changed, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
 
             self.assertFalse(first_cached)
@@ -4773,8 +4918,8 @@ class EditorV2Tests(unittest.TestCase):
             placement = payload["recordsByArtifact"]["placements"][0]
 
             self.assertGreater(placement["_autoFontSizeWidthPercent"], 0)
-            self.assertGreater(placement["_roughPointSize"], 0)
-            self.assertTrue(placement["_roughText"])
+            self.assertNotIn("_roughPointSize", placement)
+            self.assertNotIn("_roughText", placement)
 
 
 if __name__ == "__main__":

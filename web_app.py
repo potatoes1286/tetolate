@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -24,6 +26,7 @@ import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -55,7 +58,10 @@ from web_pages import (
     job_viewer_page,
 )
 import web_security
+from web_series import SERIES_FILENAME, SeriesManagerMixin, chapter_filename_key, chapter_number, chapter_label, chapter_key
 from web_storage import write_json_atomic
+from web_control_auth import ControlAuthMixin
+from web_exports import ExportManagerMixin
 
 
 LOGGER = logging.getLogger(__name__)
@@ -100,9 +106,11 @@ DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
 MAX_PAGE_SELECTION_ITEMS = 10_000
 ADMIN_COOKIE_NAME = "tetolate_admin"
 ADMIN_SESSION_SECONDS = 12 * 60 * 60
+REMEMBERED_ADMIN_SESSION_SECONDS = 30 * 24 * 60 * 60
 ADMIN_LOGIN_FAILURE_LIMIT = 5
 ADMIN_LOGIN_FAILURE_WINDOW_SECONDS = 60
 WEB_STATE_FILENAME = ".tetolate-web-state.json"
+VLM_SECRETS_FILENAME = ".vlm-secrets.json"
 WEB_INSTANCE_LOCK_FILENAME = ".tetolate-web.lock"
 WEB_CONFIG_FIELDS = {
     "listen",
@@ -130,8 +138,11 @@ UPLOAD_PAGE_IMAGE_ACCEPT = (
 )
 
 
-class UploadRequestTooLarge(Exception):
+class UploadRequestTooLarge(HTTPException):
     """Raised when an upload request exceeds the configured byte limit."""
+
+    def __init__(self) -> None:
+        super().__init__(413, "Upload request is too large.")
 
 
 class UploadSizeLimitMiddleware:
@@ -141,8 +152,9 @@ class UploadSizeLimitMiddleware:
         self.app = app
 
     @staticmethod
-    async def _send_too_large(send: Any) -> None:
-        body = b'{"detail":"Upload request is too large."}'
+    async def _send_too_large(send: Any, control: bool = False) -> None:
+        body = (b'{"error":{"code":"too_large","message":"Upload request is too large."}}'
+                if control else b'{"detail":"Upload request is too large."}')
         await send(
             {
                 "type": "http.response.start",
@@ -157,11 +169,14 @@ class UploadSizeLimitMiddleware:
         await send({"type": "http.response.body", "body": body})
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("path") != "/upload" or scope.get("method") != "POST":
+        path = scope.get("path", "")
+        upload = path in {"/upload", "/api/v1/jobs"} or ("/series/" in path and path.endswith("/upload"))
+        if scope.get("type") != "http" or not upload or scope.get("method") != "POST":
             await self.app(scope, receive, send)
             return
 
-        manager = getattr(getattr(self.app, "state", None), "manager", None)
+        owner = scope.get("app", self.app)
+        manager = getattr(getattr(owner, "state", None), "manager", None)
         config = getattr(manager, "config", None)
         max_bytes = getattr(config, "max_upload_bytes", None)
         if not isinstance(max_bytes, int) or max_bytes <= 0:
@@ -175,7 +190,7 @@ class UploadSizeLimitMiddleware:
             except (TypeError, ValueError):
                 declared_length = None
             if declared_length is not None and declared_length > max_bytes:
-                await self._send_too_large(send)
+                await self._send_too_large(send, path.startswith("/api/v1/"))
                 return
 
         received = 0
@@ -201,7 +216,7 @@ class UploadSizeLimitMiddleware:
             await self.app(scope, limited_receive, tracking_send)
         except UploadRequestTooLarge:
             if not response_started:
-                await self._send_too_large(send)
+                await self._send_too_large(send, path.startswith("/api/v1/"))
             else:
                 raise
 CATEGORY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -221,7 +236,6 @@ RESUME_PHASE_BY_PROGRESS = {
     "Placement style": "placements",
     "Clean": "render",
     "Render": "render",
-    "Package": "package",
 }
 RESUME_PHASES = frozenset(RESUME_PHASE_BY_PROGRESS.values())
 TERMINAL_JOB_STATUSES = frozenset(("complete", "failed", "cancelled"))
@@ -726,9 +740,9 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, str, bool, s
             (configured_vlm_model or "").strip(),
             default_alt_placement_enabled,
             default_source_language,
-            DEFAULT_OCR_ENGINE,
-            DEFAULT_PADDLEOCR_VL_SERVER_URL,
-            DEFAULT_PADDLEOCR_VL_MODEL,
+            paddle_ocr_image.normalize_ocr_engine(ocr.get("engine", DEFAULT_OCR_ENGINE)),
+            validate_paddleocr_vl_server_url(ocr.get("paddleocr_vl_server_url", DEFAULT_PADDLEOCR_VL_SERVER_URL), DEFAULT_PADDLEOCR_VL_SERVER_URL),
+            parse_optional_text_form(ocr.get("paddleocr_vl_model", DEFAULT_PADDLEOCR_VL_MODEL), DEFAULT_PADDLEOCR_VL_MODEL),
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -1169,6 +1183,90 @@ async def write_uploaded_images_as_cbz(
     return total_written, upload_names_summary(names)
 
 
+async def submit_uploaded_series(manager, code, chapters, first_chapter, options, volume=""):
+    """Validate and register a whole chapter batch before queueing any chapter."""
+    prepared = []
+    committed = []
+    try:
+        manager.get_series(code)
+        uploads = non_empty_uploads(chapters)
+        if not uploads or len(uploads) > 200:
+            raise HTTPException(400, "Select 1-200 CBZ or ZIP chapters.")
+        first = Decimal(chapter_number(first_chapter))
+        ordered = sorted(uploads, key=lambda item: chapter_filename_key(upload_filename(item)))
+        orders = [chapter_number(str(first + index)) for index in range(len(ordered))]
+        for item, order in zip(ordered, orders):
+            manager.validate_series_chapter(code, order, volume)
+            filename = upload_filename(item)
+            if Path(filename).suffix.lower() not in UPLOAD_COMIC_ARCHIVE_EXTENSIONS:
+                raise HTTPException(400, "Chapters must use .cbz or .zip extensions.")
+            job_id = manager.create_job_id(code)
+            manager.job_dir(code, job_id).mkdir(parents=True)
+            prepared.append((job_id, filename, order))
+            await write_uploaded_file_to_path(item, manager.input_path(code, job_id),
+                                              manager.config.max_upload_bytes, "Uploaded chapter")
+            await run_in_threadpool(validate_uploaded_comic_archive, manager.input_path(code, job_id), filename)
+        with manager._lock:
+            try:
+                for job_id, filename, order in prepared:
+                    manager.submit_job(code, job_id, filename, **options,
+                                       chapter=order, volume=volume, enqueue_job=False)
+            except Exception:
+                for job_id, _, _ in prepared:
+                    shutil.rmtree(manager.job_dir(code, job_id))
+                prepared.clear()
+                raise
+            committed = [job_id for job_id, _, _ in prepared]
+            # A scheduling failure must not remove work that can already be queued.
+            prepared.clear()
+            manager.enqueue_ready_series_jobs()
+        return committed
+    except Exception:
+        for job_id, _, _ in prepared:
+            shutil.rmtree(manager.job_dir(code, job_id))
+        raise
+    finally:
+        for item in chapters:
+            await item.close()
+
+
+async def probe_vlm_connection(manager, endpoint_value, token_value="", category=None, job_id=None):
+    """Use the same credential selection, persistence, and errors for both APIs."""
+    try:
+        endpoint = validate_vlm_base_url(endpoint_value, "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    supplied_token = parse_auth_token_form(token_value)
+    if category is None and job_id is not None:
+        raise HTTPException(400, "jobId requires category.")
+    saved_token = None
+    same_job_endpoint = False
+    if category is not None:
+        category = manager.validate_category(category)
+        if job_id is not None:
+            job_id = manager.validate_job_id(job_id)
+            status = manager.load_status(category, job_id)
+            if status is None:
+                raise HTTPException(404, "Unknown job.")
+            same_job_endpoint = manager.status_vlm_base_url(status).rstrip("/") == endpoint.rstrip("/")
+            if supplied_token is None and same_job_endpoint:
+                saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
+    saved_token = saved_token or manager.saved_vlm_token(endpoint)
+    try:
+        models = await run_in_threadpool(manager.probe_vlm_models, endpoint, supplied_token or saved_token)
+    except Exception as exc:
+        raise HTTPException(502, vlm_probe_failure_detail(endpoint, exc, supplied_token or saved_token)) from None
+    if supplied_token is not None:
+        with manager._lock:
+            current = manager.load_status(category, job_id) if same_job_endpoint else None
+            if current is not None and manager.status_vlm_base_url(current).rstrip("/") == endpoint.rstrip("/"):
+                manager.update_job_auth_tokens(category, job_id, vlm_auth_token=supplied_token,
+                                               paddleocr_vl_auth_token=None)
+            else:
+                manager.remember_vlm_token(endpoint, supplied_token)
+    return {"ok": True, "models": models, "message": f"Connected. Found {len(models)} model(s)."}
+
+
 def quality_for_display(value: Any, default: int) -> int:
     try:
         return validate_output_quality(value, "quality")
@@ -1214,7 +1312,6 @@ def parse_progress_line(line: str) -> tuple[str, int | None] | None:
         (re.compile(r"^VLM style placement page (\d+)"), "Placement style"),
         (re.compile(r"^Clean page (\d+)"), "Clean"),
         (re.compile(r"^Render page (\d+)"), "Render"),
-        (re.compile(r"^Wrote .+translated\.cbz"), "Package"),
     )
     for pattern, phase in patterns:
         match = pattern.search(line)
@@ -1227,7 +1324,7 @@ def parse_progress_line(line: str) -> tuple[str, int | None] | None:
 
 def progress_resume_target(phase: Any, page: Any) -> tuple[str, int] | None:
     resume_from = RESUME_PHASE_BY_PROGRESS.get(str(phase))
-    if resume_from in {"proofreading", "translation_notes", "package"}:
+    if resume_from in {"proofreading", "translation_notes"}:
         return stored_resume_target(resume_from, 0)
     return stored_resume_target(resume_from, page)
 
@@ -1235,7 +1332,7 @@ def progress_resume_target(phase: Any, page: Any) -> tuple[str, int] | None:
 def stored_resume_target(resume_from: Any, page: Any) -> tuple[str, int] | None:
     if resume_from not in RESUME_PHASES:
         return None
-    if resume_from in {"proofreading", "translation_notes", "package"}:
+    if resume_from in {"proofreading", "translation_notes"}:
         return resume_from, 0
     if page is None:
         return None
@@ -1316,20 +1413,24 @@ def optional_non_negative_int(value: Any, label: str) -> int | None:
     return parsed
 
 
-class JobManager(EditorManagerMixin):
+class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, ExportManagerMixin):
     def __init__(self, config: WebConfig) -> None:
         self.config = config
         self._queue: queue.Queue[tuple[str, str] | None] = queue.Queue()
         self._queued_jobs: set[tuple[str, str]] = set()
+        self._starting_jobs: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
         self._pause_condition = threading.Condition(self._lock)
         self._paused = False
         self._stopping = False
         self._active_processes: dict[tuple[str, str], subprocess.Popen[str]] = {}
         self._worker: threading.Thread | None = None
+        self._export_threads: set[threading.Thread] = set()
         self._password_hash = ""
+        self._local_cli_token = ""
         self._categories: set[str] = set()
         self._admin_sessions: dict[str, float] = {}
+        self._remembered_admin_sessions: dict[str, float] = {}
         self._admin_login_failures: dict[str, list[float]] = {}
         self._password_workers = threading.BoundedSemaphore(2)
         self._editor_lama_lock = threading.Lock()
@@ -1343,6 +1444,7 @@ class JobManager(EditorManagerMixin):
         self.acquire_instance_lock()
         try:
             self.initialize_web_state()
+            self.recover_interrupted_exports()
             self.requeue_interrupted_jobs()
             self._worker = threading.Thread(
                 target=self.worker_loop,
@@ -1376,6 +1478,9 @@ class JobManager(EditorManagerMixin):
         self._queue.put(None)
         if self._worker is not None:
             self._worker.join(timeout=5)
+        export_deadline = time.monotonic() + 5
+        for thread in list(self._export_threads):
+            thread.join(timeout=max(0, export_deadline - time.monotonic()))
         with self._editor_lama_lock:
             if self._editor_lama_session is not None:
                 self._editor_lama_session.close()
@@ -1446,6 +1551,7 @@ class JobManager(EditorManagerMixin):
         return {
             "version": 1,
             "adminPasswordHash": self._password_hash,
+            "rememberedAdminSessions": dict(self._remembered_admin_sessions),
             "categories": sorted(self._categories, key=str.casefold),
             "updatedAt": now_utc(),
         }
@@ -1472,6 +1578,15 @@ class JobManager(EditorManagerMixin):
                 web_security.parse_password_hash(password_hash)
             except ValueError as exc:
                 raise RuntimeError(f"Web state has an invalid admin password hash: {exc}") from exc
+
+        remembered_sessions = state.get("rememberedAdminSessions", {})
+        if not isinstance(remembered_sessions, dict) or any(
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry)
+            for digest, expiry in remembered_sessions.items()
+        ):
+            raise RuntimeError("Web state rememberedAdminSessions must contain session hashes and finite expiry times.")
+        remembered_sessions = {digest: expiry for digest, expiry in remembered_sessions.items() if expiry > time.time()}
 
         configured_categories = state.get("categories", [])
         if not isinstance(configured_categories, list):
@@ -1509,9 +1624,11 @@ class JobManager(EditorManagerMixin):
 
         with self._lock:
             self._password_hash = password_hash
+            self._remembered_admin_sessions = remembered_sessions if not default_password else {}
             self._categories = categories
             if new_installation:
                 self.category_dir(DEFAULT_CATEGORY).mkdir(parents=True, exist_ok=True)
+            self.initialize_local_cli_token()
             self.save_web_state()
 
     def password_matches_hash(self, password: str, password_hash: str) -> bool:
@@ -1526,7 +1643,7 @@ class JobManager(EditorManagerMixin):
             password_hash = self._password_hash
         return self.password_matches_hash(password, password_hash)
 
-    def authenticate_admin(self, password: str) -> str | None:
+    def authenticate_admin(self, password: str, remember_session: bool = False) -> str | None:
         with self._lock:
             password_hash = self._password_hash
         if not self.password_matches_hash(password, password_hash):
@@ -1534,7 +1651,7 @@ class JobManager(EditorManagerMixin):
         with self._lock:
             if self._password_hash != password_hash:
                 return None
-            return self.create_admin_session()
+            return self.create_admin_session(remember_session=remember_session)
 
     def session_digest(self, token: str) -> str:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -1544,14 +1661,25 @@ class JobManager(EditorManagerMixin):
         expired = [digest for digest, expiry in self._admin_sessions.items() if expiry <= now]
         for digest in expired:
             self._admin_sessions.pop(digest, None)
+        now = time.time()
+        for digest, expiry in list(self._remembered_admin_sessions.items()):
+            if expiry <= now:
+                self._remembered_admin_sessions.pop(digest, None)
 
-    def create_admin_session(self) -> str:
+    def create_admin_session(self, *, remember_session: bool = False) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
             self.purge_expired_admin_sessions()
-            self._admin_sessions[self.session_digest(token)] = (
-                time.monotonic() + ADMIN_SESSION_SECONDS
-            )
+            digest = self.session_digest(token)
+            if remember_session:
+                self._remembered_admin_sessions[digest] = time.time() + REMEMBERED_ADMIN_SESSION_SECONDS
+                try:
+                    self.save_web_state()
+                except Exception:
+                    self._remembered_admin_sessions.pop(digest, None)
+                    raise
+            else:
+                self._admin_sessions[digest] = time.monotonic() + ADMIN_SESSION_SECONDS
         return token
 
     def admin_session_is_valid(self, token: str) -> bool:
@@ -1559,13 +1687,22 @@ class JobManager(EditorManagerMixin):
             return False
         with self._lock:
             self.purge_expired_admin_sessions()
-            return self.session_digest(token) in self._admin_sessions
+            digest = self.session_digest(token)
+            return digest in self._admin_sessions or digest in self._remembered_admin_sessions
 
     def revoke_admin_session(self, token: str) -> None:
         if not token:
             return
         with self._lock:
             self._admin_sessions.pop(self.session_digest(token), None)
+            digest = self.session_digest(token)
+            expiry = self._remembered_admin_sessions.pop(digest, None)
+            if expiry is not None:
+                try:
+                    self.save_web_state()
+                except Exception:
+                    self._remembered_admin_sessions[digest] = expiry
+                    raise
 
     def admin_login_retry_after(self, client_key: str) -> int:
         now = time.monotonic()
@@ -1613,10 +1750,13 @@ class JobManager(EditorManagerMixin):
             if self._password_hash != previous_hash:
                 raise ValueError("Admin password changed during this request; try again.")
             self._password_hash = new_hash
+            previous_sessions = self._remembered_admin_sessions
+            self._remembered_admin_sessions = {}
             try:
                 self.save_web_state()
             except Exception:
                 self._password_hash = previous_hash
+                self._remembered_admin_sessions = previous_sessions
                 raise
             self._admin_sessions.clear()
         return self.create_admin_session()
@@ -1625,7 +1765,7 @@ class JobManager(EditorManagerMixin):
         with self._lock:
             return tuple(sorted(self._categories, key=str.casefold))
 
-    def create_category(self, category: str) -> str:
+    def create_category(self, category: str, is_series: bool = False) -> str:
         category = category.strip()
         if not CATEGORY_PATTERN.fullmatch(category):
             raise HTTPException(
@@ -1641,9 +1781,12 @@ class JobManager(EditorManagerMixin):
             path.mkdir(parents=True)
             self._categories.add(category)
             try:
+                if is_series:
+                    self.initialize_series(category)
                 self.save_web_state()
             except Exception:
                 self._categories.remove(category)
+                (path / SERIES_FILENAME).unlink(missing_ok=True)
                 path.rmdir()
                 raise
         return category
@@ -1664,10 +1807,18 @@ class JobManager(EditorManagerMixin):
                 for existing in self._categories
             ):
                 raise HTTPException(status_code=409, detail="That category already exists.")
-            if any(code == category for code, _job_id in self._active_processes):
+            if any(code == category for code, _job_id in self._active_processes) or any(
+                code == category for code, _job_id in self._starting_jobs
+            ):
                 raise HTTPException(status_code=409, detail="Stop active jobs before renaming this category.")
             if any(code == category for code, _job_id in self._queued_jobs):
                 raise HTTPException(status_code=409, detail="Wait for queued jobs before renaming this category.")
+            if self.category_export_status(category).get("status") == "generating" or any(
+                item.get("status") == "generating"
+                for job_id in self.iter_job_ids(category)
+                for item in self.load_export_state(category, job_id)["variants"].values()
+            ):
+                raise HTTPException(status_code=409, detail="Wait for CBZ exports before renaming this category.")
 
             source_path = self.category_dir(category)
             target_path = self.category_dir(new_category)
@@ -1720,7 +1871,9 @@ class JobManager(EditorManagerMixin):
             )
         trash_path: Path | None = None
         with self._lock:
-            if any(code == category for code, _job_id in self._active_processes):
+            if any(code == category for code, _job_id in self._active_processes) or any(
+                code == category for code, _job_id in self._starting_jobs
+            ):
                 raise HTTPException(status_code=409, detail="Stop active jobs before deleting this category.")
             if any(code == category for code, _job_id in self._queued_jobs):
                 raise HTTPException(status_code=409, detail="Stop queued jobs before deleting this category.")
@@ -1966,6 +2119,7 @@ class JobManager(EditorManagerMixin):
                     "category": category,
                     "url": f"/category/{category}",
                     "jobCount": len(self.iter_job_ids(category)),
+                    "isSeries": self.is_series(category),
                 }
                 for category in self.categories()
             ]
@@ -1979,7 +2133,8 @@ class JobManager(EditorManagerMixin):
             }
 
     def validate_category(self, code: str) -> str:
-        code = code.strip()
+        if code != code.strip():
+            raise HTTPException(status_code=404, detail="Unknown job category.")
         with self._lock:
             exists = code in self._categories
         if not exists:
@@ -2043,7 +2198,7 @@ class JobManager(EditorManagerMixin):
         model = data.get("vlmModel")
         if isinstance(model, str):
             try:
-                normalized["vlmModel"] = validate_vlm_model(model)
+                normalized["vlmModel"] = validate_vlm_model(model) if model.strip() else ""
             except ValueError:
                 pass
         for key in (
@@ -2155,6 +2310,28 @@ class JobManager(EditorManagerMixin):
     def job_secrets_path(self, code: str, job_id: str) -> Path:
         return self.job_dir(code, job_id) / JOB_SECRETS_FILENAME
 
+    def load_vlm_tokens(self) -> dict[str, str]:
+        path = self.config.jobs_dir / VLM_SECRETS_FILENAME
+        if not path.exists():
+            return {}
+        data = web_security.read_json_object(path)
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in data.items()):
+            raise ValueError("Saved VLM tokens must map endpoint URLs to strings.")
+        return data
+
+    def saved_vlm_token(self, endpoint: str) -> str | None:
+        return self.load_vlm_tokens().get(endpoint.rstrip("/"))
+
+    def remember_vlm_token(self, endpoint: str, token: str | None) -> None:
+        with self._lock:
+            tokens = self.load_vlm_tokens()
+            key = endpoint.rstrip("/")
+            if token is None:
+                tokens.pop(key, None)
+            else:
+                tokens[key] = token
+            write_json_atomic(self.config.jobs_dir / VLM_SECRETS_FILENAME, tokens, mode=0o600)
+
     def load_job_secrets(self, code: str, job_id: str) -> dict[str, str]:
         path = self.job_secrets_path(code, job_id)
         if not path.is_file():
@@ -2185,6 +2362,14 @@ class JobManager(EditorManagerMixin):
         preserve_existing: bool = True,
     ) -> None:
         secrets = self.load_job_secrets(code, job_id) if preserve_existing else {}
+        status = self.load_status(code, job_id) or {}
+        endpoint = self.status_vlm_base_url(status)
+        if clear_vlm_auth_token:
+            self.remember_vlm_token(endpoint, None)
+        elif vlm_auth_token is not None:
+            self.remember_vlm_token(endpoint, vlm_auth_token)
+        elif not secrets.get("vlmAuthToken"):
+            vlm_auth_token = self.saved_vlm_token(endpoint)
         for key, token, clear in (
             ("vlmAuthToken", vlm_auth_token, clear_vlm_auth_token),
             (
@@ -2332,11 +2517,6 @@ class JobManager(EditorManagerMixin):
             downloads[variant] = info
         return downloads
 
-    def invalidate_translated_cbz_archives(self, code: str, job_id: str) -> None:
-        """Remove archives whose rendered page inputs are no longer current."""
-        for variant in TRANSLATED_CBZ_FILENAMES:
-            self.translated_cbz_variant_path(code, job_id, variant).unlink(missing_ok=True)
-
     def iter_job_ids(self, code: str) -> list[str]:
         jobs_path = self.jobs_dir(code)
         if not jobs_path.is_dir():
@@ -2393,40 +2573,16 @@ class JobManager(EditorManagerMixin):
     def pending_resume_target_for_status(self, status: dict[str, Any]) -> tuple[str, int] | None:
         return stored_resume_target(status.get("pendingResumeFrom"), status.get("pendingResumePage"))
 
-    def apply_pending_resume_target(
-        self,
-        status: dict[str, Any],
-        target: tuple[str, int] | None,
-    ) -> None:
+    def apply_pending_resume_target(self, status: dict[str, Any], target: tuple[str, int] | None) -> None:
         if target is None:
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             return
-
         resume_from, resume_page = target
         status["pendingResumeFrom"] = resume_from
         status["pendingResumePage"] = resume_page
         status["lastResumeFrom"] = resume_from
         status["lastResumePage"] = resume_page
-        if resume_from == "package":
-            status["pendingPackageOnly"] = True
-            status["pendingWebpQuality"] = quality_for_display(
-                status.get("webpQuality"),
-                self.config.default_webp_quality,
-            )
-            status["pendingJxlQuality"] = quality_for_display(
-                status.get("jxlQuality"),
-                self.config.default_jxl_quality,
-            )
-        else:
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
 
     def load_status(self, code: str, job_id: str) -> dict[str, Any] | None:
         path = self.status_path(code, job_id)
@@ -2491,7 +2647,7 @@ class JobManager(EditorManagerMixin):
         config = replace(
             pipeline.vlm,
             base_url=endpoint,
-            api_key=auth_token or pipeline.vlm.api_key,
+            api_key=auth_token or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         return vlm_client.list_vlm_model_ids(config)
 
@@ -2568,14 +2724,17 @@ class JobManager(EditorManagerMixin):
         ocr_config: translate_cbz.OCRConfig,
         status: dict[str, Any],
     ) -> translate_cbz.OCRConfig:
+        endpoint = self.status_paddleocr_vl_server_url(status)
+        key = ocr_config.paddleocr_vl_api_key if endpoint.rstrip("/") == ocr_config.paddleocr_vl_server_url.rstrip("/") else None
         return replace(
             ocr_config,
             lang=translate_cbz.SOURCE_LANGUAGE_PROFILES[
                 self.status_source_language(status)
             ].ocr_lang,
             engine=self.status_ocr_engine(status),
-            paddleocr_vl_server_url=self.status_paddleocr_vl_server_url(status),
+            paddleocr_vl_server_url=endpoint,
             paddleocr_vl_model=self.status_paddleocr_vl_model(status),
+            paddleocr_vl_api_key=key,
         )
 
     def public_status(
@@ -2608,6 +2767,7 @@ class JobManager(EditorManagerMixin):
         )
         input_info = file_info(self.input_path(code, job_id))
         downloads = self.download_info(code, job_id)
+        exports = self.load_export_state(code, job_id)["variants"]
         original_page_count = len(self.original_page_files(code, job_id))
         final_page_count = (
             len(self.final_page_files(code, job_id))
@@ -2688,6 +2848,8 @@ class JobManager(EditorManagerMixin):
             "canTranslateTitle": status_value not in {"queued", "running"} and not is_active,
             "canRerunPages": status.get("status") == "complete",
             "canGenerateDownloads": status.get("status") == "complete",
+            "exports": exports,
+            "exportsRunning": any(item.get("status") == "generating" for item in exports.values()),
             "canEdit": status.get("status") == "complete" or ocr_review_checkpoint,
             "ocrReviewCheckpoint": ocr_review_checkpoint,
             "webpQuality": webp_quality,
@@ -2701,6 +2863,12 @@ class JobManager(EditorManagerMixin):
             "defaultVlmBaseUrl": self.config.default_vlm_base_url,
             "vlmModel": vlm_model,
             "defaultVlmModel": self.config.default_vlm_model,
+            "chapter": str(status.get("chapter") or ""),
+            "volume": str(status.get("volume") or ""),
+            "chapterLabel": chapter_label(status),
+            "isSeries": self.is_series(code),
+            "seriesNotesWarning": str(status.get("seriesNotesWarning") or ""),
+            "seriesContextSaved": bool(status.get("seriesContextSaved")),
             "autoTranslateComicInfoTitle": bool(
                 status.get(
                     "autoTranslateComicInfoTitle",
@@ -2711,6 +2879,8 @@ class JobManager(EditorManagerMixin):
             "cbzTitleMode": str(status.get("cbzTitleMode") or CBZ_TITLE_MODE_ORIGINAL),
             "cbzAltTitleInNotes": bool(status.get("cbzAltTitleInNotes")),
             "titleTranslationWarning": str(status.get("titleTranslationWarning") or ""),
+            "titleTranslationAttempted": bool(status.get("titleTranslationAttempted")),
+            "titleTranslationSkipped": bool(status.get("titleTranslationSkipped")),
             "pauseAfterOcr": pause_after_ocr,
             "proofreadTranslations": proofread_translations,
             "writeTranslationNotes": write_translation_notes,
@@ -2738,7 +2908,8 @@ class JobManager(EditorManagerMixin):
             "hasGeneratedTranslationNotes": bool(generated_translation_notes),
             "canUpdateAdvancedOptions": (
                 not is_active
-                and status_value not in {"queued", "running", "terminating"}
+                and (code, job_id) not in self._starting_jobs
+                and status_value in {"queued", "failed", "cancelled", "paused", "complete"}
             ),
             "restartResumeFrom": restart_target[0] if restart_target is not None else None,
             "restartResumePage": restart_target[1] if restart_target is not None else None,
@@ -2757,14 +2928,17 @@ class JobManager(EditorManagerMixin):
                 jobs.append(self.public_status(code, job_id, include_log=False))
             except HTTPException:
                 continue
-        jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+        jobs.sort(key=chapter_key if self.is_series(code) else lambda item: str(item.get("createdAt") or ""), reverse=True)
         return {
             "category": code,
             "jobs": jobs,
+            "series": self.get_series(code) if self.is_series(code) else None,
+            "seriesExport": self.public_category_export_status(code),
             "translationNotes": options["translationNotes"],
             "defaultThinkingBudgetTokens": options["thinkingBudgetTokens"],
             "defaultVlmBaseUrl": options["vlmBaseUrl"],
             "defaultVlmModel": options["vlmModel"],
+            "hasVlmAuthToken": bool(self.saved_vlm_token(options["vlmBaseUrl"])),
             "autoTranslateComicInfoTitle": options["autoTranslateComicInfoTitle"],
             "pauseAfterOcr": options["pauseAfterOcr"],
             "proofreadTranslations": options["proofreadTranslations"],
@@ -2848,6 +3022,8 @@ class JobManager(EditorManagerMixin):
                     self.apply_pending_resume_target(status, resume_target)
                 self.save_status(code, job_id, status)
                 self.enqueue(code, job_id)
+        self.recover_series_notes()
+        self.enqueue_ready_series_jobs()
         if saw_paused_job:
             with self._pause_condition:
                 self._paused = True
@@ -2855,7 +3031,13 @@ class JobManager(EditorManagerMixin):
     def enqueue(self, code: str, job_id: str) -> None:
         key = (code, job_id)
         with self._lock:
-            if key in self._queued_jobs:
+            if key in self._queued_jobs or key in self._starting_jobs or key in self._active_processes:
+                return
+            status = self.load_status(code, job_id) or {}
+            reason = self.series_wait_reason(code, status)
+            if reason:
+                status.update(phase="Waiting for series", message=reason)
+                self.save_status(code, job_id, status)
                 return
             self._queued_jobs.add(key)
             self._queue.put(key)
@@ -2883,8 +3065,14 @@ class JobManager(EditorManagerMixin):
         vlm_auth_token: str | None = None,
         paddleocr_vl_auth_token: str | None = None,
         auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+        chapter: str = "",
+        volume: str = "",
+        enqueue_job: bool = True,
     ) -> None:
         created_at = now_utc()
+        chapter, volume = self.validate_series_chapter(code, chapter, volume, job_id)
+        if self.is_series(code):
+            write_translation_notes = True
         if thinking_budget_tokens is None:
             thinking_budget_tokens = self.config.default_thinking_budget_tokens
         thinking_budget_tokens = validate_thinking_budget_tokens(thinking_budget_tokens)
@@ -2913,6 +3101,8 @@ class JobManager(EditorManagerMixin):
         status = {
             "category": code,
             "jobId": job_id,
+            "chapter": chapter,
+            "volume": volume,
             "status": "queued",
             "phase": "Queued",
             "page": None,
@@ -2968,7 +3158,8 @@ class JobManager(EditorManagerMixin):
             imagemagick_workers=imagemagick_workers,
             auto_translate_comicinfo_title=auto_translate_comicinfo_title,
         )
-        self.enqueue(code, job_id)
+        if enqueue_job:
+            self.enqueue(code, job_id)
 
     def update_job_advanced_options(
         self,
@@ -2993,6 +3184,7 @@ class JobManager(EditorManagerMixin):
         clear_vlm_auth_token: bool,
         clear_paddleocr_vl_auth_token: bool,
         auto_translate_comicinfo_title: bool = DEFAULT_AUTO_TRANSLATE_COMICINFO_TITLE,
+        remember_defaults: bool = True,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
@@ -3001,7 +3193,7 @@ class JobManager(EditorManagerMixin):
             vlm_base_url,
             self.config.default_vlm_base_url,
         )
-        vlm_model = validate_vlm_model(vlm_model)
+        vlm_model = validate_vlm_model(vlm_model) if vlm_model.strip() else ""
         source_language = translate_cbz.normalize_source_language(source_language)
         ocr_engine = paddle_ocr_image.normalize_ocr_engine(ocr_engine)
         ocr_page_workers = translate_cbz.normalize_page_workers(ocr_page_workers, "OCR workers")
@@ -3013,7 +3205,8 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if (code, job_id) in self._active_processes or status.get("status") not in {
+            if (code, job_id) in self._active_processes or (code, job_id) in self._starting_jobs or status.get("status") not in {
+                "queued",
                 "failed",
                 "cancelled",
                 "paused",
@@ -3021,15 +3214,22 @@ class JobManager(EditorManagerMixin):
             }:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only completed, failed, cancelled, or paused jobs can update advanced options.",
+                    detail="Cannot change advanced options while the job is starting or running.",
                 )
+            if self.status_vlm_base_url(status).rstrip("/") != vlm_base_url.rstrip("/"):
+                # A job's saved key belongs to its previous endpoint.
+                job_secrets = self.load_job_secrets(code, job_id)
+                job_secrets.pop("vlmAuthToken", None)
+                write_json_atomic(self.job_secrets_path(code, job_id), job_secrets, mode=0o600)
+            if self.status_paddleocr_vl_server_url(status).rstrip("/") != paddleocr_vl_server_url.rstrip("/"):
+                clear_paddleocr_vl_auth_token = not paddleocr_vl_auth_token
             status["thinkingBudgetTokens"] = thinking_budget_tokens
             status["vlmBaseUrl"] = vlm_base_url
             status["vlmModel"] = vlm_model
             status["autoTranslateComicInfoTitle"] = bool(auto_translate_comicinfo_title)
             status["pauseAfterOcr"] = bool(pause_after_ocr)
             status["proofreadTranslations"] = bool(proofread_translations)
-            status["writeTranslationNotes"] = bool(write_translation_notes)
+            status["writeTranslationNotes"] = bool(write_translation_notes or self.is_series(code))
             status["altPlacementEnabled"] = bool(alt_placement_enabled)
             status["sourceLanguage"] = source_language
             status["ocrEngine"] = ocr_engine
@@ -3038,7 +3238,8 @@ class JobManager(EditorManagerMixin):
             status["ocrPageWorkers"] = ocr_page_workers
             status["lamaWorkers"] = lama_workers
             status["imagemagickWorkers"] = imagemagick_workers
-            status["message"] = "Advanced options updated."
+            if status.get("status") != "queued":
+                status["message"] = "Advanced options updated."
             self.save_status(code, job_id, status)
             self.update_job_auth_tokens(
                 code,
@@ -3048,24 +3249,53 @@ class JobManager(EditorManagerMixin):
                 clear_vlm_auth_token=clear_vlm_auth_token,
                 clear_paddleocr_vl_auth_token=clear_paddleocr_vl_auth_token,
             )
-            self.remember_category_advanced_options(
-                code,
-                thinking_budget_tokens=thinking_budget_tokens,
-                vlm_base_url=vlm_base_url,
-                vlm_model=vlm_model,
-                pause_after_ocr=pause_after_ocr,
-                proofread_translations=proofread_translations,
-                write_translation_notes=write_translation_notes,
-                alt_placement_enabled=alt_placement_enabled,
-                source_language=source_language,
-                ocr_engine=ocr_engine,
-                paddleocr_vl_server_url=paddleocr_vl_server_url,
-                paddleocr_vl_model=paddleocr_vl_model,
-                ocr_page_workers=ocr_page_workers,
-                lama_workers=lama_workers,
-                imagemagick_workers=imagemagick_workers,
-                auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+            if remember_defaults:
+                self.remember_category_advanced_options(
+                    code,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    vlm_base_url=vlm_base_url,
+                    vlm_model=vlm_model,
+                    pause_after_ocr=pause_after_ocr,
+                    proofread_translations=proofread_translations,
+                    write_translation_notes=write_translation_notes,
+                    alt_placement_enabled=alt_placement_enabled,
+                    source_language=source_language,
+                    ocr_engine=ocr_engine,
+                    paddleocr_vl_server_url=paddleocr_vl_server_url,
+                    paddleocr_vl_model=paddleocr_vl_model,
+                    ocr_page_workers=ocr_page_workers,
+                    lama_workers=lama_workers,
+                    imagemagick_workers=imagemagick_workers,
+                    auto_translate_comicinfo_title=auto_translate_comicinfo_title,
+                )
+
+    def use_category_options_for_job(self, code: str, job_id: str) -> None:
+        code = self.validate_category(code)
+        with self._lock:
+            options = resolve_control_settings(self, code, {}, require_model=False)
+            self.update_job_advanced_options(
+                code, job_id, **options,
+                clear_vlm_auth_token=False, clear_paddleocr_vl_auth_token=False,
+                remember_defaults=False,
             )
+
+    def apply_category_options_to_queue(self, code: str) -> list[str]:
+        code = self.validate_category(code)
+        with self._lock:
+            options = resolve_control_settings(self, code, {}, require_model=False)
+            updated = []
+            for job_id in self.iter_job_ids(code):
+                status = self.load_status(code, job_id)
+                key = (code, job_id)
+                if not status or status.get("status") != "queued" or key in self._starting_jobs or key in self._active_processes:
+                    continue
+                self.update_job_advanced_options(
+                    code, job_id, **options,
+                    clear_vlm_auth_token=False, clear_paddleocr_vl_auth_token=False,
+                    remember_defaults=False,
+                )
+                updated.append(job_id)
+            return updated
 
     def restart_failed_job(self, code: str, job_id: str) -> None:
         code = self.validate_category(code)
@@ -3074,7 +3304,7 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if (code, job_id) in self._active_processes:
+            if (code, job_id) in self._active_processes or (code, job_id) in self._starting_jobs:
                 raise HTTPException(status_code=409, detail="Job is already running or paused.")
             if status.get("status") in {"queued", "running"}:
                 raise HTTPException(status_code=409, detail="Job is already queued or running.")
@@ -3085,7 +3315,8 @@ class JobManager(EditorManagerMixin):
                 )
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
-            self.required_status_vlm_model(status)
+            if not status.get("pendingFinishEdits"):
+                self.required_status_vlm_model(status)
 
             pending_reruns = status.get("pendingPageReruns")
             first_pending = (
@@ -3142,30 +3373,9 @@ class JobManager(EditorManagerMixin):
             if restart_target is not None:
                 status["pendingResumeFrom"] = restart_target[0]
                 status["pendingResumePage"] = restart_target[1]
-                if restart_target[0] == "package":
-                    status["pendingPackageOnly"] = True
-                    if status.get("pendingPackageVariant") not in TRANSLATED_CBZ_FILENAMES:
-                        status["pendingPackageVariant"] = "png"
-                    status["pendingWebpQuality"] = quality_for_display(
-                        status.get("webpQuality"),
-                        self.config.default_webp_quality,
-                    )
-                    status["pendingJxlQuality"] = quality_for_display(
-                        status.get("jxlQuality"),
-                        self.config.default_jxl_quality,
-                    )
-                else:
-                    status.pop("pendingPackageOnly", None)
-                    status.pop("pendingPackageVariant", None)
-                    status.pop("pendingWebpQuality", None)
-                    status.pop("pendingJxlQuality", None)
             else:
                 status.pop("pendingResumeFrom", None)
                 status.pop("pendingResumePage", None)
-                status.pop("pendingPackageOnly", None)
-                status.pop("pendingPackageVariant", None)
-                status.pop("pendingWebpQuality", None)
-                status.pop("pendingJxlQuality", None)
             self.save_status(code, job_id, status)
             self.enqueue(code, job_id)
 
@@ -3177,10 +3387,13 @@ class JobManager(EditorManagerMixin):
         resume_from: str = "ocr_raw",
         translation_boxno: int | None = None,
         page_resume_from: dict[int, str] | None = None,
+        editor_stage_only: str | None = None,
     ) -> None:
         code = self.validate_category(code)
         job_id = self.validate_job_id(job_id)
         resume_from = RERUN_STAGE_MAP.get(resume_from, resume_from)
+        if editor_stage_only not in {None, "ocr", "text", "placement"}:
+            raise HTTPException(400, "Unknown editor stage.")
         if resume_from not in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             raise HTTPException(status_code=400, detail="Unsupported rerun stage.")
         if translation_boxno is not None:
@@ -3203,11 +3416,12 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=409, detail="Job is already queued or running.")
             if status.get("status") != "complete":
                 raise HTTPException(status_code=400, detail="Only complete jobs can rerun pages.")
+            if (code, job_id) in self._starting_jobs or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the current job task to finish before regenerating.")
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
                 raise HTTPException(status_code=400, detail="Existing output directory is missing.")
-            self.required_status_vlm_model(status)
 
             page_count = len(self.original_page_files(code, job_id))
             if page_count <= 0:
@@ -3246,6 +3460,14 @@ class JobManager(EditorManagerMixin):
                         detail=f"Unsupported rerun stage for page {page}: {page_stage}.",
                     )
                 page_reruns.append({"page": page, "resumeFrom": page_stage})
+                if editor_stage_only:
+                    page_reruns[-1]["editorStageOnly"] = editor_stage_only
+                    last = "ocr" if editor_stage_only == "ocr" else "translation"
+                    manifest = self.load_editor_v2_manifest(code, job_id)
+                    previous_base = manifest.get("pages", {}).get(str(page), {}).get("pendingBases", {}).get(last)
+                    page_reruns[-1]["editorStageBase"] = previous_base or self.editor_v2_snapshot(code, job_id, manifest, page, (last,))[last]
+            if editor_stage_only != "ocr" and any(item["resumeFrom"] != "render" for item in page_reruns):
+                self.required_status_vlm_model(status)
             first_rerun = page_reruns[0]
 
             if self.has_editor_v2(code, job_id):
@@ -3281,11 +3503,7 @@ class JobManager(EditorManagerMixin):
                     "lastResumePage": first_rerun["page"],
                 }
             )
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             status.pop("pid", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
             if translation_boxno is None:
                 status.pop("pendingTranslationBoxno", None)
             else:
@@ -3347,81 +3565,6 @@ class JobManager(EditorManagerMixin):
             daemon=True,
         ).start()
 
-    def generate_download(
-        self,
-        code: str,
-        job_id: str,
-        variant: str,
-        *,
-        title_mode: str = CBZ_TITLE_MODE_ORIGINAL,
-        alt_title_in_notes: bool = False,
-        regenerate: bool = False,
-    ) -> None:
-        code = self.validate_category(code)
-        job_id = self.validate_job_id(job_id)
-        if variant not in TRANSLATED_CBZ_FILENAMES:
-            raise HTTPException(status_code=404, detail="Unknown translated CBZ variant.")
-        with self._lock:
-            status = self.load_status(code, job_id)
-            if status is None:
-                raise HTTPException(status_code=404, detail="Unknown job.")
-            if status.get("status") in {"queued", "running"}:
-                raise HTTPException(status_code=409, detail="Job is already queued or running.")
-            if status.get("status") != "complete":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Only complete jobs can generate downloads.",
-                )
-            if not self.input_path(code, job_id).is_file():
-                raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
-            if not self.output_dir(code, job_id).is_dir():
-                raise HTTPException(status_code=400, detail="Existing output directory is missing.")
-            if title_mode not in CBZ_TITLE_MODES:
-                raise HTTPException(status_code=400, detail="Unknown CBZ title mode.")
-            if (
-                self.translated_cbz_variant_path(code, job_id, variant).is_file()
-                and not regenerate
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="That CBZ already exists. Use the regenerate action to replace it.",
-                )
-
-            try:
-                package_count = int(status.get("packageGenerationCount", 0)) + 1
-            except (TypeError, ValueError):
-                package_count = 1
-            status.update(
-                {
-                    "status": "queued",
-                    "phase": "Queued",
-                    "page": None,
-                    "message": (
-                        f"Queued to generate {variant.upper()} CBZ download."
-                    ),
-                    "finishedAt": None,
-                    "returnCode": None,
-                    "packageGenerationCount": package_count,
-                    "pendingPackageOnly": True,
-                    "pendingPackageVariant": variant,
-                    "pendingWebpQuality": quality_for_display(
-                        status.get("webpQuality"), self.config.default_webp_quality
-                    ),
-                    "pendingJxlQuality": quality_for_display(
-                        status.get("jxlQuality"), self.config.default_jxl_quality
-                    ),
-                    "pendingResumeFrom": "package",
-                    "pendingResumePage": 0,
-                    "lastResumeFrom": "package",
-                    "lastResumePage": 0,
-                    "cbzTitleMode": title_mode,
-                    "cbzAltTitleInNotes": bool(alt_title_in_notes),
-                }
-            )
-            status.pop("pid", None)
-            status.pop("pendingPageReruns", None)
-        self.save_status(code, job_id, status)
-        self.enqueue(code, job_id)
 
     def request_vlm_title(
         self,
@@ -3432,10 +3575,11 @@ class JobManager(EditorManagerMixin):
         instructions: str = "",
         allow_refusal: bool = False,
     ) -> tuple[str, bool]:
-        status = self.load_status(code, job_id) or {}
-        model = self.required_status_vlm_model(status)
-        endpoint = self.status_vlm_base_url(status)
-        secrets = self.load_job_secrets(code, job_id)
+        with self._lock:
+            status = self.load_status(code, job_id) or {}
+            model = self.required_status_vlm_model(status)
+            endpoint = self.status_vlm_base_url(status)
+            secrets = self.load_job_secrets(code, job_id)
         pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
         if pipeline.vlm is None:
             raise HTTPException(status_code=400, detail="VLM configuration is unavailable.")
@@ -3443,7 +3587,7 @@ class JobManager(EditorManagerMixin):
             pipeline.vlm,
             base_url=endpoint,
             model=model,
-            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+            api_key=secrets.get("vlmAuthToken") or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         if allow_refusal:
             prompt = (
@@ -3562,7 +3706,6 @@ class JobManager(EditorManagerMixin):
                         translated = ""
                     else:
                         status["translatedJobName"] = safe_job_name(translated, source_title)
-                    self.save_status(code, job_id, status)
                 except Exception as exc:
                     warning = f"Could not generate the translated title; using the original title: {exc}"
 
@@ -3586,6 +3729,8 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
+            if (code, job_id) in self._starting_jobs or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the current job task to finish before deleting.")
             if status.get("status") in {"queued", "running", "paused", "terminating"}:
                 raise HTTPException(status_code=409, detail="Job is queued or running.")
             if status.get("status") not in TERMINAL_JOB_STATUSES:
@@ -3602,6 +3747,7 @@ class JobManager(EditorManagerMixin):
                     status_code=500,
                     detail="Could not delete job.",
                 ) from exc
+            self.enqueue_ready_series_jobs()
 
     def rename_job(self, code: str, job_id: str, name: str) -> str:
         code = self.validate_category(code)
@@ -3613,6 +3759,8 @@ class JobManager(EditorManagerMixin):
                 raise HTTPException(status_code=404, detail="Unknown job.")
             if status.get("status") in {"queued", "running"} or (code, job_id) in self._active_processes:
                 raise HTTPException(status_code=409, detail="Wait for the job to stop before renaming it.")
+            if status.get("jobName") != name:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["jobName"] = name
             self.save_status(code, job_id, status)
         return name
@@ -3631,6 +3779,8 @@ class JobManager(EditorManagerMixin):
                     status_code=409,
                     detail="Wait for the job to stop before changing its title.",
                 )
+            if (status.get("translatedJobName") or "") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             if translated:
                 status["translatedJobName"] = translated
                 status["titleTranslationAttempted"] = True
@@ -3662,7 +3812,7 @@ class JobManager(EditorManagerMixin):
             pipeline.vlm,
             base_url=endpoint,
             model=model,
-            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+            api_key=secrets.get("vlmAuthToken") or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         prompt = (
             "Translate this manga or comic title into natural English. "
@@ -3691,6 +3841,8 @@ class JobManager(EditorManagerMixin):
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
+            if status.get("translatedJobName") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["translatedJobName"] = translated
             status.pop("titleTranslationSkipped", None)
             status.pop("titleTranslationWarning", None)
@@ -3724,6 +3876,8 @@ class JobManager(EditorManagerMixin):
 
             if manual_title:
                 translated = validate_job_name(manual_title)
+                if status.get("translatedJobName") != translated:
+                    self.invalidate_translated_cbz_archives(code, job_id)
                 status["titleTranslationAttempted"] = True
                 status.pop("titleTranslationSkipped", None)
                 status["translatedJobName"] = translated
@@ -3762,6 +3916,8 @@ class JobManager(EditorManagerMixin):
                 self.save_status(code, job_id, status)
                 return None
             translated = safe_job_name(translated, source_title)
+            if status.get("translatedJobName") != translated:
+                self.invalidate_translated_cbz_archives(code, job_id)
             status["translatedJobName"] = translated
             status.pop("titleTranslationWarning", None)
             self.save_status(code, job_id, status)
@@ -3777,8 +3933,6 @@ class JobManager(EditorManagerMixin):
             if not self.wait_until_unpaused():
                 self._queue.task_done()
                 return
-            with self._lock:
-                self._queued_jobs.discard(key)
             try:
                 self.run_job(code, job_id)
             except Exception as exc:
@@ -3786,27 +3940,12 @@ class JobManager(EditorManagerMixin):
                     f"error: unexpected web worker failure for {code}/{job_id}: {exc}",
                     file=sys.stderr,
                 )
-                try:
-                    status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
-                    finished_at = datetime.now(timezone.utc)
-                    stop_active_runtime(status, finished_at)
-                    status.update(
-                        {
-                            "status": "failed",
-                            "phase": "Failed",
-                            "message": f"Unexpected worker failure: {exc}",
-                            "finishedAt": finished_at.isoformat(),
-                        }
-                    )
-                    status.pop("pid", None)
-                    self.save_status(code, job_id, status)
-                except Exception as status_exc:
-                    print(
-                        f"error: could not persist worker failure for {code}/{job_id}: {status_exc}",
-                        file=sys.stderr,
-                    )
             finally:
                 self._queue.task_done()
+                try:
+                    self.enqueue_ready_series_jobs()
+                except Exception:
+                    LOGGER.exception("Could not schedule series chapters")
 
     def update_from_log_line(self, code: str, job_id: str, line: str) -> None:
         parsed = parse_progress_line(line)
@@ -3842,12 +3981,13 @@ class JobManager(EditorManagerMixin):
         resume_from: str | None = None,
         resume_page: int | None = None,
         single_page: bool = False,
-        skip_package: bool = False,
-        package_variant: str | None = None,
         webp_quality: int | None = None,
         jxl_quality: int | None = None,
         translation_boxno: int | None = None,
+        editor_stage_only: str | None = None,
     ) -> list[str]:
+        if resume_from == "package":
+            raise HTTPException(400, "CBZ exports run independently, not as pipeline jobs.")
         command = [
             sys.executable,
             str(self.config.translate_script),
@@ -3887,7 +4027,7 @@ class JobManager(EditorManagerMixin):
                 ),
             ]
         )
-        if resume_from in {"render", "package"}:
+        if resume_from == "render" or editor_stage_only == "ocr":
             model = self.status_vlm_model(status)
             if model:
                 command.extend(["--vlm-model", model])
@@ -3924,15 +4064,6 @@ class JobManager(EditorManagerMixin):
             command.extend(["--webp-quality", str(webp_quality)])
         if jxl_quality is not None:
             command.extend(["--jxl-quality", str(jxl_quality)])
-        if package_variant is not None:
-            if package_variant not in TRANSLATED_CBZ_FILENAMES:
-                raise HTTPException(status_code=400, detail="Unknown translated CBZ variant.")
-            command.extend(["--package-variant", package_variant])
-        if resume_from == "package" and status.get("pendingComicInfoTitle") is not None:
-            command.extend(["--comicinfo-title", str(status.get("pendingComicInfoTitle") or "")])
-            command.extend(
-                ["--comicinfo-alt-title", str(status.get("pendingComicInfoAltTitle") or "")]
-            )
         if resume_from is None:
             if self.status_pause_after_ocr(status):
                 command.extend(["--stop-after", "ocr_merged"])
@@ -3943,14 +4074,15 @@ class JobManager(EditorManagerMixin):
             return command
 
         command.extend(["--resume-from", resume_from])
-        if resume_from not in {"extract", "package"}:
+        if resume_from != "extract":
             command.extend(["--resume-page", str(resume_page or 0)])
         if single_page and resume_from in {"ocr_raw", "ocr_structured", "alt_placement", "translations", "placements", "render"}:
             command.append("--single-page")
+        if editor_stage_only:
+            command.extend(["--editor-stage-only", editor_stage_only])
         if translation_boxno is not None:
             command.extend(["--translation-boxno", str(translation_boxno)])
-        if skip_package or resume_from != "package":
-            command.append("--skip-package")
+        command.append("--skip-package")
         return command
 
     def run_pipeline_process(
@@ -3962,7 +4094,15 @@ class JobManager(EditorManagerMixin):
     ) -> int:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        secrets = self.load_job_secrets(code, job_id)
+        with self._lock:
+            status = self.load_status(code, job_id) or {}
+            secrets = self.load_job_secrets(code, job_id)
+        if self.status_paddleocr_vl_server_url(status).rstrip("/") != paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL.rstrip("/"):
+            env.pop("TETOLATE_PADDLEOCR_VL_API_KEY", None)
+        if env.get("TETOLATE_VLM_API_KEY"):
+            pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+            if pipeline.vlm is None or self.status_vlm_base_url(status).rstrip("/") != pipeline.vlm.base_url.rstrip("/"):
+                env.pop("TETOLATE_VLM_API_KEY", None)
         if secrets.get("vlmAuthToken"):
             env["TETOLATE_VLM_API_KEY"] = secrets["vlmAuthToken"]
         if secrets.get("paddleocrVlAuthToken"):
@@ -4033,132 +4173,6 @@ class JobManager(EditorManagerMixin):
 
         return return_code
 
-    def run_package_generation_job(
-        self,
-        code: str,
-        job_id: str,
-        status: dict[str, Any],
-    ) -> None:
-        variant = str(status.get("pendingPackageVariant") or "")
-        if variant not in TRANSLATED_CBZ_FILENAMES:
-            status.update(
-                {
-                    "status": "failed",
-                    "phase": "Failed",
-                    "message": "No valid CBZ variant was selected for generation.",
-                    "finishedAt": now_utc(),
-                }
-            )
-            self.save_status(code, job_id, status)
-            return
-        webp_quality = quality_for_display(
-            status.get("pendingWebpQuality"),
-            self.config.default_webp_quality,
-        )
-        jxl_quality = quality_for_display(
-            status.get("pendingJxlQuality"),
-            self.config.default_jxl_quality,
-        )
-        selected_title, alt_title, title_warning = self.resolve_cbz_export_titles(
-            code,
-            job_id,
-            status,
-        )
-        if selected_title is not None:
-            status["pendingComicInfoTitle"] = selected_title
-            status["pendingComicInfoAltTitle"] = alt_title or ""
-        if title_warning:
-            status["titleTranslationWarning"] = title_warning
-        else:
-            status.pop("titleTranslationWarning", None)
-        start_active_runtime(status)
-        status.update(
-            {
-                "status": "running",
-                "phase": "Starting",
-                "page": None,
-                "message": (
-                    f"Generating {variant.upper()} CBZ download. {title_warning}"
-                    if title_warning
-                    else f"Generating {variant.upper()} CBZ download."
-                ),
-                "finishedAt": None,
-                "pendingResumeFrom": "package",
-                "pendingResumePage": 0,
-                "lastResumeFrom": "package",
-                "lastResumePage": 0,
-            }
-        )
-        self.save_status(code, job_id, status)
-
-        return_code = self.run_pipeline_process(
-            code,
-            job_id,
-            self.build_command(
-                code,
-                job_id,
-                "package",
-                0,
-                webp_quality=webp_quality,
-                jxl_quality=jxl_quality,
-                package_variant=variant,
-            ),
-            f"generate {variant} download",
-        )
-
-        status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
-        finished_at = datetime.now(timezone.utc)
-        stop_active_runtime(status, finished_at)
-        status["returnCode"] = return_code
-        status["finishedAt"] = finished_at.isoformat()
-        status["webpQuality"] = webp_quality
-        status["jxlQuality"] = jxl_quality
-        status.pop("pid", None)
-        status.pop("pendingTranslationBoxno", None)
-        was_terminated = bool(status.pop("pendingTermination", None))
-        status.pop("terminatingAt", None)
-        status.pop("isPaused", None)
-        status.pop("pausedAt", None)
-
-        if was_terminated:
-            status.update(
-                {
-                    "status": "cancelled",
-                    "phase": "Cancelled",
-                    "page": None,
-                    "message": "Download generation terminated.",
-                }
-            )
-        elif return_code == 0 and self.translated_cbz_variant_path(code, job_id, variant).is_file():
-            status.update(
-                {
-                    "status": "complete",
-                    "phase": "Complete",
-                    "page": None,
-                    "message": f"{variant.upper()} CBZ download generation complete.",
-                }
-            )
-            if title_warning:
-                status["message"] += f" Warning: {title_warning}"
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
-            status.pop("pendingResumeFrom", None)
-            status.pop("pendingResumePage", None)
-        else:
-            status.update(
-                {
-                    "status": "failed",
-                    "phase": "Failed",
-                    "message": f"Download generation failed with exit code {return_code}.",
-                }
-            )
-            status["pendingPackageOnly"] = True
-            status["pendingPackageVariant"] = variant
-            status["pendingResumeFrom"] = "package"
-            status["pendingResumePage"] = 0
-        self.save_status(code, job_id, status)
 
     def run_page_rerun_batch_job(
         self,
@@ -4189,6 +4203,10 @@ class JobManager(EditorManagerMixin):
             }:
                 continue
             page_reruns.append({"page": page, "resumeFrom": resume_from})
+            stage_only = item.get("editorStageOnly")
+            if stage_only in {"ocr", "text", "placement"}:
+                page_reruns[-1]["editorStageOnly"] = stage_only
+                page_reruns[-1]["editorStageBase"] = item.get("editorStageBase")
         if not page_reruns:
             status.update(
                 {
@@ -4236,7 +4254,6 @@ class JobManager(EditorManagerMixin):
                     "pendingPageReruns": page_reruns[index - 1 :],
                 }
             )
-            status.pop("pendingPackageOnly", None)
             self.save_status(code, job_id, status)
             final_return_code = self.run_pipeline_process(
                 code,
@@ -4247,8 +4264,8 @@ class JobManager(EditorManagerMixin):
                     resume_from,
                     page,
                     single_page=True,
-                    skip_package=True,
                     translation_boxno=translation_boxno,
+                    **({"editor_stage_only": page_rerun["editorStageOnly"]} if "editorStageOnly" in page_rerun else {}),
                 ),
                 f"rerun page {page}",
             )
@@ -4289,6 +4306,9 @@ class JobManager(EditorManagerMixin):
                 )
             else:
                 for page_rerun in page_reruns:
+                    if "editorStageOnly" in page_rerun:
+                        self.mark_editor_stage_complete(code, job_id, page_rerun["page"], page_rerun["editorStageOnly"], page_rerun.get("editorStageBase"))
+                        continue
                     self.clear_editor_changes_for_pages(
                         code,
                         job_id,
@@ -4321,13 +4341,9 @@ class JobManager(EditorManagerMixin):
             status.pop("pendingResumeFrom", None)
             status.pop("pendingResumePage", None)
             status.pop("pendingPageReruns", None)
-            status.pop("pendingPackageOnly", None)
-            status.pop("pendingPackageVariant", None)
-            status.pop("pendingWebpQuality", None)
-            status.pop("pendingJxlQuality", None)
             status.pop("pendingEditorChangedPages", None)
             status.pop("pendingTranslationBoxno", None)
-        elif not status.get("pendingPackageOnly"):
+        else:
             remaining_reruns = status.get("pendingPageReruns")
             if (
                 isinstance(remaining_reruns, list)
@@ -4343,19 +4359,56 @@ class JobManager(EditorManagerMixin):
         self.save_status(code, job_id, status)
 
     def run_job(self, code: str, job_id: str) -> None:
+        # Claim the job before reading its settings or making title-model calls.
+        # Queue edits use the same lock, so they cannot be lost during startup.
+        key = (code, job_id)
+        with self._lock:
+            self._starting_jobs.add(key)
+            self._queued_jobs.discard(key)
+        try:
+            self._run_job(code, job_id)
+        except Exception as exc:
+            # Keep the claim until failure status is saved too. A rename must
+            # not move the job between an exception and its status write.
+            try:
+                status = self.load_status(code, job_id) or {"category": code, "jobId": job_id}
+                finished_at = datetime.now(timezone.utc)
+                stop_active_runtime(status, finished_at)
+                status.update(status="failed", phase="Failed", message=f"Unexpected worker failure: {exc}",
+                              finishedAt=finished_at.isoformat())
+                status.pop("pid", None)
+                self.save_status(code, job_id, status)
+            except Exception as status_exc:
+                print(
+                    f"error: could not persist worker failure for {code}/{job_id}: {status_exc}",
+                    file=sys.stderr,
+                )
+            raise
+        finally:
+            with self._lock:
+                self._starting_jobs.discard(key)
+
+    def _run_job(self, code: str, job_id: str) -> None:
         status = self.load_status(code, job_id) or {
             "category": code,
             "jobId": job_id,
             "createdAt": now_utc(),
         }
-        if status.get("pendingPackageOnly"):
-            self.run_package_generation_job(code, job_id, status)
+        if status.get("pendingFinishEdits"):
+            self.run_finish_editor_edits(code, job_id)
             return
 
         pending_page_reruns = status.get("pendingPageReruns")
         if isinstance(pending_page_reruns, list) and pending_page_reruns:
             self.run_page_rerun_batch_job(code, job_id, status, pending_page_reruns)
             return
+
+        reason = self.series_wait_reason(code, status)
+        if reason:
+            status.update(phase="Waiting for series", message=reason)
+            self.save_status(code, job_id, status)
+            return
+        self.prepare_series_context(code, job_id, status)
 
         resume_from = status.get("pendingResumeFrom")
         resume_page = status.get("pendingResumePage")
@@ -4468,6 +4521,8 @@ class JobManager(EditorManagerMixin):
                 }
             )
         self.save_status(code, job_id, status)
+        if status.get("status") == "complete":
+            self.publish_series_notes(code, job_id)
 
 
 def manager_from_request(request: Request) -> JobManager:
@@ -4482,6 +4537,41 @@ def admin_is_authenticated(request: Request, manager: JobManager) -> bool:
     return manager.admin_session_is_valid(token)
 
 
+CONTROL_OPTION_FIELDS = {
+    "thinking_budget_tokens": "thinkingBudgetTokens", "vlm_base_url": "vlmBaseUrl",
+    "vlm_model": "vlmModel", "pause_after_ocr": "pauseAfterOcr",
+    "proofread_translations": "proofreadTranslations", "write_translation_notes": "writeTranslationNotes",
+    "alt_placement_enabled": "altPlacementEnabled", "source_language": "sourceLanguage",
+    "ocr_engine": "ocrEngine", "paddleocr_vl_server_url": "paddleocrVlServerUrl",
+    "paddleocr_vl_model": "paddleocrVlModel", "ocr_page_workers": "ocrPageWorkers",
+    "lama_workers": "lamaWorkers", "imagemagick_workers": "imagemagickWorkers",
+    "auto_translate_comicinfo_title": "autoTranslateComicInfoTitle",
+}
+
+
+def resolve_control_settings(manager: JobManager, code: str, data: dict[str, Any], job_id: str | None = None,
+                             *, require_model: bool = True) -> dict[str, Any]:
+    defaults = manager.load_category_advanced_options(code)
+    if job_id is not None:
+        defaults.update(manager.load_status(code, job_id) or {})
+    options = {key: data.get(key, defaults[field]) for key, field in CONTROL_OPTION_FIELDS.items()}
+    options["thinking_budget_tokens"] = parse_thinking_budget_form(
+        str(options["thinking_budget_tokens"]), manager.config.default_thinking_budget_tokens,
+    )
+    options["vlm_base_url"] = parse_vlm_base_url_form(options["vlm_base_url"], manager.config)
+    options["vlm_model"] = (parse_vlm_model_form(options["vlm_model"])
+                            if require_model or options["vlm_model"].strip() else "")
+    options["source_language"] = parse_source_language_form(options["source_language"], manager.config.default_source_language)
+    options["ocr_engine"] = parse_ocr_engine_form(options["ocr_engine"], manager.config.default_ocr_engine)
+    options["paddleocr_vl_server_url"] = parse_paddleocr_vl_server_url_form(options["paddleocr_vl_server_url"], manager.config)
+    options["paddleocr_vl_model"] = parse_optional_text_form(options["paddleocr_vl_model"], manager.config.default_paddleocr_vl_model)
+    for key, label in (("ocr_page_workers", "OCR workers"), ("lama_workers", "LaMa workers"), ("imagemagick_workers", "ImageMagick workers")):
+        options[key] = parse_page_workers_form(str(options[key]), label)
+    for key in ("vlm_auth_token", "paddleocr_vl_auth_token"):
+        options[key] = parse_auth_token_form(data.get(key, ""))
+    return options
+
+
 def require_admin(request: Request) -> JobManager:
     manager = manager_from_request(request)
     if not admin_is_authenticated(request, manager):
@@ -4493,11 +4583,12 @@ def set_admin_session_cookie(
     response: RedirectResponse,
     request: Request,
     token: str,
+    *, remember_session: bool = False,
 ) -> None:
     response.set_cookie(
         ADMIN_COOKIE_NAME,
         token,
-        max_age=ADMIN_SESSION_SECONDS,
+        max_age=REMEMBERED_ADMIN_SESSION_SECONDS if remember_session else None,
         httponly=True,
         secure=request.url.scheme == "https",
         samesite="strict",
@@ -4537,19 +4628,39 @@ def create_app(config_path: Path | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def require_admin_session(request: Request, call_next: Any) -> Any:
+        from web_control_api import error_response
         public_login = (
             request.url.path == "/admin" and request.method == "GET"
         ) or (
             request.url.path == "/admin/login" and request.method == "POST"
+        ) or (
+            request.url.path == "/api/v1/auth/login" and request.method == "POST"
         )
+        if request.url.path == "/api/v1/auth/login" and not mutation_request_is_same_origin(request):
+            return error_response(403, "Cross-origin mutation rejected.")
         if not public_login:
             manager = getattr(request.app.state, "manager", None)
             authenticated = isinstance(manager, JobManager) and admin_is_authenticated(
                 request,
                 manager,
             )
+            authorization = request.headers.get("authorization", "")
+            if request.url.path.startswith("/api/v1/") and authorization:
+                scheme, _, token = authorization.partition(" ")
+                record = manager.authenticate_control_token(token) if (
+                    isinstance(manager, JobManager) and scheme.lower() == "bearer" and len(token) <= 256
+                ) else None
+                if record is None:
+                    return error_response(401, "Invalid or revoked control token.")
+                self_revoke = request.method == "DELETE" and request.url.path == f'/api/v1/tokens/{record["id"]}'
+                if record["readOnly"] and request.method not in {"GET", "HEAD", "OPTIONS"} and not self_revoke:
+                    return error_response(403, "This control token is read-only.")
+                request.state.control_auth = record
+                authenticated = True
             if not authenticated:
                 if request.url.path.startswith("/api/"):
+                    if request.url.path.startswith("/api/v1/"):
+                        return error_response(401, "Control token or admin login required.")
                     return JSONResponse(
                         {"detail": "Admin login required."},
                         status_code=401,
@@ -4560,6 +4671,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 request
             ):
                 if request.url.path.startswith("/api/"):
+                    if request.url.path.startswith("/api/v1/"):
+                        return error_response(403, "Cross-origin mutation rejected.")
                     return JSONResponse(
                         {"detail": "Cross-origin mutation rejected."},
                         status_code=403,
@@ -4574,6 +4687,19 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         response.headers.setdefault("Cache-Control", "no-store")
         return response
 
+    @app.post("/admin/control-tokens")
+    async def create_control_token(request: Request, name: str = Form(...), read_only: str | None = Form(None)) -> HTMLResponse:
+        manager = require_admin(request)
+        record = manager.create_control_token(name, parse_checkbox(read_only))
+        from web_pages import base_page, escape
+        return base_page("Control token", f'<h1>Control token</h1><p>Copy this token now. It is only shown once.</p><pre>{escape(record["token"])}</pre><p><a href="/admin">Back to admin</a></p>')
+
+    @app.post("/admin/control-tokens/{token_id}/revoke")
+    async def revoke_control_token(request: Request, token_id: str) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.revoke_control_token(token_id)
+        return RedirectResponse("/admin", status_code=303)
+
     @app.get("/")
     async def index() -> RedirectResponse:
         return RedirectResponse("/admin", status_code=303)
@@ -4585,6 +4711,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             "api.js",
             "store.js",
             "canvas.js",
+            "preview.js",
             "screens.js",
             "editor.css",
         }
@@ -4601,7 +4728,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return admin_dashboard_page(manager, message)
 
     @app.post("/admin/login")
-    async def admin_login(request: Request, password: str = Form(...)) -> Any:
+    async def admin_login(request: Request, password: str = Form(...), remember_session: str | None = Form(None)) -> Any:
         manager = manager_from_request(request)
         client_key = request.client.host if request.client is not None else "unknown"
         retry_after = manager.admin_login_retry_after(client_key)
@@ -4612,13 +4739,14 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             response.status_code = 429
             response.headers["Retry-After"] = str(retry_after)
             return response
-        token = await run_in_threadpool(manager.authenticate_admin, password)
+        remember = parse_checkbox(remember_session)
+        token = await run_in_threadpool(manager.authenticate_admin, password, remember)
         if token is None:
             manager.record_admin_login_failure(client_key)
             return admin_login_page("Invalid password.")
         manager.clear_admin_login_failures(client_key)
         response = RedirectResponse("/admin", status_code=303)
-        set_admin_session_cookie(response, request, token)
+        set_admin_session_cookie(response, request, token, remember_session=remember)
         return response
 
     @app.post("/admin/logout")
@@ -4642,9 +4770,9 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return RedirectResponse("/admin", status_code=303)
 
     @app.post("/admin/categories")
-    async def create_category(request: Request, category: str = Form(...)) -> RedirectResponse:
+    async def create_category(request: Request, category: str = Form(...), is_series: str | None = Form(None)) -> RedirectResponse:
         manager = require_admin(request)
-        category = manager.create_category(category)
+        category = manager.create_category(category, parse_checkbox(is_series))
         return RedirectResponse(f"/category/{category}", status_code=303)
 
     @app.get("/admin/categories/{category}/delete", response_class=HTMLResponse)
@@ -4723,6 +4851,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         imagemagick_workers: str = Form("1"),
         vlm_auth_token: str = Form(""),
         paddleocr_vl_auth_token: str = Form(""),
+        chapter: str = Form(""),
+        volume: str = Form(""),
     ) -> Any:
         manager = manager_from_request(request)
         code = manager.validate_category(category)
@@ -4820,6 +4950,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 parse_auth_token_form(vlm_auth_token),
                 parse_auth_token_form(paddleocr_vl_auth_token),
                 auto_translate_comicinfo_title=parse_checkbox(auto_translate_comicinfo_title),
+                chapter=chapter,
+                volume=volume,
             )
         except Exception:
             try:
@@ -4831,6 +4963,41 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             raise
 
         return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/category/{code}/series")
+    async def update_series(
+        request: Request, code: str, name: str = Form(...),
+        instructions: str = Form(""), notes: str = Form(""), comic_info_xml: str = Form(""),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.update_series(code, name, instructions, notes, comic_info_xml)
+        return RedirectResponse(f"/category/{code}#series-settings", status_code=303)
+
+    @app.post("/job/{code}/{job_id}/chapter")
+    async def assign_chapter(
+        request: Request, code: str, job_id: str, chapter: str = Form(""), volume: str = Form(""),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.assign_job_chapter(code, job_id, chapter, volume)
+        return RedirectResponse(f"/job/{code}/{job_id}", status_code=303)
+
+    @app.post("/category/{code}/series/upload")
+    async def upload_series_chapters(
+        request: Request, code: str,
+        chapters: list[UploadFile] = File(...), first_chapter: str = Form("1"), volume: str = Form(""),
+    ) -> RedirectResponse:
+        manager = require_admin(request)
+        manager.get_series(code)
+        options = resolve_control_settings(manager, code, {}, require_model=True)
+        options["translation_notes"] = manager.load_category_advanced_options(code)["translationNotes"]
+        await submit_uploaded_series(manager, code, chapters, first_chapter, options, volume)
+        return RedirectResponse(f"/category/{code}", status_code=303)
+
+    @app.post("/category/{code}/exports")
+    async def export_category(request: Request, code: str, variant: str = Form("png"), grouping: str = Form("chapters")):
+        manager = require_admin(request)
+        manager.generate_category_export(code, variant, grouping)
+        return RedirectResponse(f"/category/{code}#series-settings", status_code=303)
 
     @app.get("/category/{code}", response_class=HTMLResponse)
     async def category_jobs(request: Request, code: str) -> HTMLResponse:
@@ -4929,70 +5096,42 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         endpoint_value = data.get("vlmBaseUrl")
         if not isinstance(endpoint_value, str):
             raise HTTPException(status_code=400, detail="vlmBaseUrl must be a string.")
-        try:
-            endpoint = validate_vlm_base_url(endpoint_value, "")
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
         token_value = data.get("vlmAuthToken", "")
         if not isinstance(token_value, str):
             raise HTTPException(status_code=400, detail="vlmAuthToken must be a string.")
-        supplied_token = parse_auth_token_form(token_value)
-
         category_value = data.get("category")
         job_id_value = data.get("jobId")
-        if category_value is None and job_id_value is not None:
-            raise HTTPException(
-                status_code=400,
-                detail="jobId requires category.",
-            )
-        saved_token: str | None = None
-        if category_value is not None:
-            if not isinstance(category_value, str):
-                raise HTTPException(
-                    status_code=400,
-                    detail="category must be a string.",
-                )
-            category = manager.validate_category(category_value)
-            if job_id_value is not None:
-                if not isinstance(job_id_value, str):
-                    raise HTTPException(status_code=400, detail="jobId must be a string.")
-                job_id = manager.validate_job_id(job_id_value)
-                if manager.load_status(category, job_id) is None:
-                    raise HTTPException(status_code=404, detail="Unknown job.")
-                if supplied_token is None:
-                    saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
+        for key, value in (("category", category_value), ("jobId", job_id_value)):
+            if value is not None and not isinstance(value, str):
+                raise HTTPException(400, f"{key} must be a string.")
+        return JSONResponse(await probe_vlm_connection(manager, endpoint_value, token_value,
+                                                        category_value, job_id_value))
 
-        if supplied_token is not None and category_value is not None and job_id_value is not None:
-            manager.update_job_auth_tokens(
-                category,
-                job_id,
-                vlm_auth_token=supplied_token,
-                paddleocr_vl_auth_token=None,
-            )
-
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/text-layout")
+    async def editor_v2_text_layout(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
         try:
-            models = await run_in_threadpool(
-                manager.probe_vlm_models,
-                endpoint,
-                supplied_token or saved_token,
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=vlm_probe_failure_detail(
-                    endpoint,
-                    exc,
-                    supplied_token or saved_token,
-                ),
-            ) from None
-        return JSONResponse(
-            {
-                "ok": True,
-                "models": models,
-                "message": f"Connected. Found {len(models)} model(s).",
-            }
-        )
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Text layout requires a placement record.")
+        text = await run_in_threadpool(manager.editor_v2_text_layout, code, job_id, page, data.get("record"))
+        return JSONResponse({"text": text}, headers={"Cache-Control": "private, no-store"})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/text-layers")
+    async def editor_v2_text_layers(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        try:
+            data = await request.json()
+        except ValueError as exc:
+            raise HTTPException(400, "Request body must be valid JSON.") from exc
+        if not isinstance(data, dict):
+            raise HTTPException(400, "A text-layer batch requires a records array.")
+        def render_batch() -> dict[str, Any]:
+            paths = manager.render_editor_v2_text_layers(code, job_id, page, data.get("records"))
+            return {"layers": [base64.b64encode(path.read_bytes()).decode("ascii") for path in paths]}
+        return JSONResponse(await run_in_threadpool(render_batch), headers={"Cache-Control": "private, no-store"})
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}")
     async def editor_v2_data(
@@ -5013,6 +5152,16 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             manager.save_editor_v2_update(code, job_id, page, stage, data)
         )
 
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/reset")
+    async def reset_editor_v2_stage(
+        request: Request, code: str, job_id: str, stage: str, page: int
+    ) -> JSONResponse:
+        manager = manager_from_request(request)
+        data = await request.json()
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=400, detail="Request body must be an object.")
+        return JSONResponse(manager.reset_editor_v2_stage(code, job_id, page, stage, data))
+
     @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/stages/{stage}/protection")
     async def editor_v2_protection(
         request: Request, code: str, job_id: str, stage: str, page: int
@@ -5030,16 +5179,24 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         request: Request, code: str, job_id: str, stage: str, page: int
     ) -> JSONResponse:
         manager = manager_from_request(request)
-        try:
-            resume_from = editor_v2.RERUN_FROM[editor_v2.validate_stage(stage)]
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        manager.rerun_completed_job_pages(code, job_id, [page], resume_from)
+        resume_from = manager.regenerate_editor_v2_stage(code, job_id, stage, page)
         return JSONResponse(
             {"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": resume_from}
         )
 
-    @app.post("/api/job/{code}/{job_id}/editor/v2/regenerate-changes")
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/regenerate")
+    async def regenerate_editor_page(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        phase = manager.rerun_editor_v2_page(code, job_id, "placement", page)
+        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}", "resumeFrom": phase})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/finish-edits")
+    async def finish_editor_edits(request: Request, code: str, job_id: str) -> JSONResponse:
+        manager = manager_from_request(request)
+        pages = manager.queue_finish_editor_edits(code, job_id)
+        return JSONResponse({"ok": True, "url": f"/job/{code}/{job_id}", "pages": pages})
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/regenerate-all-pages")
     async def regenerate_editor_v2_changes(
         request: Request, code: str, job_id: str
     ) -> JSONResponse:
@@ -5106,10 +5263,16 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         data = await request.json()
         records = data.get("records") if isinstance(data, dict) else None
         clean_records = data.get("cleanRecords") if isinstance(data, dict) else None
+        clean_boxes = data.get("cleanBoxes", []) if isinstance(data, dict) else []
+        translations = data.get("translations") if isinstance(data, dict) else None
         if not isinstance(records, list):
             raise HTTPException(status_code=400, detail="records must be an array.")
         if not isinstance(clean_records, list):
             raise HTTPException(status_code=400, detail="cleanRecords must be an array.")
+        if not isinstance(clean_boxes, list):
+            raise HTTPException(status_code=400, detail="cleanBoxes must be an array.")
+        if not isinstance(translations, list):
+            raise HTTPException(400, "translations must be an array.")
         _path, cached, cleaned_with_lama = await run_in_threadpool(
             manager.render_editor_v2_preview,
             code,
@@ -5117,6 +5280,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             page,
             records,
             clean_records,
+            clean_boxes,
+            translations,
         )
         return JSONResponse(
             {
@@ -5126,6 +5291,29 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 "url": f"/api/job/{code}/{job_id}/editor/v2/preview-image/{page}?v={int(time.time())}",
             }
         )
+
+    @app.post("/api/job/{code}/{job_id}/editor/v2/pages/{page}/clean-preview")
+    async def clean_editor_v2_preview(request: Request, code: str, job_id: str, page: int) -> JSONResponse:
+        manager = manager_from_request(request)
+        data = await request.json()
+        records = data.get("cleanRecords") if isinstance(data, dict) else None
+        boxes = data.get("cleanBoxes") if isinstance(data, dict) else None
+        if not isinstance(records, list) or not isinstance(boxes, list):
+            raise HTTPException(400, "cleanRecords and cleanBoxes must be arrays.")
+        result = await run_in_threadpool(manager.render_editor_v2_clean_preview, code, job_id, page, records, boxes)
+        return JSONResponse(result)
+
+    @app.get("/api/job/{code}/{job_id}/editor/v2/clean-preview-image/{page}/{key}")
+    async def editor_v2_clean_image(request: Request, code: str, job_id: str, page: int, key: str) -> FileResponse:
+        manager = manager_from_request(request)
+        manager.require_editable_job(code, job_id, "placement")
+        manager.original_page_path(code, job_id, page)
+        if not re.fullmatch(r"[0-9a-f]{64}", key):
+            raise HTTPException(404, "Unknown cleaned preview.")
+        path = manager.editor_v2_clean_preview_path(code, job_id, page, key)
+        if not path.is_file():
+            raise HTTPException(404, "Cleaned preview is unavailable.")
+        return FileResponse(path, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/job/{code}/{job_id}/editor/v2/preview-image/{page}")
     async def editor_v2_preview_image(
@@ -5463,13 +5651,17 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             },
         )
 
+    from web_control_api import install_control_api
+    install_control_api(app, manager_from_request, resolve_control_settings,
+                        write_uploaded_file_to_path, validate_uploaded_comic_archive,
+                        write_uploaded_images_as_cbz, submit_uploaded_series, probe_vlm_connection)
     return app
 
 
 app = create_app()
 
 
-def main() -> None:
+def server_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the tetolate web UI.")
     parser.add_argument(
         "--config",
@@ -5477,12 +5669,18 @@ def main() -> None:
         default=Path(os.environ.get("TETOLATE_WEB_CONFIG", DEFAULT_WEB_CONFIG)),
         help="Path to web_config.json.",
     )
-    parser.add_argument("--host", help="Override the listen host from the web config.")
+    address = parser.add_mutually_exclusive_group()
+    address.add_argument("--address", default="127.0.0.1", help="Listen address (default: 127.0.0.1).")
+    address.add_argument("--listen", dest="address", action="store_const", const="0.0.0.0", help="Listen on all IPv4 interfaces; same as --address 0.0.0.0.")
     parser.add_argument("--port", type=int, help="Override the listen port from the web config.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = server_parser().parse_args()
 
     config = load_web_config(args.config)
-    host = args.host or config.listen_host
+    host = args.address
     port = args.port or config.listen_port
 
     import uvicorn

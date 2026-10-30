@@ -137,6 +137,8 @@ COPY --from=app-dependency-builder /app/.venv /app/.venv
 
 WORKDIR /app
 COPY *.py ./
+COPY tetolate_cli.py /usr/local/bin/tetolate
+RUN chmod 0755 /usr/local/bin/tetolate
 COPY web_editor/ ./web_editor/
 COPY data/config /app/data/config
 COPY data/bundled_fonts /app/data/bundled_fonts
@@ -153,10 +155,12 @@ RUN magick -version \
 
 FROM runtime-base AS tests
 COPY tests ./tests
+COPY setup.sh run.sh run_server.sh Dockerfile ./
+COPY scripts/release.py ./scripts/release.py
 # The runtime entrypoint copies prompts into /data; use the bundled files here
 # because the build-time test stage does not run that entrypoint.
 RUN TETOLATE_PROMPTS_DIR=/app/data/prompts \
-    python -m unittest tests.test_regressions \
+    python -m unittest discover -s tests \
     && touch /tmp/tests-passed
 
 FROM runtime-base AS runtime
@@ -166,7 +170,7 @@ VOLUME ["/data"]
 EXPOSE 8088
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
-CMD ["/app/.venv/bin/python", "/app/web_app.py", "--config", "/data/config/web_config.json"]
+CMD ["/app/.venv/bin/python", "/app/web_app.py", "--config", "/data/config/web_config.json", "--listen"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/admin', timeout=3).read(1)"]

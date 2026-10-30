@@ -11,7 +11,10 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = 2
 STAGE_ORDER = ("ocr", "structure", "erase", "translation", "placement")
+EDITOR_STAGE_ORDER = ("ocr", "text", "placement")
+TEXT_STAGES = ("structure", "erase", "translation")
 STAGE_LABELS = {
+    "text": "Text & Translation",
     "ocr": "OCR & Merge",
     "structure": "Structure",
     "erase": "Erase & Alternate Placement",
@@ -23,7 +26,7 @@ STAGE_ARTIFACTS = {
     "structure": ("ocr_structured",),
     "erase": ("ocr_structured", "alt_placement"),
     "translation": ("translations",),
-    "placement": ("placements",),
+    "placement": ("placements", "clean_boxes"),
 }
 ARTIFACT_STAGES = {
     artifact: tuple(stage for stage in STAGE_ORDER if artifact in STAGE_ARTIFACTS[stage])
@@ -44,6 +47,7 @@ STAGE_FIELDS: dict[str, dict[str, frozenset[str] | None]] = {
     },
     "translation": {"translations": frozenset({"englishText", "text"})},
     "placement": {
+        "clean_boxes": frozenset({"region"}),
         "placements": frozenset(
             {
                 "placementRegion",
@@ -55,8 +59,12 @@ STAGE_FIELDS: dict[str, dict[str, frozenset[str] | None]] = {
                 "gravity",
                 "fontSizeWidthPercent",
                 "manualLineBreaks",
+                "lineSpacing",
                 "minPointSize",
                 "maxPointSize",
+                "rotation",
+                "skewX",
+                "skewY",
             }
         )
     },
@@ -78,6 +86,127 @@ def validate_stage(stage: str) -> str:
     if stage not in STAGE_ORDER:
         raise ValueError(f"Unknown editor stage: {stage}")
     return stage
+
+
+def editor_stage_members(stage: str) -> tuple[str, ...]:
+    return TEXT_STAGES if stage == "text" else (validate_stage(stage),)
+
+
+def record_signature(stage: str, artifact: str, records: list[dict[str, Any]]) -> str:
+    fields = STAGE_FIELDS[stage][artifact]
+    return _canonical([
+        {key: value for key, value in record.items()
+         if key in {"recordId", "boxno"} or (fields is None and not key.startswith("_"))
+         or (fields is not None and key in fields)}
+        for record in records
+    ])
+
+
+def deleted_records(manifest: dict[str, Any], page: int, stage: str, artifact: str) -> list[dict[str, Any]]:
+    override = manifest.get("pages", {}).get(str(page), {}).get("stages", {}).get(stage, {}).get("artifacts", {}).get(artifact, {})
+    return [item["record"] for item in override.get("deleted", {}).values()
+            if isinstance(item, dict) and isinstance(item.get("record"), dict)]
+
+
+def complete_manual_ocr_groups(
+    manifest: dict[str, Any], page: int, raw_records: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Give ungrouped manual detections a stable singleton, unless deleted."""
+    result = copy.deepcopy(groups)
+    represented = {source for group in groups for source in group.get("sourceBoxnos", [])}
+    deleted = deleted_records(manifest, page, "ocr", "ocr_merged")
+    excluded = {source for group in deleted for source in group.get("sourceBoxnos", [])}
+    next_boxno = max((group.get("boxno", -1) for group in [*groups, *deleted]), default=-1) + 1
+    for raw in raw_records:
+        boxno = raw.get("boxno")
+        if raw.get("ocrSource") != "manual" or boxno in represented or boxno in excluded:
+            continue
+        result.append({"page": page, "boxno": next_boxno,
+                       "recordId": f"group_{raw['recordId']}", "ocrSource": "manual",
+                       "sourceBoxnos": [boxno], "sourceTexts": [str(raw.get("text", ""))],
+                       "text": str(raw.get("text", "")), "region": copy.deepcopy(raw["region"])})
+        next_boxno += 1
+        represented.add(boxno)
+    return result
+
+
+def visible_artifacts(
+    manifest: dict[str, Any], page: int, artifacts: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Hide descendants of deleted sources without changing saved stage data."""
+    visible = copy.deepcopy(artifacts)
+    raw_boxnos = {record.get("boxno") for record in visible.get("ocr_raw", [])}
+    raw_by_boxno = {record.get("boxno"): record for record in visible.get("ocr_raw", [])}
+    deleted_raw = {record.get("boxno") for record in deleted_records(manifest, page, "ocr", "ocr_raw")} - raw_boxnos
+    referenced_raw = {source for artifact in ("ocr_merged", "ocr_structured", "translations", "placements", "alt_placement")
+                      for record in visible.get(artifact, []) for source in record.get("sourceBoxnos", [])}
+    deleted_raw |= referenced_raw - raw_boxnos
+    groups = []
+    for group in visible.get("ocr_merged", []):
+        sources = group.get("sourceBoxnos", [])
+        remaining = [source for source in sources if source not in deleted_raw]
+        if sources and not remaining:
+            continue
+        group["sourceBoxnos"] = remaining
+        if remaining != sources:
+            records = [raw_by_boxno[source] for source in remaining if source in raw_by_boxno]
+            group["sourceTexts"] = [str(record.get("text", "")) for record in records]
+            group["text"] = "".join(group["sourceTexts"])
+            if records:
+                regions = [record["region"] for record in records]
+                group["region"] = [min(r[0] for r in regions), min(r[1] for r in regions),
+                                   max(r[2] for r in regions), max(r[3] for r in regions)]
+        groups.append(group)
+    visible["ocr_merged"] = groups
+    active_sources = {source for group in groups for source in group.get("sourceBoxnos", [])}
+    deleted_groups = {source for group in deleted_records(manifest, page, "ocr", "ocr_merged")
+                      for source in group.get("sourceBoxnos", [])}
+    hidden_sources = (deleted_raw | deleted_groups) - active_sources
+    rejected = [record for stage in TEXT_STAGES[:2]
+                for record in deleted_records(manifest, page, stage, "ocr_structured")]
+    rejected_sources = {source for record in rejected for source in record.get("sourceBoxnos", [])}
+    hidden_boxnos = {record.get("boxno") for record in rejected}
+    structured = []
+    for record in visible.get("ocr_structured", []):
+        sources = set(record.get("sourceBoxnos", []))
+        if sources and (sources <= hidden_sources or sources <= rejected_sources):
+            hidden_boxnos.add(record.get("boxno"))
+        else:
+            structured.append(record)
+    visible["ocr_structured"] = structured
+    hidden_boxnos.difference_update(record.get("boxno") for record in structured)
+    for artifact in ("translations", "alt_placement", "placements"):
+        visible[artifact] = [record for record in visible.get(artifact, [])
+                             if record.get("boxno") not in hidden_boxnos
+                             and not (set(record.get("sourceBoxnos", [])) and (
+                                 set(record["sourceBoxnos"]) <= hidden_sources
+                                 or set(record["sourceBoxnos"]) <= rejected_sources))]
+    return visible
+
+
+def mark_stages_saved(
+    manifest: dict[str, Any], page: int, stages: Iterable[str],
+    *, before: dict[str, list[str]] | None = None,
+) -> None:
+    """Track all changed inputs without accepting an earlier pending edit."""
+    stages = set(stages)
+    manifest["revision"] += 1
+    manifest["updatedAt"] = utc_now()
+    value = _page(manifest, page)
+    value["savedRevision"] = manifest["revision"]
+    pending = set(value.get("pendingStages", []))
+    bases = value.setdefault("pendingBases", {})
+    if before is not None:
+        for stage in stages - pending:
+            bases[stage] = before[stage]
+    pending.update(stages)
+    stale = set(value.get("stale", []))
+    for stage in stages:
+        stale.update(downstream_stages(stage))
+        stage_override(manifest, page, stage)["savedRevision"] = manifest["revision"]
+    value["pendingStages"] = [stage for stage in STAGE_ORDER if stage in pending]
+    value["stale"] = [stage for stage in STAGE_ORDER if stage in stale]
 
 
 def downstream_stages(stage: str) -> tuple[str, ...]:
@@ -270,12 +399,21 @@ def update_artifact_override(
         prior = old_deleted.get(rid)
         deleted[rid] = {
             "record": copy.deepcopy(record),
-            "region": copy.deepcopy(record.get("region")),
+            "region": None if record.get("ocrSource") in {"manual", "manual_crop"} else copy.deepcopy(record.get("region")),
             "protected": not (
                 isinstance(prior, dict) and prior.get("protected") is False
             ),
         }
     override["deleted"] = deleted
+    if artifact in {"ocr_raw", "ocr_merged"}:
+        for rid, item in old_added.items():
+            if rid not in submitted_by_id and isinstance(item.get("record"), dict):
+                record = item["record"]
+                deleted.setdefault(rid, {"record": copy.deepcopy(record),
+                    "region": None, "protected": True})
+    for rid, item in old_deleted.items():
+        if rid not in baseline_by_id and rid not in submitted_by_id:
+            deleted[rid] = copy.deepcopy(item)
     baseline_order = list(baseline_by_id)
     current_order = list(submitted_by_id)
     if current_order != baseline_order:
@@ -354,7 +492,10 @@ def apply_artifact_override(
         for name, item in field_values.items():
             if not isinstance(item, dict) or (protected_only and not item.get("protected")):
                 continue
-            target[name] = copy.deepcopy(item.get("value"))
+            if name == "fontSizeWidthPercent" and item.get("value") is None:
+                target.pop(name, None)
+            else:
+                target[name] = copy.deepcopy(item.get("value"))
 
     for rid, item in override.get("added", {}).items():
         if not isinstance(item, dict) or (protected_only and not item.get("protected")):
@@ -568,23 +709,61 @@ def freeze_stage(
         )
 
 
-def mark_saved(manifest: dict[str, Any], page: int, stage: str) -> int:
+def mark_saved(
+    manifest: dict[str, Any], page: int, stage: str,
+    *, before: list[str] | None = None,
+) -> int:
     manifest["revision"] = int(manifest.get("revision", 0)) + 1
     manifest["updatedAt"] = utc_now()
     page_value = _page(manifest, page)
     page_value["savedRevision"] = manifest["revision"]
     stale = set(page_value.get("stale", []))
     pending = set(page_value.get("pendingStages", []))
+    bases = page_value.setdefault("pendingBases", {})
+    if stage not in pending and before is not None:
+        bases[stage] = before
     stage_index = STAGE_ORDER.index(stage)
     accepted_stages = STAGE_ORDER[: stage_index + 1]
     stale.difference_update(accepted_stages)
     pending.difference_update(accepted_stages)
     pending.add(stage)
+    for accepted in accepted_stages:
+        if accepted != stage:
+            bases.pop(accepted, None)
     page_value["pendingStages"] = [item for item in STAGE_ORDER if item in pending]
     stale.update(downstream_stages(stage))
     page_value["stale"] = [item for item in STAGE_ORDER if item in stale]
     stage_override(manifest, page, stage)["savedRevision"] = manifest["revision"]
     return manifest["revision"]
+
+
+def mark_reset(
+    manifest: dict[str, Any], page: int, stages: Iterable[str],
+    before: dict[str, list[str]], after: dict[str, list[str]],
+) -> None:
+    """Clear discarded pending edits, but retain changes to already-applied inputs."""
+    value = _page(manifest, page)
+    pending = set(value.get("pendingStages", []))
+    bases = value.setdefault("pendingBases", {})
+    for stage in stages:
+        base = bases.get(stage)
+        if base is not None:
+            needs_rerun = after[stage] != base
+        else:
+            needs_rerun = stage not in pending and before[stage] != after[stage]
+        if needs_rerun:
+            pending.add(stage)
+            if base is None:
+                bases[stage] = before[stage]
+        else:
+            pending.discard(stage)
+            bases.pop(stage, None)
+    mark_stages_saved(manifest, page, ())
+    for stage in stages:
+        stage_override(manifest, page, stage)["savedRevision"] = manifest["revision"]
+    stale = {later for stage in pending for later in downstream_stages(stage)}
+    value["pendingStages"] = [stage for stage in STAGE_ORDER if stage in pending]
+    value["stale"] = [stage for stage in STAGE_ORDER if stage in stale]
 
 
 def mark_regenerated(manifest: dict[str, Any], page: int, resume_from: str) -> None:
@@ -598,6 +777,8 @@ def mark_regenerated(manifest: dict[str, Any], page: int, resume_from: str) -> N
     page_value["stale"] = [item for item in STAGE_ORDER if item in stale]
     pending = set(page_value.get("pendingStages", []))
     pending.difference_update(STAGE_ORDER[start:])
+    for stage in STAGE_ORDER[start:]:
+        page_value.get("pendingBases", {}).pop(stage, None)
     page_value["pendingStages"] = [item for item in STAGE_ORDER if item in pending]
     for pending_stage in pending:
         stale.update(downstream_stages(pending_stage))
@@ -605,6 +786,12 @@ def mark_regenerated(manifest: dict[str, Any], page: int, resume_from: str) -> N
 
 
 def stage_status(manifest: dict[str, Any], page: int, stage: str) -> dict[str, Any]:
+    if stage == "text":
+        states = [stage_status(manifest, page, member) for member in TEXT_STAGES]
+        return {"stage": stage, "label": STAGE_LABELS[stage],
+                **{key: any(state[key] for state in states) for key in ("changed", "stale", "pending")},
+                "frozen": all(state["frozen"] for state in states),
+                "savedRevision": max(state["savedRevision"] for state in states)}
     page_value = manifest.get("pages", {}).get(str(page), {})
     stages = page_value.get("stages", {}) if isinstance(page_value, dict) else {}
     value = stages.get(stage, {}) if isinstance(stages, dict) else {}

@@ -1,7 +1,8 @@
 
-Use this folder to store PaddleOCR-VL 1.6 model files. It is only needed
-when using the bundled CPU llama.cpp service under the `paddleocr-vl`
-Compose profile.
+Use this folder for a local PaddleOCR-VL 1.6 inference service. Native installs
+run that service separately and enter its API address in setup. Docker/Podman
+can start the bundled CPU llama.cpp service with the `paddleocr-vl` Compose profile.
+Built-in PaddleOCR does not need these files.
 
 Download the GGUF model, multimodal projector, and chat template from:
 
