@@ -79,9 +79,9 @@ export class EditorApi {
     });
   }
 
-  preview(stage, page, records, cleanRecords, cleanBoxes = [], signal) {
+  preview(stage, page, records, cleanRecords, cleanBoxes, translations, signal) {
     return this.queueCleaning(`${this.root}/pages/${page}/stages/${stage}/preview`,
-      {records, cleanRecords, cleanBoxes}, signal);
+      {records, cleanRecords, cleanBoxes, translations}, signal);
   }
 
   cleanPreview(page, cleanRecords, cleanBoxes, signal) {

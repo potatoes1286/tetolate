@@ -708,6 +708,8 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
     if min_score < 0 or min_score > 1:
         raise PipelineError("Config field ocr.min_score must be between 0 and 1.")
 
+    endpoint = normalize_vlm_base_url(data.get("paddleocr_vl_server_url", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL), "ocr.paddleocr_vl_server_url")
+
     return OCRConfig(
         engine=paddle_ocr_image.normalize_ocr_engine(data.get("engine", paddle_ocr_image.DEFAULT_OCR_ENGINE)),
         service_url=service_url,
@@ -735,9 +737,9 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
         tile_include_full_image=paddle_ocr_image.DEFAULT_TILE_INCLUDE_FULL_IMAGE,
         tile_dedupe_iou=paddle_ocr_image.DEFAULT_TILE_DEDUPE_IOU,
         tile_dedupe_containment=paddle_ocr_image.DEFAULT_TILE_DEDUPE_CONTAINMENT,
-        paddleocr_vl_server_url=normalize_vlm_base_url(data.get("paddleocr_vl_server_url", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL), "ocr.paddleocr_vl_server_url"),
+        paddleocr_vl_server_url=endpoint,
         paddleocr_vl_model=normalize_vlm_model(data.get("paddleocr_vl_model", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL), "ocr.paddleocr_vl_model"),
-        paddleocr_vl_api_key=data.get("paddleocr_vl_api_key", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY),
+        paddleocr_vl_api_key=data.get("paddleocr_vl_api_key", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY if endpoint.rstrip("/") == paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL.rstrip("/") else None),
         paddleocr_vl_max_concurrency=None,
     )
 
@@ -5310,11 +5312,13 @@ def main() -> int:
         if args.vlm_base_url is not None:
             if config.vlm is None:
                 raise PipelineError("--vlm-base-url requires a VLM config.")
+            endpoint = normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url")
             config = replace(
                 config,
                 vlm=replace(
                     config.vlm,
-                    base_url=normalize_vlm_base_url(args.vlm_base_url, "--vlm-base-url"),
+                    base_url=endpoint,
+                    api_key=config.vlm.api_key if endpoint.rstrip("/") == config.vlm.base_url.rstrip("/") else "not-needed",
                 ),
             )
         if args.vlm_model is not None:
@@ -5389,7 +5393,8 @@ def main() -> int:
                         args.paddleocr_vl_api_key
                         if args.paddleocr_vl_api_key is not None
                         else os.environ.get("TETOLATE_PADDLEOCR_VL_API_KEY")
-                        or config.ocr.paddleocr_vl_api_key
+                        or (config.ocr.paddleocr_vl_api_key if args.paddleocr_vl_server_url is None
+                            or args.paddleocr_vl_server_url.rstrip("/") == config.ocr.paddleocr_vl_server_url.rstrip("/") else None)
                     ),
                     paddleocr_vl_max_concurrency=(
                         args.paddleocr_vl_max_concurrency

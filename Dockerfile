@@ -155,6 +155,8 @@ RUN magick -version \
 
 FROM runtime-base AS tests
 COPY tests ./tests
+COPY setup.sh run.sh run_server.sh Dockerfile ./
+COPY scripts/release.py ./scripts/release.py
 # The runtime entrypoint copies prompts into /data; use the bundled files here
 # because the build-time test stage does not run that entrypoint.
 RUN TETOLATE_PROMPTS_DIR=/app/data/prompts \

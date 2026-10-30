@@ -218,7 +218,7 @@ class CLITests(unittest.TestCase):
         response = mock.MagicMock()
         response.__enter__.return_value = response
         response.headers = {}
-        response.read.side_effect = [b"partial", OSError("connection closed")]
+        response.read1.side_effect = [b"partial", OSError("connection closed")]
         with mock.patch.object(client, "open", return_value=response):
             with self.assertRaises(cli.ClientError) as error:
                 client.download("/jobs/12345678/download/png", output)
@@ -346,7 +346,7 @@ class CLITests(unittest.TestCase):
                 response = mock.MagicMock()
                 response.__enter__.return_value = response
                 response.headers = {}
-                response.read.side_effect = [b"partial", b""]
+                response.read1.side_effect = [b"partial", b""]
                 with mock.patch.object(client, "open", return_value=response) as open_request, \
                      mock.patch.object(cli.time, "monotonic", side_effect=clock):
                     with self.assertRaises(cli.ClientError) as caught:

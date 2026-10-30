@@ -14,6 +14,7 @@ export class EditorStore extends EventTarget {
     this.dirty = false;
     this.history = [];
     this.future = [];
+    this.boxnoCounters = {};
   }
 
   draftKey(page = this.page, stage = this.stage) {
@@ -35,6 +36,9 @@ export class EditorStore extends EventTarget {
         const draft = JSON.parse(rawDraft);
         if (draft.baseRevision === document.revision && draft.records) {
           this.records = draft.records;
+          for (const [key, value] of Object.entries(draft.boxnoCounters || {})) {
+            if (Number.isInteger(value) && value >= 0) this.boxnoCounters[key] = Math.max(this.boxnoCounters[key] || 0, value);
+          }
           if (draft.translationNotes) this.document.translationNotes = draft.translationNotes;
           this.dirty = true;
         } else {
@@ -140,6 +144,7 @@ export class EditorStore extends EventTarget {
     localStorage.setItem(this.draftKey(), JSON.stringify({
       baseRevision: this.document.revision,
       records: this.records,
+      boxnoCounters: this.boxnoCounters,
       translationNotes: this.document.translationNotes,
       savedAt: Date.now(),
     }));

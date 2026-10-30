@@ -139,6 +139,9 @@ def visible_artifacts(
     raw_boxnos = {record.get("boxno") for record in visible.get("ocr_raw", [])}
     raw_by_boxno = {record.get("boxno"): record for record in visible.get("ocr_raw", [])}
     deleted_raw = {record.get("boxno") for record in deleted_records(manifest, page, "ocr", "ocr_raw")} - raw_boxnos
+    referenced_raw = {source for artifact in ("ocr_merged", "ocr_structured", "translations", "placements", "alt_placement")
+                      for record in visible.get(artifact, []) for source in record.get("sourceBoxnos", [])}
+    deleted_raw |= referenced_raw - raw_boxnos
     groups = []
     for group in visible.get("ocr_merged", []):
         sources = group.get("sourceBoxnos", [])
@@ -174,7 +177,11 @@ def visible_artifacts(
     visible["ocr_structured"] = structured
     hidden_boxnos.difference_update(record.get("boxno") for record in structured)
     for artifact in ("translations", "alt_placement", "placements"):
-        visible[artifact] = [record for record in visible.get(artifact, []) if record.get("boxno") not in hidden_boxnos]
+        visible[artifact] = [record for record in visible.get(artifact, [])
+                             if record.get("boxno") not in hidden_boxnos
+                             and not (set(record.get("sourceBoxnos", [])) and (
+                                 set(record["sourceBoxnos"]) <= hidden_sources
+                                 or set(record["sourceBoxnos"]) <= rejected_sources))]
     return visible
 
 
@@ -392,12 +399,18 @@ def update_artifact_override(
         prior = old_deleted.get(rid)
         deleted[rid] = {
             "record": copy.deepcopy(record),
-            "region": copy.deepcopy(record.get("region")),
+            "region": None if record.get("ocrSource") in {"manual", "manual_crop"} else copy.deepcopy(record.get("region")),
             "protected": not (
                 isinstance(prior, dict) and prior.get("protected") is False
             ),
         }
     override["deleted"] = deleted
+    if artifact in {"ocr_raw", "ocr_merged"}:
+        for rid, item in old_added.items():
+            if rid not in submitted_by_id and isinstance(item.get("record"), dict):
+                record = item["record"]
+                deleted.setdefault(rid, {"record": copy.deepcopy(record),
+                    "region": None, "protected": True})
     for rid, item in old_deleted.items():
         if rid not in baseline_by_id and rid not in submitted_by_id:
             deleted[rid] = copy.deepcopy(item)

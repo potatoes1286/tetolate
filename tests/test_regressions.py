@@ -4808,14 +4808,14 @@ class EditorV2Tests(unittest.TestCase):
                 overlay_text, "overlay_text", side_effect=fake_overlay
             ) as render:
                 _path, first_cached, _first_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, placements, []
+                    code, job_id, 0, placements, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
                 _path, second_cached, _second_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, placements, []
+                    code, job_id, 0, placements, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
                 changed = [{**placements[0], "placementRegion": [20, 10, 90, 90]}]
                 _path, changed_cached, _changed_cleaned = manager.render_editor_v2_preview(
-                    code, job_id, 0, changed, []
+                    code, job_id, 0, changed, [], [], [{"boxno": 0, "englishText": "Preview text"}]
                 )
 
             self.assertFalse(first_cached)

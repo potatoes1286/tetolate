@@ -218,10 +218,10 @@ class EditorLayerTests(unittest.TestCase):
 
         with mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, False)), \
              mock.patch.object(overlay_text, "overlay_text", side_effect=fake_overlay) as render:
-            self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])
-            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])[1])
+            self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [], [], [self.record])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [], [], [self.record])[1])
             with mock.patch.object(overlay_text, "TEXT_LAYOUT_VERSION", overlay_text.TEXT_LAYOUT_VERSION + 1):
-                self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [])[1])
+                self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [self.record], [], [], [self.record])[1])
             self.assertEqual(render.call_count, 2)
 
     def test_same_size_font_replacement_with_preserved_mtime_invalidates_both_preview_caches(self):
@@ -236,8 +236,8 @@ class EditorLayerTests(unittest.TestCase):
              mock.patch.object(overlay_text, "overlay_text", side_effect=overlay) as current:
             first = self.layer(record)
             self.assertEqual(first, self.layer(record))
-            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
-            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [], [], [record])[1])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [], [], [record])[1])
             before = font.stat()
             replacement = self.fonts / "replacement.ttf"
             replacement.write_bytes(b"new-font")
@@ -246,8 +246,8 @@ class EditorLayerTests(unittest.TestCase):
             self.assertEqual(font.stat().st_size, before.st_size)
             self.assertEqual(font.stat().st_mtime_ns, before.st_mtime_ns)
             self.assertNotEqual(first, self.layer(record))
-            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
-            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])[1])
+            self.assertFalse(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [], [], [record])[1])
+            self.assertTrue(self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [], [], [record])[1])
             self.assertEqual(layers.call_count, 2)
             self.assertEqual(current.call_count, 2)
 
@@ -467,7 +467,7 @@ class EditorLayerTests(unittest.TestCase):
                          region[1] + (region[3] - region[1] - image.height) // 2))
                 with mock.patch.object(self.manager, "editor_v2_effective_records", return_value=[{"boxno": 0, "englishText": text}]), \
                      mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, False)):
-                    current, _, _ = self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [])
+                    current, _, _ = self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [record], [], [], [{"boxno": 0, "englishText": text}])
                 with Image.open(current) as image:
                     difference = ImageChops.difference(preview.convert("RGB"), image.convert("RGB"))
                     maximum_error = max(high for _low, high in difference.getextrema())

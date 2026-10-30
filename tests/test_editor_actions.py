@@ -150,7 +150,7 @@ class EditorActionTests(unittest.TestCase):
         payload = self.manager.editor_v2_payload(self.code, self.job_id, "placement", 0)
         records = payload["recordsByArtifact"]
         preview, _, _ = self.manager.render_editor_v2_preview(self.code, self.job_id, 0,
-            records["placements"], records["ocr_structured"], records["clean_boxes"])
+            records["placements"], records["ocr_structured"], records["clean_boxes"], records["translations"])
         with Image.open(preview) as image:
             expected = image.convert("RGB").copy()
         with mock.patch.object(self.manager, "enqueue"):

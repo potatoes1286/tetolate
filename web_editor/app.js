@@ -259,8 +259,14 @@ function selectedArtifact() {
   return store.selection?.artifact || SCREEN[store.stage].primary;
 }
 
-function nextBoxno(records) {
-  return records.reduce((largest, record) => Math.max(largest, Number(record.boxno) || 0), -1) + 1;
+function nextBoxno(records, artifact = null) {
+  const visible = records.reduce((largest, record) => Math.max(largest, Number(record.boxno) || 0), -1) + 1;
+  if (!artifact) return visible;
+  const counters = store.boxnoCounters ||= {};
+  const key = `${store.page}:${artifact}`;
+  const number = Math.max(visible, store.document?.nextBoxnos?.[artifact] || 0, counters[key] || 0);
+  counters[key] = number + 1;
+  return number;
 }
 
 function newRecordId(prefix = "manual") {
@@ -750,10 +756,10 @@ function addCleanBox(region) {
 function addRawBox(region) {
   store.mutate(() => {
     const records = store.records.ocr_raw || (store.records.ocr_raw = []);
-    const record = { page: store.page, boxno: nextBoxno(records), recordId: newRecordId("raw"), region, text: "", ocrSource: "manual" };
+    const record = { page: store.page, boxno: nextBoxno(records, "ocr_raw"), recordId: newRecordId("raw"), region, text: "", ocrSource: "manual" };
     records.push(record); store.selection = { artifact: "ocr_raw", recordId: record.recordId };
     const groups = store.records.ocr_merged ||= [];
-    groups.push({page: store.page, boxno: nextBoxno(groups), recordId: newRecordId("group"),
+    groups.push({page: store.page, boxno: nextBoxno(groups, "ocr_merged"), recordId: newRecordId("group"),
       sourceBoxnos: [record.boxno], sourceTexts: [""], text: "", region: [...region], ocrSource: "manual"});
     mergeSelection.clear(); mergeSelection.add(record.recordId);
   });
@@ -770,13 +776,13 @@ async function ocrArea(region) {
       const rawRecords = result.rawRecords || result.records || [];
       const boxMap = new Map();
       for (const item of rawRecords) {
-        const old = item.boxno, boxno = nextBoxno(store.records.ocr_raw || []);
+        const old = item.boxno, boxno = nextBoxno(store.records.ocr_raw || [], "ocr_raw");
         boxMap.set(old, boxno);
         (store.records.ocr_raw ||= []).push({ ...item, page: store.page, boxno, recordId: newRecordId("raw") });
       }
       for (const item of result.mergedRecords || []) {
         const sourceBoxnos = (item.sourceBoxnos || []).map((boxno) => boxMap.get(boxno)).filter(Number.isInteger);
-        (store.records.ocr_merged ||= []).push({ ...item, page: store.page, boxno: nextBoxno(store.records.ocr_merged), sourceBoxnos, recordId: newRecordId("group") });
+        (store.records.ocr_merged ||= []).push({ ...item, page: store.page, boxno: nextBoxno(store.records.ocr_merged, "ocr_merged"), sourceBoxnos, recordId: newRecordId("group") });
       }
     });
     setStatus(`OCR added ${(result.rawRecords || result.records || []).length} raw boxes.`);
@@ -793,7 +799,7 @@ function groupChecked() {
   if (!raw.length) return setStatus("Check one or more raw boxes first.", true);
   store.mutate(() => {
     const selectedBoxnos = new Set(raw.map((item) => item.boxno));
-    const boxno = nextBoxno(store.records.ocr_merged || []);
+    const boxno = nextBoxno(store.records.ocr_merged || [], "ocr_merged");
     const rawByBoxno = new Map((store.records.ocr_raw || []).map((item) => [item.boxno, item]));
     store.records.ocr_merged = (store.records.ocr_merged || []).filter((group) => {
       group.sourceBoxnos = (group.sourceBoxnos || []).filter((boxno) => !selectedBoxnos.has(boxno));
@@ -819,7 +825,7 @@ function splitGroup() {
     store.records.ocr_merged = (store.records.ocr_merged || []).filter((item) => item.recordId !== group.recordId);
     for (const boxno of group.sourceBoxnos || []) {
       const raw = rawByBox.get(boxno); if (!raw) continue;
-      store.records.ocr_merged.push({ page: store.page, boxno: nextBoxno(store.records.ocr_merged), recordId: newRecordId("group"), sourceBoxnos: [boxno], sourceTexts: [raw.text || ""], text: raw.text || "", region: [...raw.region] });
+      store.records.ocr_merged.push({ page: store.page, boxno: nextBoxno(store.records.ocr_merged, "ocr_merged"), recordId: newRecordId("group"), sourceBoxnos: [boxno], sourceTexts: [raw.text || ""], text: raw.text || "", region: [...raw.region] });
     }
     store.selection = null;
   });
@@ -1051,6 +1057,7 @@ async function exactPreview() {
       store.records.placements || [],
       store.records.ocr_structured || [],
       store.records.clean_boxes || [],
+      store.records.translations || [],
       controller.signal,
     );
     if (controller.signal.aborted || store.document !== document || store.page !== page || typesettingView !== "current") return;

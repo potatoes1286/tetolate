@@ -153,7 +153,7 @@ class CleanBoxTests(unittest.TestCase):
         original = self.manager.original_page_path(self.code, self.job_id, 0)
         with mock.patch.object(self.manager, "current_editor_clean_source", return_value=(original, True)) as clean, \
              mock.patch.object(overlay_text, "overlay_text", side_effect=lambda entries, source, target: shutil.copyfile(source, target)) as draw:
-            self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [], [], [self.box])
+            self.manager.render_editor_v2_preview(self.code, self.job_id, 0, [], [], [self.box], [])
         self.assertEqual(clean.call_args.args[3], [self.box])
         self.assertEqual(draw.call_args.args[0], [])
         self.assertEqual(self.manager.editor_v2_manifest_path(self.code, self.job_id).read_bytes(), before)
@@ -224,7 +224,7 @@ class CleanBoxTests(unittest.TestCase):
         app = web_app.create_app(self.root / "config/web_config.json")
         app.state.manager = self.manager
         root = f"/api/job/{self.code}/{self.job_id}/editor/v2/pages/0/stages/placement"
-        body = {"records": [], "cleanRecords": [], "cleanBoxes": [self.box]}
+        body = {"records": [], "cleanRecords": [], "cleanBoxes": [self.box], "translations": []}
         original = self.manager.original_page_path(self.code, self.job_id, 0)
 
         async def direct(function, *args, **kwargs):

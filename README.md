@@ -69,20 +69,15 @@ NOTE: For Gemma 4, the default tokens dedicated per image is relatively low whic
 
 ### Native installation
 
-Install uv and ImageMagick 7 with PNG, WebP, and JPEG XL support. From the source
-checkout, run:
+Install uv and ImageMagick 7 with PNG, WebP, and JPEG XL support. From the source checkout, run:
 
 ```bash
 ./setup.sh
 ```
 
-Setup installs managed Python 3.11 and the locked dependencies, checks ImageMagick,
-asks for model endpoints and API keys, and starts the web UI. It creates missing
-configuration files with mode 0600. Existing settings stay unchanged unless you
-choose to update them. Endpoint checks read model lists, not image inference.
+Setup installs managed Python 3.11 and the locked dependencies, checks ImageMagick, asks for model endpoints and API keys, and starts the web UI. It creates missing configuration files with mode 0600. Existing settings stay unchanged unless you choose to update them. Endpoint checks read model lists, not image inference.
 
-Start the model services separately. Choose `paddle` for built-in OCR without an
-OCR inference service, or `paddleocr_vl` to use your PaddleOCR-VL endpoint.
+Start the model services separately. Choose `paddle` for built-in OCR without an OCR inference service, or `paddleocr_vl` to use your PaddleOCR-VL endpoint.
 
 ```bash
 ./setup.sh --no-start  # configure and check only

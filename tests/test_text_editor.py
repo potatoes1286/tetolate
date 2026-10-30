@@ -264,6 +264,9 @@ class TextEditorTests(unittest.TestCase):
 
     def test_pending_ocr_placeholders_are_not_saved_as_manual_edits(self):
         manifest = self.manager.load_editor_v2_manifest(self.code, self.job_id)
+        raw = self.manager.load_editor_v2_baseline(self.code, self.job_id, "ocr_raw", 0)
+        editor_v2.update_artifact_override(manifest, 0, "ocr", "ocr_raw", raw,
+            [*raw, {"page": 0, "boxno": 2, "text": "New OCR", "region": [50, 50, 70, 70]}])
         baseline = self.manager.load_editor_v2_baseline(self.code, self.job_id, "ocr_merged", 0)
         merged = [*baseline, {"page": 0, "boxno": 2, "sourceBoxnos": [2], "text": "New OCR",
                              "region": [50, 50, 70, 70]}]

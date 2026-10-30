@@ -320,15 +320,15 @@ then synchronize the release metadata:
 python scripts/release.py
 ```
 
-The script updates `pyproject.toml`, `uv.lock`, `compose.yaml`, and the current
-release references in the documentation. Complete the checks above before tagging.
+The script updates `pyproject.toml`, `uv.lock`, and the release examples below.
+Compose stays on `latest`. Complete the checks above before tagging.
 
 The first release is AMD64-only. The `dev` branch does not publish images. Push
 the release tag only after its commit is ready:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v2.0.0
+git push origin v2.0.0
 ```
 
 The workflow uses its repository `GITHUB_TOKEN`; it needs no personal access
@@ -338,7 +338,7 @@ public if GitHub created it as private.
 
 For the first publication, verify all of the following:
 
-- `docker pull ghcr.io/potatoes1286/tetolate:1.0.0` succeeds when signed out of GHCR.
-- The versioned `compose.yaml` starts tetolate from a directory that does not contain the repository source.
+- `docker pull ghcr.io/potatoes1286/tetolate:2.0.0` succeeds when signed out of GHCR.
+- `compose.yaml` starts tetolate from a directory that does not contain the repository source.
 - `docker compose ps` reports the published image as healthy.
 - Confirm Compose binds the web UI to `127.0.0.1:8088` for local-only access.

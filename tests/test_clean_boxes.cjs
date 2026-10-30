@@ -129,7 +129,7 @@ test("save and preview API serialize clean boxes separately from text", async ()
   });
   const page = setup(); page.context.addCleanBox([50, 50, 90, 100]);
   const api = new Api("default", "test");
-  await api.preview("placement", 0, [], [], page.store.records.clean_boxes);
+  await api.preview("placement", 0, [], [], page.store.records.clean_boxes, []);
   assert.equal(requests[0][1].cleanBoxes.length, 1);
   assert.deepEqual(requests[0][1].records, []);
   Object.assign(page.context, {api: {save: async (_stage, _page, body) => {

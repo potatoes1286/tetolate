@@ -339,6 +339,29 @@ class EditorManagerMixin:
                 artifact, page, artifacts[artifact]
             )
 
+    def editor_v2_ocr_identities(self, code: str, job_id: str, manifest: dict[str, Any], page: int) -> dict[str, dict[int, set[str]]]:
+        identities = {}
+        for artifact in ("ocr_raw", "ocr_merged"):
+            records = [*self.load_editor_v2_baseline(code, job_id, artifact, page),
+                       *self.editor_v2_effective_records(code, job_id, manifest, artifact, page),
+                       *editor_v2.deleted_records(manifest, page, "ocr", artifact)]
+            by_number: dict[int, set[str]] = {}
+            for record in editor_v2.hydrate_ids(artifact, page, records):
+                number = record.get("boxno")
+                if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+                    by_number.setdefault(number, set()).add(record["recordId"])
+            identities[artifact] = by_number
+        for artifact in ("ocr_merged", "ocr_structured", "translations", "placements", "alt_placement"):
+            records = [*self.load_editor_v2_baseline(code, job_id, artifact, page),
+                       *self.editor_v2_effective_records(code, job_id, manifest, artifact, page),
+                       *(record for stage in editor_v2.ARTIFACT_STAGES[artifact]
+                         for record in editor_v2.deleted_records(manifest, page, stage, artifact))]
+            for record in records:
+                for source in record.get("sourceBoxnos", []):
+                    if isinstance(source, int) and not isinstance(source, bool) and source >= 0:
+                        identities["ocr_raw"].setdefault(source, set())
+        return identities
+
     def editor_v2_payload(
         self, code: str, job_id: str, stage: str, page: int
     ) -> dict[str, Any]:
@@ -403,6 +426,8 @@ class EditorManagerMixin:
                 "height": height,
             },
             "recordsByArtifact": artifacts,
+            "nextBoxnos": {artifact: max(numbers, default=-1) + 1
+                           for artifact, numbers in self.editor_v2_ocr_identities(code, job_id, manifest, page).items()},
             "protection": self.editor_v2_protection_payload(manifest, page, stage),
             "rerunFrom": (editor_v2.earliest_rerun(editor_v2.pending_changes(manifest)[page])
                           if page in editor_v2.pending_changes(manifest) else None),
@@ -658,6 +683,13 @@ class EditorManagerMixin:
             record[field] = value
             editor_v2.update_artifact_override(manifest, page, member, artifact,
                 self.load_editor_v2_baseline(code, job_id, artifact, page), records)
+            if artifact == "ocr_structured":
+                # Added Erase records contain a full source snapshot, not just
+                # erase fields. Do not let that snapshot restore old text.
+                erase = editor_v2.artifact_override(manifest, page, "erase", artifact)
+                added = erase.get("added", {}).get(rid)
+                if isinstance(added, dict) and isinstance(added.get("record"), dict):
+                    added["record"][field] = value
             # Structure and erase share these records. A later frozen erase
             # snapshot must keep the corrected source text as well.
             for frozen_member in (("structure", "erase") if artifact == "ocr_structured" else (member,)):
@@ -714,6 +746,14 @@ class EditorManagerMixin:
                 normalized_raw, normalized_merged = self.normalize_ocr_merge_records(
                     code, job_id, page, raw_records, merged_records
                 )
+                identities = self.editor_v2_ocr_identities(code, job_id, manifest, page)
+                for artifact, values in (("ocr_raw", normalized_raw), ("ocr_merged", normalized_merged)):
+                    for record in editor_v2.hydrate_ids(artifact, page, values):
+                        number = record["boxno"]
+                        if isinstance(number, bool) or number < 0:
+                            raise HTTPException(400, "OCR box numbers must be non-negative integers.")
+                        if number in identities[artifact] and record["recordId"] not in identities[artifact][number]:
+                            raise HTTPException(409, "An OCR box number is already reserved. Reload the page before adding boxes.")
                 supplied = {
                     **supplied,
                     "ocr_raw": normalized_raw,
@@ -804,7 +844,7 @@ class EditorManagerMixin:
                     for record in display[artifact]:
                         if record["recordId"] not in retained and record["recordId"] in deleted_groups:
                             deleted.setdefault(record["recordId"], {
-                                "record": copy.deepcopy(record), "region": copy.deepcopy(record.get("region")),
+                                "record": copy.deepcopy(record), "region": None,
                                 "protected": True,
                             })
                 if editor_v2.stage_override(manifest, page, stage).get("frozen"):
@@ -1555,11 +1595,19 @@ class EditorManagerMixin:
     def render_editor_v2_preview(
         self, code: str, job_id: str, page: int,
         placement_records: list[Any], structured_records: list[Any],
-        clean_boxes: list[Any] | None = None,
+        clean_boxes: list[Any], translation_records: list[Any],
     ) -> tuple[Path, bool, bool]:
         self.require_editable_job(code, job_id, "placement")
         boxes = self.normalize_clean_boxes(code, job_id, page, clean_boxes or [])
-        entries = self.editor_v2_render_entries(code, job_id, page, placement_records)
+        if len(translation_records) > 4096 or any(not isinstance(record, dict)
+                or isinstance(record.get("boxno"), bool) or not isinstance(record.get("boxno"), int)
+                or record["boxno"] < 0 or not isinstance(record.get("englishText"), str)
+                or len(record["englishText"]) > 100_000 for record in translation_records):
+            raise HTTPException(400, "Preview translations require box numbers and text of at most 100000 characters.")
+        text_by_box = {record["boxno"]: record["englishText"] for record in translation_records}
+        if len(text_by_box) != len(translation_records):
+            raise HTTPException(400, "Preview translation box numbers must be unique.")
+        entries = self.editor_v2_render_entries(code, job_id, page, placement_records, text_by_box)
         source, cleaned_with_lama = self.current_editor_clean_source(
             code, job_id, page, [*structured_records, *boxes],
         )
@@ -1632,6 +1680,8 @@ class EditorManagerMixin:
             raise HTTPException(status_code=404, detail="Unknown job.")
         with self._lock:
             is_active = (code, job_id) in self._active_processes
+            if is_active or (code, job_id) in self._starting_jobs:
+                raise HTTPException(status_code=409, detail="Wait for the current job task to finish before editing.")
         editable_checkpoint = (
             status.get("status") == "paused"
             and status.get("reviewCheckpoint") == "ocr"
@@ -1865,9 +1915,10 @@ class EditorManagerMixin:
             crop = image.convert("RGB").crop((left, top, right, bottom))
 
         config = translate_cbz.load_config(self.config.pipeline_config, None)
-        status = self.load_status(code, job_id) or {}
-        ocr_config = self.ocr_config_for_status(config.ocr, status)
-        secrets = self.load_job_secrets(code, job_id)
+        with self._lock:
+            status = self.load_status(code, job_id) or {}
+            ocr_config = self.ocr_config_for_status(config.ocr, status)
+            secrets = self.load_job_secrets(code, job_id)
         if ocr_config.engine == paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL:
             ocr = paddle_ocr_image.create_paddleocr_vl(
                 ocr_config.device,

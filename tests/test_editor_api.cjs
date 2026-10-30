@@ -41,6 +41,16 @@ function cleaningApi() {
   return {api: new Api("category", "job"), requests};
 }
 
+test("Current preview sends an immutable copy of draft translations", async () => {
+  const {api, requests} = cleaningApi();
+  const translations = [{boxno: 0, englishText: "Draft translation"}];
+  const pending = api.preview("placement", 0, [], [], [], translations);
+  translations[0].englishText = "Later edit";
+  assert.equal(requests[0].body.translations[0].englishText, "Draft translation");
+  requests[0].finish({url: "current-draft"});
+  assert.equal((await pending).url, "current-draft");
+});
+
 test("a burst keeps the active request and only the newest immutable waiting mask", async () => {
   const {api, requests} = cleaningApi();
   const first = api.cleanPreview(0, [], [{region: [10, 10, 30, 30]}]);
@@ -79,7 +89,7 @@ test("caller abort hides an active result without releasing the network slot", a
 test("Preview and Current share one cleaning slot", async () => {
   for (const currentFirst of [false, true]) {
     const {api, requests} = cleaningApi();
-    const current = () => api.preview("placement", 2, [{boxno: 0}], [], []);
+    const current = () => api.preview("placement", 2, [{boxno: 0}], [], [], []);
     const preview = () => api.cleanPreview(3, [], []);
     const first = currentFirst ? current() : preview();
     const second = currentFirst ? preview() : current();

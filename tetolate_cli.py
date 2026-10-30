@@ -16,6 +16,7 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -191,15 +192,34 @@ class Client:
         output.parent.mkdir(parents=True, exist_ok=True)
         descriptor, name = tempfile.mkstemp(dir=output.parent, prefix=".tetolate-download-", suffix=".tmp")
         temporary = Path(name)
+        watchdog = None
         try:
             with os.fdopen(descriptor, "wb") as target, self.open("GET", path, **open_options) as response:
                 expected = response.headers.get("Content-Length")
                 while True:
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout")
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout")
+                        if response.fp is not None:
+                            # urllib exposes no timeout setter on the response.
+                            # Bound each socket read by the remaining total time.
+                            connection = response.fp.raw._sock
+                            connection.settimeout(min(self.timeout, remaining))
+                            if watchdog is None:
+                                def interrupt():
+                                    try:
+                                        connection.shutdown(socket.SHUT_RDWR)
+                                    except OSError:
+                                        pass
+                                watchdog = threading.Timer(remaining, interrupt)
+                                watchdog.daemon = True
+                                watchdog.start()
                     try:
-                        chunk = response.read(1024 * 1024)
+                        chunk = response.read1(1024 * 1024)
                     except (OSError, HTTPTransportError):
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout") from None
                         raise ClientError("Download connection was interrupted.", EXIT_CONNECTION, "connection_error") from None
                     if deadline is not None and time.monotonic() >= deadline:
                         raise ClientError("Timed out downloading the archive.", EXIT_TIMEOUT, "timeout")
@@ -211,6 +231,8 @@ class Client:
                 raise ClientError("Download ended before the complete archive arrived.", EXIT_CONNECTION, "connection_error")
             temporary.replace(output)
         finally:
+            if watchdog is not None:
+                watchdog.cancel()
             temporary.unlink(missing_ok=True)
         return {"output": str(output), "bytes": size}
 

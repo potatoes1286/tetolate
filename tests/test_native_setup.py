@@ -143,6 +143,8 @@ class NativeSetupTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["port"], 9000)
         dockerfile = (native_setup.ROOT / "Dockerfile").read_text()
         self.assertIn('"/data/config/web_config.json", "--listen"]', dockerfile)
+        test_stage = dockerfile.split("FROM runtime-base AS tests", 1)[1].split("FROM runtime-base AS runtime", 1)[0]
+        self.assertIn("COPY setup.sh run.sh run_server.sh Dockerfile ./", test_stage)
 
     def test_magick_checks_version_formats_and_font_rendering(self):
         for version, formats, expected in (

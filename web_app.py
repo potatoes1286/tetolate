@@ -1251,16 +1251,19 @@ async def probe_vlm_connection(manager, endpoint_value, token_value="", category
             same_job_endpoint = manager.status_vlm_base_url(status).rstrip("/") == endpoint.rstrip("/")
             if supplied_token is None and same_job_endpoint:
                 saved_token = manager.load_job_secrets(category, job_id).get("vlmAuthToken")
-    if supplied_token is not None and same_job_endpoint:
-        manager.update_job_auth_tokens(category, job_id, vlm_auth_token=supplied_token,
-                                       paddleocr_vl_auth_token=None)
     saved_token = saved_token or manager.saved_vlm_token(endpoint)
     try:
         models = await run_in_threadpool(manager.probe_vlm_models, endpoint, supplied_token or saved_token)
     except Exception as exc:
         raise HTTPException(502, vlm_probe_failure_detail(endpoint, exc, supplied_token or saved_token)) from None
     if supplied_token is not None:
-        manager.remember_vlm_token(endpoint, supplied_token)
+        with manager._lock:
+            current = manager.load_status(category, job_id) if same_job_endpoint else None
+            if current is not None and manager.status_vlm_base_url(current).rstrip("/") == endpoint.rstrip("/"):
+                manager.update_job_auth_tokens(category, job_id, vlm_auth_token=supplied_token,
+                                               paddleocr_vl_auth_token=None)
+            else:
+                manager.remember_vlm_token(endpoint, supplied_token)
     return {"ok": True, "models": models, "message": f"Connected. Found {len(models)} model(s)."}
 
 
@@ -1868,7 +1871,9 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             )
         trash_path: Path | None = None
         with self._lock:
-            if any(code == category for code, _job_id in self._active_processes):
+            if any(code == category for code, _job_id in self._active_processes) or any(
+                code == category for code, _job_id in self._starting_jobs
+            ):
                 raise HTTPException(status_code=409, detail="Stop active jobs before deleting this category.")
             if any(code == category for code, _job_id in self._queued_jobs):
                 raise HTTPException(status_code=409, detail="Stop queued jobs before deleting this category.")
@@ -2642,7 +2647,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         config = replace(
             pipeline.vlm,
             base_url=endpoint,
-            api_key=auth_token or pipeline.vlm.api_key,
+            api_key=auth_token or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         return vlm_client.list_vlm_model_ids(config)
 
@@ -2719,14 +2724,17 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         ocr_config: translate_cbz.OCRConfig,
         status: dict[str, Any],
     ) -> translate_cbz.OCRConfig:
+        endpoint = self.status_paddleocr_vl_server_url(status)
+        key = ocr_config.paddleocr_vl_api_key if endpoint.rstrip("/") == ocr_config.paddleocr_vl_server_url.rstrip("/") else None
         return replace(
             ocr_config,
             lang=translate_cbz.SOURCE_LANGUAGE_PROFILES[
                 self.status_source_language(status)
             ].ocr_lang,
             engine=self.status_ocr_engine(status),
-            paddleocr_vl_server_url=self.status_paddleocr_vl_server_url(status),
+            paddleocr_vl_server_url=endpoint,
             paddleocr_vl_model=self.status_paddleocr_vl_model(status),
+            paddleocr_vl_api_key=key,
         )
 
     def public_status(
@@ -3023,7 +3031,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
     def enqueue(self, code: str, job_id: str) -> None:
         key = (code, job_id)
         with self._lock:
-            if key in self._queued_jobs:
+            if key in self._queued_jobs or key in self._starting_jobs or key in self._active_processes:
                 return
             status = self.load_status(code, job_id) or {}
             reason = self.series_wait_reason(code, status)
@@ -3296,7 +3304,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
-            if (code, job_id) in self._active_processes:
+            if (code, job_id) in self._active_processes or (code, job_id) in self._starting_jobs:
                 raise HTTPException(status_code=409, detail="Job is already running or paused.")
             if status.get("status") in {"queued", "running"}:
                 raise HTTPException(status_code=409, detail="Job is already queued or running.")
@@ -3408,6 +3416,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
                 raise HTTPException(status_code=409, detail="Job is already queued or running.")
             if status.get("status") != "complete":
                 raise HTTPException(status_code=400, detail="Only complete jobs can rerun pages.")
+            if (code, job_id) in self._starting_jobs or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the current job task to finish before regenerating.")
             if not self.input_path(code, job_id).is_file():
                 raise HTTPException(status_code=400, detail="Original uploaded archive is missing.")
             if not self.output_dir(code, job_id).is_dir():
@@ -3565,10 +3575,11 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
         instructions: str = "",
         allow_refusal: bool = False,
     ) -> tuple[str, bool]:
-        status = self.load_status(code, job_id) or {}
-        model = self.required_status_vlm_model(status)
-        endpoint = self.status_vlm_base_url(status)
-        secrets = self.load_job_secrets(code, job_id)
+        with self._lock:
+            status = self.load_status(code, job_id) or {}
+            model = self.required_status_vlm_model(status)
+            endpoint = self.status_vlm_base_url(status)
+            secrets = self.load_job_secrets(code, job_id)
         pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
         if pipeline.vlm is None:
             raise HTTPException(status_code=400, detail="VLM configuration is unavailable.")
@@ -3576,7 +3587,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             pipeline.vlm,
             base_url=endpoint,
             model=model,
-            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+            api_key=secrets.get("vlmAuthToken") or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         if allow_refusal:
             prompt = (
@@ -3718,6 +3729,8 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             status = self.load_status(code, job_id)
             if status is None:
                 raise HTTPException(status_code=404, detail="Unknown job.")
+            if (code, job_id) in self._starting_jobs or (code, job_id) in self._active_processes:
+                raise HTTPException(status_code=409, detail="Wait for the current job task to finish before deleting.")
             if status.get("status") in {"queued", "running", "paused", "terminating"}:
                 raise HTTPException(status_code=409, detail="Job is queued or running.")
             if status.get("status") not in TERMINAL_JOB_STATUSES:
@@ -3799,7 +3812,7 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
             pipeline.vlm,
             base_url=endpoint,
             model=model,
-            api_key=secrets.get("vlmAuthToken") or pipeline.vlm.api_key,
+            api_key=secrets.get("vlmAuthToken") or (pipeline.vlm.api_key if endpoint.rstrip("/") == pipeline.vlm.base_url.rstrip("/") else "not-needed"),
         )
         prompt = (
             "Translate this manga or comic title into natural English. "
@@ -4081,7 +4094,15 @@ class JobManager(ControlAuthMixin, SeriesManagerMixin, EditorManagerMixin, Expor
     ) -> int:
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
-        secrets = self.load_job_secrets(code, job_id)
+        with self._lock:
+            status = self.load_status(code, job_id) or {}
+            secrets = self.load_job_secrets(code, job_id)
+        if self.status_paddleocr_vl_server_url(status).rstrip("/") != paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL.rstrip("/"):
+            env.pop("TETOLATE_PADDLEOCR_VL_API_KEY", None)
+        if env.get("TETOLATE_VLM_API_KEY"):
+            pipeline = translate_cbz.load_config(self.config.pipeline_config, None)
+            if pipeline.vlm is None or self.status_vlm_base_url(status).rstrip("/") != pipeline.vlm.base_url.rstrip("/"):
+                env.pop("TETOLATE_VLM_API_KEY", None)
         if secrets.get("vlmAuthToken"):
             env["TETOLATE_VLM_API_KEY"] = secrets["vlmAuthToken"]
         if secrets.get("paddleocrVlAuthToken"):
@@ -5243,12 +5264,15 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         records = data.get("records") if isinstance(data, dict) else None
         clean_records = data.get("cleanRecords") if isinstance(data, dict) else None
         clean_boxes = data.get("cleanBoxes", []) if isinstance(data, dict) else []
+        translations = data.get("translations") if isinstance(data, dict) else None
         if not isinstance(records, list):
             raise HTTPException(status_code=400, detail="records must be an array.")
         if not isinstance(clean_records, list):
             raise HTTPException(status_code=400, detail="cleanRecords must be an array.")
         if not isinstance(clean_boxes, list):
             raise HTTPException(status_code=400, detail="cleanBoxes must be an array.")
+        if not isinstance(translations, list):
+            raise HTTPException(400, "translations must be an array.")
         _path, cached, cleaned_with_lama = await run_in_threadpool(
             manager.render_editor_v2_preview,
             code,
@@ -5257,6 +5281,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             records,
             clean_records,
             clean_boxes,
+            translations,
         )
         return JSONResponse(
             {

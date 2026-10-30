@@ -44,6 +44,25 @@ function setup() {
   return {store, context, editor, mergeSelection, status, click, doubleClick, handlers};
 }
 
+test("new OCR boxes use reserved numbers across deletion, undo and recovered drafts", () => {
+  const page = setup();
+  page.store.document.nextBoxnos = {ocr_raw: 10, ocr_merged: 20};
+  page.context.addRawBox([10, 70, 30, 90]);
+  assert.equal(page.store.records.ocr_raw.at(-1).boxno, 10);
+  assert.equal(page.store.records.ocr_merged.at(-1).boxno, 20);
+  page.store.undo();
+  page.context.addRawBox([10, 80, 30, 100]);
+  assert.equal(page.store.records.ocr_raw.at(-1).boxno, 11);
+  page.store.undo();
+  const recovered = new page.store.constructor(page.store.config);
+  recovered.setDocument(structuredClone(page.store.document));
+  assert.equal(recovered.dirty, true);
+  const context = vm.createContext({store: recovered});
+  vm.runInContext(functionSource("nextBoxno"), context);
+  assert.equal(context.nextBoxno(recovered.records.ocr_raw, "ocr_raw"), 12);
+  assert.equal(context.nextBoxno(recovered.records.ocr_merged, "ocr_merged"), 22);
+});
+
 test("deleting part of an OCR group rebuilds its text and region, and undo restores it", () => {
   const page = setup();
   page.mergeSelection.add("raw-0"); page.mergeSelection.add("raw-1");
