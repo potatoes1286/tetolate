@@ -168,7 +168,7 @@ VOLUME ["/data"]
 EXPOSE 8088
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]
-CMD ["/app/.venv/bin/python", "/app/web_app.py", "--config", "/data/config/web_config.json"]
+CMD ["/app/.venv/bin/python", "/app/web_app.py", "--config", "/data/config/web_config.json", "--listen"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/admin', timeout=3).read(1)"]

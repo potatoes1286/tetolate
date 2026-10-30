@@ -740,9 +740,9 @@ def load_pipeline_defaults(path: Path) -> tuple[int, int, int, str, str, bool, s
             (configured_vlm_model or "").strip(),
             default_alt_placement_enabled,
             default_source_language,
-            DEFAULT_OCR_ENGINE,
-            DEFAULT_PADDLEOCR_VL_SERVER_URL,
-            DEFAULT_PADDLEOCR_VL_MODEL,
+            paddle_ocr_image.normalize_ocr_engine(ocr.get("engine", DEFAULT_OCR_ENGINE)),
+            validate_paddleocr_vl_server_url(ocr.get("paddleocr_vl_server_url", DEFAULT_PADDLEOCR_VL_SERVER_URL), DEFAULT_PADDLEOCR_VL_SERVER_URL),
+            parse_optional_text_form(ocr.get("paddleocr_vl_model", DEFAULT_PADDLEOCR_VL_MODEL), DEFAULT_PADDLEOCR_VL_MODEL),
         )
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
@@ -5636,7 +5636,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
 app = create_app()
 
 
-def main() -> None:
+def server_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the tetolate web UI.")
     parser.add_argument(
         "--config",
@@ -5644,12 +5644,18 @@ def main() -> None:
         default=Path(os.environ.get("TETOLATE_WEB_CONFIG", DEFAULT_WEB_CONFIG)),
         help="Path to web_config.json.",
     )
-    parser.add_argument("--host", help="Override the listen host from the web config.")
+    address = parser.add_mutually_exclusive_group()
+    address.add_argument("--address", default="127.0.0.1", help="Listen address (default: 127.0.0.1).")
+    address.add_argument("--listen", dest="address", action="store_const", const="0.0.0.0", help="Listen on all IPv4 interfaces; same as --address 0.0.0.0.")
     parser.add_argument("--port", type=int, help="Override the listen port from the web config.")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = server_parser().parse_args()
 
     config = load_web_config(args.config)
-    host = args.host or config.listen_host
+    host = args.address
     port = args.port or config.listen_port
 
     import uvicorn

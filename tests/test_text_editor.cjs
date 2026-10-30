@@ -262,6 +262,64 @@ test("Typesetting saves only changed text fields alongside placement records", a
   assert.deepEqual(Object.keys(request.recordsByArtifact), ["placements", "clean_boxes"]);
 });
 
+for (const [artifact, field] of [["ocr_structured", "text"], ["translations", "englishText"]]) {
+  for (const lastEdit of ["original", "empty", "undo"]) {
+    test(`Typesetting preserves ${artifact} ${lastEdit} edits made during a save`, async () => {
+      const storage = new Map();
+      const Store = vm.runInNewContext(fs.readFileSync(path.join(root, "store.js"), "utf8")
+        .replace("export class", "class") + "\nEditorStore", {
+        EventTarget, Event, structuredClone,
+        localStorage: {getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value),
+          removeItem: (key) => storage.delete(key)},
+      });
+      const store = new Store({category: "default", jobId: "12345678"});
+      let server = {page: 0, stage: "placement", revision: 1, recordsByArtifact: records(),
+        translationNotes: {job: "", page: ""}};
+      store.setDocument(structuredClone(server));
+      const document = store.document;
+      const original = store.records[artifact][0][field];
+      const wanted = lastEdit === "empty" ? "" : original;
+      let release;
+      const requests = [];
+      const context = vm.createContext({store, SCREEN: screens.SCREEN, savePromise: null, resetting: false,
+        byId: () => ({}), setStatus: () => {}, api: {save: async (_stage, _page, body) => {
+          requests.push(structuredClone(body));
+          assert.equal(body.baseRevision, server.revision);
+          for (const edit of body.textEdits) {
+            const key = edit.artifact === "translations" ? "englishText" : "text";
+            server.recordsByArtifact[edit.artifact].find((record) => record.recordId === edit.recordId)[key] = edit.value;
+          }
+          server = {...server, revision: server.revision + 1};
+          const response = structuredClone(server);
+          if (requests.length === 1) await new Promise((resolve) => {release = resolve;});
+          return response;
+        }}});
+      vm.runInContext(app.match(/async function save\([^]*?\n\}/)[0], context);
+      store.mutate((data) => { data[artifact][0][field] = "First edit"; });
+      const saving = context.save();
+      if (lastEdit === "undo") store.undo();
+      else store.mutate((data) => { data[artifact][0][field] = wanted; });
+      store.document.translationNotes.job = "Newer notes";
+      const historyLength = store.history.length;
+      release(); await saving;
+      assert.equal(store.document, document, "in-flight previews keep the same document identity");
+      assert.equal(store.dirty, true);
+      assert.equal(store.records[artifact][0][field], wanted);
+      assert.equal(store.document.recordsByArtifact[artifact][0][field], "First edit");
+      assert.equal(store.document.translationNotes.job, "Newer notes");
+      assert.equal(store.history.length, historyLength);
+      const draft = JSON.parse(storage.get(store.draftKey()));
+      assert.equal(draft.baseRevision, 2);
+      assert.equal(draft.records[artifact][0][field], wanted);
+      await context.save();
+      assert.equal(requests[1].textEdits[0].value, wanted);
+      assert.equal(server.recordsByArtifact[artifact][0][field], wanted);
+      assert.equal(store.records[artifact][0][field], wanted);
+      assert.equal(store.dirty, false);
+    });
+  }
+}
+
 test("zero and blank angles replace old values in the store, drafts, undo and redo", () => {
   const storeSource = fs.readFileSync(path.join(root, "store.js"), "utf8");
   const storage = new Map();

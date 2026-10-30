@@ -105,7 +105,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         self.assertEqual(config.ocr.engine, paddle_ocr_image.OCR_ENGINE_PADDLEOCR_VL)
         self.assertEqual(config.render_font, "ComicNeue-Bold.ttf")
 
-    def test_hidden_ocr_options_are_not_read_from_vlm_config(self) -> None:
+    def test_ocr_engine_is_configurable_but_low_level_options_stay_hidden(self) -> None:
         language = translate_cbz.language_config_from_codes("jp", "en")
         config = translate_cbz.load_ocr_config(
             {
@@ -118,7 +118,7 @@ class RepositoryHygieneTests(unittest.TestCase):
         )
 
         self.assertEqual(config.min_score, 0.8)
-        self.assertEqual(config.engine, paddle_ocr_image.DEFAULT_OCR_ENGINE)
+        self.assertEqual(config.engine, "paddle")
         self.assertEqual(config.service_url, paddle_ocr_image.DEFAULT_OCR_SERVICE_URL)
         self.assertEqual(config.tile_enabled, paddle_ocr_image.DEFAULT_TILE_ENABLED)
 

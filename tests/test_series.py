@@ -158,6 +158,65 @@ class SeriesTests(unittest.TestCase):
                 finally:
                     claimed.clear()
 
+    def test_renumbering_latest_note_chapter_backwards_keeps_later_jobs_ready(self) -> None:
+        first, second, third = self.chapter("1"), self.chapter("2"), self.chapter("3")
+        for job in (first, second):
+            self.status(job, "complete")
+            self.generated_notes(job, f"Notes from {job}")
+            self.assertTrue(self.manager.publish_series_notes("default", job))
+        before = self.manager.get_series("default")
+        self.manager.assign_job_chapter("default", second, "0")
+        after = self.manager.get_series("default")
+        self.assertEqual(after["notesThrough"], {"chapter": "1", "volume": ""})
+        for key in ("notes", "notesFromJobId", "revision"):
+            self.assertEqual(after[key], before[key])
+        self.manager.recover_series_notes()
+        self.assertEqual(self.manager.series_wait_reason("default", self.manager.load_status("default", third)), "")
+        restarted = web_app.JobManager(self.manager.config)
+        restarted.initialize_web_state()
+        restarted.requeue_interrupted_jobs()
+        self.assertIn(("default", third), restarted._queued_jobs)
+        self.assertEqual(restarted.get_series("default"), after)
+
+    def test_volume_change_keeps_note_coverage_of_other_completed_chapters(self) -> None:
+        first, second, third = [self.chapter("1", volume=str(volume)) for volume in (1, 2, 3)]
+        for job in (first, second):
+            self.status(job, "complete")
+            self.generated_notes(job, "Shared notes")
+            self.assertTrue(self.manager.publish_series_notes("default", job))
+        self.manager.assign_job_chapter("default", second, "1", "0")
+        self.assertEqual(self.manager.get_series("default")["notesThrough"], {"chapter": "1", "volume": "1"})
+        self.assertEqual(self.manager.series_wait_reason("default", self.manager.load_status("default", third)), "")
+
+    def test_renumbering_covered_chapter_updates_boundary_without_replacing_notes(self) -> None:
+        first, second, later = self.chapter("1"), self.chapter("2"), self.chapter("5")
+        for job in (first, second):
+            self.status(job, "complete")
+            self.generated_notes(job, "Current shared notes")
+            self.assertTrue(self.manager.publish_series_notes("default", job))
+        self.manager.assign_job_chapter("default", first, "4")
+        series = self.manager.get_series("default")
+        self.assertEqual(series["notesThrough"], {"chapter": "4", "volume": ""})
+        self.assertEqual(series["notesFromJobId"], second)
+        self.assertEqual(series["notes"], "Current shared notes")
+        self.assertEqual(self.manager.series_wait_reason("default", self.manager.load_status("default", later)), "")
+        earlier = self.chapter("3")
+        self.assertIn("later chapter", self.manager.series_wait_reason("default", self.manager.load_status("default", earlier)))
+
+    def test_renumbering_does_not_restore_notes_after_explicit_rewind(self) -> None:
+        first, second = self.chapter("1"), self.chapter("2")
+        for job, notes in ((first, "Earlier notes"), (second, "Later notes")):
+            self.status(job, "complete")
+            self.generated_notes(job, notes)
+            self.assertTrue(self.manager.publish_series_notes("default", job))
+        self.manager.publish_series_notes("default", first, explicit=True)
+        self.manager.assign_job_chapter("default", first, "0")
+        self.manager.recover_series_notes()
+        series = self.manager.get_series("default")
+        self.assertEqual(series["notesThrough"], {"chapter": "0", "volume": ""})
+        self.assertEqual(series["notesFromJobId"], first)
+        self.assertEqual(series["notes"], "Earlier notes")
+
     def test_publication_replaces_notes_and_older_reruns_need_explicit_publish(self) -> None:
         first, second = self.chapter("1"), self.chapter("2")
         self.status(first, "complete")

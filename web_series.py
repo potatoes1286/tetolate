@@ -122,10 +122,20 @@ class SeriesManagerMixin:
             chapter, volume = self.validate_series_chapter(code, chapter, volume, job_id)
             if chapter == status.get("chapter") and volume == status.get("volume"):
                 return
+            through = series["notesThrough"]
+            covered = []
+            if through and chapter_key(status) <= chapter_key(through):
+                covered = [item for item in self.series_chapters(code) if chapter_key(item) <= chapter_key(through)]
             status.update(chapter=chapter, volume=volume, writeTranslationNotes=True)
             self.save_status(code, job_id, status)
-            if series["notesFromJobId"] == job_id:
-                series["notesThrough"] = {"chapter": chapter, "volume": volume}
+            if covered:
+                # Notes still cover the same chapters after renumbering, even
+                # when the chapter that supplied them is no longer last.
+                for item in covered:
+                    if item["jobId"] == job_id:
+                        item.update(chapter=chapter, volume=volume)
+                last = max(covered, key=chapter_key)
+                series["notesThrough"] = {"chapter": last["chapter"], "volume": last["volume"]}
                 self.save_series(code, series)
             self.invalidate_translated_cbz_archives(code, job_id)
             self.enqueue_ready_series_jobs()

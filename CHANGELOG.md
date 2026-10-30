@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added native setup to install managed Python dependencies, check ImageMagick, test model lists, and create private configuration files without replacing existing settings.
 - Added a draggable bottom edge to make the editor taller and scroll the top bars out of view, with keyboard resizing and reset.
 - Show the last page number beside editor page entry and provide Hide boxes (H) in OCR & Merge and Text & Translation.
 - Added editable source and translated text above the box coordinates in Typesetting, shared with Text & Translation.
@@ -23,6 +24,8 @@
 
 ### Changed
 
+- Documented native installation as a first-party supported option alongside Docker/Podman, with separate install, network access, OCR, and update instructions.
+- Native server commands now bind to 127.0.0.1 by default; use --listen for all IPv4 interfaces or --address for a specific address. Containers pass --listen explicitly.
 - Compacted editor headers and fields, moved stage tools across the full width, paired typesetting settings, and replaced field protection/reset labels with P/R controls.
 - Removed job-level series-note buttons; volume and chapter can be edited after generation.
 - Series are now categories, with optional volume and decimal chapter numbers. Removed separate series records and selectors.
@@ -41,6 +44,8 @@
 
 ### Fixed
 
+- Keep text restored or cleared during an editor save, instead of discarding it on the next save.
+- Keep shared-note coverage when chapter or volume numbers change, so later series jobs do not wait for notes already published.
 - Keep pending OCR additions linked to their saved translations and Typesetting boxes, so moving a box and switching tabs does not create duplicates.
 - Keep Typesetting field protection controls when source, translation, and placement records share an ID.
 - Keep editor panes within the window so selecting a box does not expand the page and shift the view.

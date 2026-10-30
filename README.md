@@ -38,20 +38,24 @@ Editor with OCR & Merge, Text & Translation, and Typesetting tabs to correct pag
 
 ## Requirements
 
-- Docker or Podman
+- Native: [uv](https://docs.astral.sh/uv/) and ImageMagick 7 with PNG, WebP, and JPEG XL support. Or use Docker/Podman.
 - An OpenAI-compatible vision-language model endpoint. Gemma 4 12B is considered the minimum which requires 8GB of VRAM, or offloaded to RAM which is slower. This is not a guide on running models locally; please look elsewhere for that.
 - If using PaddleOCR-VL 1.6 (recommended), 2.5GB of free RAM will be occupied, and will inference on CPU
 - Optional professional comic fonts. Tetolate includes open stand-in fonts when no user fonts are installed.
 
-Tested on x86-64 Linux with Docker and Podman. ARM, Windows, and macOS are not currently tested.
+Native installation and Docker/Podman are first-party supported on x86-64 Linux.
+ARM, Windows, and macOS are not currently tested.
 
 ## Install
 
-Docker/Podman is the recommended installation path. For source builds and native development, see [BUILDING.md](BUILDING.md).
+Choose native installation or Docker/Podman. Both run the same pipeline and editor.
 
 Internet is required for a first run to download the necessary models off Huggingface and Paddle.
 
 Start an OpenAI-compatible vision-language model endpoint.
+
+After either installation starts, open `http://127.0.0.1:8088`. Log in with
+`changeme` and change the password.
 
 NOTE: For Gemma 4, the default tokens dedicated per image is relatively low which can cause poor performance. To max tokens per image, if running via llama.cpp add `--image-min-tokens 1120`, or with ExLlamaV3 go to your model's `processor_config.json` and set
 
@@ -63,7 +67,33 @@ NOTE: For Gemma 4, the default tokens dedicated per image is relatively low whic
 }
 ```
 
-Grab the compose yaml and run the image.
+### Native installation
+
+Install uv and ImageMagick 7 with PNG, WebP, and JPEG XL support. From the source
+checkout, run:
+
+```bash
+./setup.sh
+```
+
+Setup installs managed Python 3.11 and the locked dependencies, checks ImageMagick,
+asks for model endpoints and API keys, and starts the web UI. It creates missing
+configuration files with mode 0600. Existing settings stay unchanged unless you
+choose to update them. Endpoint checks read model lists, not image inference.
+
+Start the model services separately. Choose `paddle` for built-in OCR without an
+OCR inference service, or `paddleocr_vl` to use your PaddleOCR-VL endpoint.
+
+```bash
+./setup.sh --no-start  # configure and check only
+./run_server.sh       # later launches; local only
+```
+
+See [BUILDING.md](BUILDING.md#native-installation) for configuration and command-line use.
+
+### Docker/Podman
+
+Grab the compose yaml and run the image:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/potatoes1286/tetolate/refs/heads/main/compose.yaml
@@ -73,16 +103,17 @@ docker compose logs tetolate
 
 (If using podman, simply swap out docker for podman here.)
 
-Default password is `changeme`. Navigate to `http://127.0.0.1:8088` and log in. After logging in, change it.
-
-
 ### Configuration
 
 #### OCR Service
 
 There are two options for OCR. The built in PaddleOCR is quick, cheap, and not the best. For maximum quality, use PaddleOCR-VL 1.6. PaddleOCR-VL is the recommended path.
 
-To use PaddleOCR-VL, download the two GGUF files and chat template listed in the [model guide](https://github.com/potatoes1286/tetolate/blob/main/data/models/README.md) into `data/models`, and run
+For native installation, run the OCR inference service separately and enter its
+API address in setup or Advanced Options. A local service normally uses
+`http://127.0.0.1:8081/v1`. Setup does not start that service.
+
+For Docker/Podman, download the two GGUF files and chat template listed in the [model guide](data/models/README.md) into `data/models`, and run
 
 ```bash
 docker compose down
@@ -93,7 +124,19 @@ and select PaddleOCR-VL in the job's advanced options.
 
 #### Expose to Network
 
-Compose publishes port 8088 on `127.0.0.1` for local-only access. For LAN access, change it to `0.0.0.0` in `compose.yaml` and change the default password first. Do not expose it to the internet.
+Change the default password before allowing LAN access. Do not expose Tetolate to the internet.
+
+Native launches bind to `127.0.0.1` by default:
+
+```bash
+./run_server.sh --listen               # same as --address 0.0.0.0
+./run_server.sh --address 192.168.1.10  # a specific local address
+```
+
+Compose publishes port 8088 on `127.0.0.1` for local-only access. For LAN access,
+change the host binding to `0.0.0.0` in `compose.yaml`. Endpoint addresses are not
+rewritten: container `127.0.0.1` refers to the container, not the host. Use
+`host.docker.internal` for a host service reachable from the container.
 
 #### Fonts
 
@@ -129,10 +172,16 @@ exports set their own title, volume, chapter number, and page count. No VLM is u
 #### Terminal access
 
 The CLI connects to the running web server. It needs only Python's standard library.
-Use `tetolate_cli.py` from the repository, or copy it from your container:
+Use `tetolate_cli.py` from the source checkout. For a container installation,
+copy the client once:
 
 ```bash
 podman cp tetolate:/app/tetolate_cli.py ./tetolate_cli.py
+```
+
+Then:
+
+```bash
 python3 tetolate_cli.py status
 python3 tetolate_cli.py jobs list --json
 python3 tetolate_cli.py jobs submit chapter.cbz --set vlm_model=YOUR_MODEL
@@ -175,6 +224,17 @@ client as `tetolate`.
 VLM prompts are plain text files in `data/prompts/`. They are read for each request, so edits apply to the next pass without restarting. See `data/prompts/README.md` for placeholder and custom-directory details.
 
 #### Updating
+
+Stop the server before updating. Keep the `data/` directory.
+
+Native installation:
+
+```bash
+git pull --ff-only
+./setup.sh
+```
+
+Docker/Podman:
 
 Download the Compose file for the new version, pull its image, and recreate the container.
 

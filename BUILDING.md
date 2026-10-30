@@ -1,35 +1,33 @@
-# Building tetolate
+# Installing and building tetolate
 
-This document covers source builds, native development environments, tests, and
-individual container targets. For the normal published-image installation, see
-[README.md](README.md).
+Native installation and Docker/Podman are first-party supported on x86-64 Linux.
+See [README.md](README.md#install) for both quick starts. This guide covers native
+configuration, development, tests, and container build targets.
 
-## Native Environment
+## Native installation
 
-Requirements:
-
-- Python 3.11 or 3.12
-- [uv](https://docs.astral.sh/uv/)
-- ImageMagick 7 with PNG, WebP, and JPEG XL support
-- An OpenAI-compatible vision-language model endpoint
-
-Install the locked application, LaMa, and PaddleOCR dependencies:
+Install [uv](https://docs.astral.sh/uv/) and ImageMagick 7 with PNG, WebP,
+and JPEG XL support. Start your VLM endpoint and, if using PaddleOCR-VL,
+its separate inference endpoint. Then run:
 
 ```bash
-UV_CACHE_DIR=/tmp/uv-cache uv sync --locked --extra inpaint --extra ocr
+./setup.sh
 ```
 
-Copy the configuration examples and protect the resulting files:
+Setup installs a managed Python 3.11 environment and the locked application,
+OCR, and LaMa dependencies. It checks ImageMagick formats and text rendering,
+asks for endpoint addresses and API keys, lists models, and starts the web UI.
+Endpoint checks read `/models`; they do not test image inference or start model
+services. Choose `paddle` to use built-in OCR without a separate OCR endpoint.
 
-```bash
-cp data/config/vlm_config.example.json data/config/vlm_config.json
-cp data/config/web_config.example.json data/config/web_config.json
-chmod 600 data/config/vlm_config.json data/config/web_config.json
-```
+Missing configuration files are created with mode 0600. Existing files stay
+unchanged unless you choose to update the model settings. Other saved settings
+are kept. Use `./setup.sh --no-start` to configure and test without starting.
 
-Review all endpoints before starting the application. Real configuration files
-are ignored by Git; never add API keys to examples, logs, or debug archives.
-The web server always loads `vlm_config.json` beside `web_config.json`.
+New native configurations use local endpoint addresses. Existing endpoint
+addresses are not rewritten. Real configuration files are ignored by Git;
+never add keys to examples or logs. The web server loads `vlm_config.json`
+beside `web_config.json`.
 
 ## Running From Source
 
@@ -53,6 +51,18 @@ Start the web interface with:
 ```
 
 Both launchers install the OCR and LaMa dependencies automatically.
+The server command binds to `127.0.0.1` by default, even if an old configuration
+has a network listen address. `--listen` is shorthand for `--address 0.0.0.0`:
+
+```bash
+./run_server.sh --listen
+./run_server.sh --address 192.168.1.10 --port 8090
+```
+
+The same address options work with `setup.sh` and `web_app.py`. `--port` overrides
+the port in the configuration's `listen` field. Change the default password
+before allowing network access. The container command passes `--listen`
+explicitly; Compose still publishes its port on the host's loopback address.
 
 Login offers Remember session for 30 days, including server restarts. Leave it
 unchecked on shared devices. Logout revokes that session; a password change
@@ -290,7 +300,7 @@ Basic repository checks used during development are:
 ```bash
 .venv/bin/python -m py_compile *.py
 for file in web_editor/*.js; do node --check "$file"; done
-bash -n run.sh run_server.sh docker/entrypoint.sh
+bash -n setup.sh run.sh run_server.sh docker/entrypoint.sh
 docker compose config
 docker compose --profile paddleocr-vl config
 docker compose -f compose.yaml -f compose.build.yaml config

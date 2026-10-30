@@ -899,7 +899,9 @@ async function save() {
       if (store.document !== previous) return;
       if (JSON.stringify([store.records, store.document.translationNotes]) === snapshot) store.markSaved(document);
       else {
-        store.document.revision = document.revision;
+        // Keep the draft and undo history, but compare the next save with what
+        // the server now holds, not the baseline from before this save.
+        Object.assign(store.document, document, {translationNotes: store.document.translationNotes});
         store.saveDraft();
       }
       setStatus(store.dirty ? "Saved. Newer edits still need saving." : "Saved. Changed fields are protected.");

@@ -709,7 +709,7 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
         raise PipelineError("Config field ocr.min_score must be between 0 and 1.")
 
     return OCRConfig(
-        engine=paddle_ocr_image.DEFAULT_OCR_ENGINE,
+        engine=paddle_ocr_image.normalize_ocr_engine(data.get("engine", paddle_ocr_image.DEFAULT_OCR_ENGINE)),
         service_url=service_url,
         service_timeout=paddle_ocr_image.DEFAULT_OCR_SERVICE_TIMEOUT,
         lang=language.source.ocr_lang,
@@ -735,9 +735,9 @@ def load_ocr_config(data: dict[str, Any], language: LanguageConfig) -> OCRConfig
         tile_include_full_image=paddle_ocr_image.DEFAULT_TILE_INCLUDE_FULL_IMAGE,
         tile_dedupe_iou=paddle_ocr_image.DEFAULT_TILE_DEDUPE_IOU,
         tile_dedupe_containment=paddle_ocr_image.DEFAULT_TILE_DEDUPE_CONTAINMENT,
-        paddleocr_vl_server_url=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL,
-        paddleocr_vl_model=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL,
-        paddleocr_vl_api_key=paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY,
+        paddleocr_vl_server_url=normalize_vlm_base_url(data.get("paddleocr_vl_server_url", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_SERVER_URL), "ocr.paddleocr_vl_server_url"),
+        paddleocr_vl_model=normalize_vlm_model(data.get("paddleocr_vl_model", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_MODEL), "ocr.paddleocr_vl_model"),
+        paddleocr_vl_api_key=data.get("paddleocr_vl_api_key", paddle_ocr_image.DEFAULT_PADDLEOCR_VL_API_KEY),
         paddleocr_vl_max_concurrency=None,
     )
 
